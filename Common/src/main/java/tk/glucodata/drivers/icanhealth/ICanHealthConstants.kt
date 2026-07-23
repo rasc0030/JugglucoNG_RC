@@ -216,14 +216,19 @@ object ICanHealthConstants {
     }
 
     /**
-     * The launcher QR and DIS serial are different representations of the same
-     * physical sensor identity. The vendor launcher uses the leading 8 or 9
-     * characters as its short serial, depending on the active-code family.
+     * Derives the DIS-comparable identity prefix from a launcher QR/active code.
+     * Extended Chinese codes encode the same eight characters as `XYabcdefg`,
+     * while DIS exposes them as `0abcdefg`.
      */
     @JvmStatic
     fun onboardingIdentityPrefix(source: String?): String {
         val normalized = normalizeOnboardingDeviceSn(source)
-        return deriveShortSnFromActiveCode(normalized)
+        val shortSn = deriveShortSnFromActiveCode(normalized)
+        return if (usesExtendedShortSn(shortSn)) {
+            "0" + shortSn.substring(2)
+        } else {
+            shortSn
+        }
     }
 
     @JvmStatic
@@ -233,14 +238,25 @@ object ICanHealthConstants {
         if (expected.isEmpty() || observed.isEmpty()) {
             return false
         }
-        val prefix = deriveShortSnFromActiveCode(expected)
+        val prefix = onboardingIdentityPrefix(expected)
         if (prefix.length < 8) {
             return false
         }
         if (expected == observed) {
             return true
         }
-        return observed.startsWith(prefix)
+        if (observed.startsWith(prefix)) {
+            return true
+        }
+
+        // i6 active codes and DIS serials encode the same seven-character sensor
+        // core at different offsets. Example observed in production:
+        // ZA1OR03MSE50 (active code) -> 01OR03MS00070101 (DIS serial).
+        // Keep the post-connection identity gate, but recognize that vendor layout
+        // instead of accepting whichever nearby iCan happened to connect first.
+        return expected.length == 12 &&
+            observed.length >= 8 &&
+            expected.substring(2, 9) == observed.substring(1, 8)
     }
 
     private fun sanitizeSensorIdentity(source: String?): String =
@@ -254,9 +270,12 @@ object ICanHealthConstants {
         if (activeCode.length < 12) {
             return activeCode
         }
-        val prefixLength = if (activeCode[0] > 'F' || activeCode.getOrElse(1) { '0' } > 'F') 9 else 8
+        val prefixLength = if (usesExtendedShortSn(activeCode)) 9 else 8
         return activeCode.take(prefixLength)
     }
+
+    private fun usesExtendedShortSn(value: String): Boolean =
+        value.length >= 9 && (value[0] > 'F' || value[1] > 'F')
 
     // ---- Vendor Auth Commands ----
 

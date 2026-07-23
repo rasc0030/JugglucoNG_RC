@@ -71,6 +71,7 @@ import tk.glucodata.data.journal.JournalEntryType
 import tk.glucodata.data.journal.JournalFood
 import tk.glucodata.data.journal.JournalInsulinPreset
 import tk.glucodata.ui.journal.buildJournalChartMarkers
+import tk.glucodata.ui.journal.journalQuickAddTimestamp
 import tk.glucodata.ui.journal.journalTypeColor
 import tk.glucodata.ui.journal.journalTypeSelectedContainerColor
 import tk.glucodata.ui.util.ConnectedButtonGroup
@@ -368,6 +369,7 @@ fun HistoryBrowseScreen(
     title: String,
     browseMode: TimelineBrowseMode = TimelineBrowseMode.HISTORY,
     journalEnabled: Boolean = false,
+    chartRangeColors: Boolean = false,
     journalEntries: List<JournalEntry> = emptyList(),
     journalInsulinPresets: List<JournalInsulinPreset> = emptyList(),
     journalFoods: List<JournalFood> = emptyList(),
@@ -376,7 +378,8 @@ fun HistoryBrowseScreen(
     onDeleteReading: ((GlucosePoint) -> Unit)? = null,
     onJournalEntryClick: ((JournalEntry) -> Unit)? = null,
     onAddJournalEntry: ((Long, JournalEntryType?, Float?) -> Unit)? = null,
-    showTransferActions: Boolean = true
+    showTransferActions: Boolean = true,
+    quickAddAlwaysNow: Boolean = false
 ) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
@@ -518,11 +521,14 @@ fun HistoryBrowseScreen(
                             IconButton(
                                 onClick = {
                                     onAddJournalEntry(
-                                        viewportSnapshot?.selectedPoint?.timestamp
-                                            ?: viewportEnd
-                                            ?: System.currentTimeMillis(),
+                                        journalQuickAddTimestamp(
+                                            viewportSnapshot?.selectedPoint?.timestamp,
+                                            System.currentTimeMillis(),
+                                            quickAddAlwaysNow
+                                        ),
                                         selectedJournalTypes.singleOrNull(),
                                         viewportSnapshot?.selectedPoint?.value
+                                            ?.takeIf { !quickAddAlwaysNow }
                                     )
                                 }
                             ) {
@@ -603,6 +609,7 @@ fun HistoryBrowseScreen(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .height(420.dp),
+                            appChartRangeColors = chartRangeColors,
                             glucoseHistory = activeHistory,
                             journalMarkers = journalMarkers,
                             graphSmoothingMinutes = graphSmoothingMinutes,
@@ -625,6 +632,7 @@ fun HistoryBrowseScreen(
                             onJournalMarkerClick = { entryId ->
                                 journalEntriesById[entryId]?.let { onJournalEntryClick?.invoke(it) }
                             },
+                            resetToLatestOnResume = false,
                             onViewportSnapshotChanged = { viewportSnapshot = it }
                         )
                     }

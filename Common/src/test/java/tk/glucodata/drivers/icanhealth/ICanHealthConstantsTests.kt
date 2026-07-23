@@ -71,6 +71,26 @@ class ICanHealthConstantsTests {
     }
 
     @Test
+    fun matchesOnboardingIdentity_acceptsShiftedI6ActiveCodeFamily() {
+        assertTrue(
+            ICanHealthConstants.matchesOnboardingIdentity(
+                "ZA1OR03MSE50",
+                "01OR03MS00070101"
+            )
+        )
+    }
+
+    @Test
+    fun matchesOnboardingIdentity_rejectsNearbyShiftedI6Sensor() {
+        assertFalse(
+            ICanHealthConstants.matchesOnboardingIdentity(
+                "ZA1OR03MSE50",
+                "01OR03MT00070101"
+            )
+        )
+    }
+
+    @Test
     fun matchesOnboardingIdentity_rejectsAnotherNearbySensor() {
         assertFalse(
             ICanHealthConstants.matchesOnboardingIdentity(
@@ -86,12 +106,22 @@ class ICanHealthConstantsTests {
     }
 
     @Test
-    fun onboardingIdentityPrefix_usesExtendedVendorPrefixRule() {
-        assertEquals("G760080A2", ICanHealthConstants.onboardingIdentityPrefix("G760080A2604"))
+    fun onboardingIdentityPrefix_mapsChineseI6CodeToObservedDisPrefix() {
+        assertEquals("01OV04NA", ICanHealthConstants.onboardingIdentityPrefix("ZP1OV04NA550"))
         assertTrue(
             ICanHealthConstants.matchesOnboardingIdentity(
-                "G760080A2604",
-                "G760080A200070000"
+                "ZP1OV04NA550",
+                "01OV04NA0003010100000000"
+            )
+        )
+    }
+
+    @Test
+    fun matchesOnboardingIdentity_rejectsAnotherChineseI6() {
+        assertFalse(
+            ICanHealthConstants.matchesOnboardingIdentity(
+                "ZP1OV04NA550",
+                "01R9089R0003010100000000"
             )
         )
     }
