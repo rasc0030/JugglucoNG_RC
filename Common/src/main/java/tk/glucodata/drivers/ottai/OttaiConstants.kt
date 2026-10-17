@@ -49,7 +49,8 @@ object OttaiConstants {
 
     const val API_BASE = "https://api.ottai.com"          // CN app (phone/SMS account)
     const val API_BASE_GLOBAL = "https://seas.ottai.com"  // Ottai global app com.ottai.seas (username/password); same API, different host
-    const val API_BASE_SYAI = "https://ru.syai.com"       // syai (rebrand) global app; same API, different host
+    const val API_BASE_SYAI = "https://api.syai.com"      // Syai global mobile API
+    internal const val API_BASE_SYAI_LEGACY = "https://ru.syai.com"
     // Website account API (email login + registration). Same scheme/appName/SEED, different host.
     const val WEB_BASE_OTTAI = "https://www.ottai.com/api/cgm/web"
     const val WEB_BASE_SYAI = "https://www.syai.com/api/cgm/web"
@@ -62,7 +63,14 @@ object OttaiConstants {
     const val EP_LOGOUT = "$PREFIX/user/logout"
     const val EP_GET_USER = "$PREFIX/user/getUser"
     const val EP_VALIDATE_BY_MAC = "$PREFIX/device/validateDeviceByMacV2"
+    const val EP_VALIDATE_BY_MAC_V3 = "$PREFIX/device/validateDeviceByMacV3"
     const val EP_BIND = "$PREFIX/deviceBind/composite/bind"
+    const val EP_BIND_V3 = "$PREFIX/deviceBind/composite/bindV3"
+    // Server side of the CN V3 Active_Auth handshake: the app reads authDev/authFlag off the sensor
+    // over BLE, posts them here, and the server returns authHost/authFlag to write back to the
+    // sensor before bindV3. Exact request/response shape pending a live capture — see
+    // AGENTS/archive/context-dumps/ottai-2026-08-12-cloud-gate-findings.md.
+    const val EP_CGM_AUTH_VERIFY = "$PREFIX/cgmAuth/verify"
     const val EP_UNBIND = "$PREFIX/deviceBind/unBindDevice"
     const val EP_GET_BIND_DEVICE = "$PREFIX/deviceBind/getBindDevice"
     const val EP_DEVICE_LIST = "$PREFIX/deviceBind/list"  // account's bound + past sensors (paged)
@@ -179,28 +187,45 @@ object OttaiConstants {
     const val DEFAULT_RATED_LIFETIME_DAYS = 15
 
     /**
-     * The official app writes cloud activeExpireTime to maxActive. Field evidence from
-     * C09B9E4B2B48 proves that the firmware enforces that value: 1209600000 ms stopped
-     * the sensor at exactly 14 days. We deliberately raise maxActive to the managed
-     * lifetime below, while retaining the cloud value for the rated/official end shown
-     * in UI. retainTime remains cloud-driven; writing an absolute epoch to destruction
-     * made the sensor terminate the link.
+     * The official app writes cloud activeExpireTime to maxActive. retainTime remains
+     * cloud-driven; writing an absolute epoch to destruction made the sensor terminate
+     * the link.
      */
     const val DEFAULT_RETAIN_TIME_MS = 172_800_000L
     const val DEFAULT_ACTIVE_EXPIRE_MS = DEFAULT_RATED_LIFETIME_DAYS * 24L * 3600L * 1000L
 
-    /**
-     * Managed lifetime target. This value must be written to maxActive during activation;
-     * changing app-side metadata alone does not extend the sensor.
-     */
+    // Cloud and sensor values are durations. Reject epoch timestamps, unit mistakes, and corrupt
+    // preferences before they can turn into a decades-long age/end date in the sensor UI.
+    private const val MIN_ACTIVE_EXPIRE_MS = 10L * 24L * 3600L * 1000L
+    private const val MAX_ACTIVE_EXPIRE_MS = 45L * 24L * 3600L * 1000L
+
+    /** Longest managed lifetime requested during explicit activation. */
     const val EXTENDED_LIFETIME_DAYS = 30
     const val EXTENDED_LIFETIME_MS = EXTENDED_LIFETIME_DAYS * 24L * 3600L * 1000L
 
     @JvmStatic
-    fun activationMaxActiveMs(cloudActiveExpireMs: Long): Long {
-        val rated = cloudActiveExpireMs.takeIf { it > 0L } ?: DEFAULT_ACTIVE_EXPIRE_MS
-        return maxOf(rated, EXTENDED_LIFETIME_MS)
+    fun sanitizeActiveExpireMs(value: Long): Long =
+        value.takeIf { it in MIN_ACTIVE_EXPIRE_MS..MAX_ACTIVE_EXPIRE_MS } ?: 0L
+
+    @JvmStatic
+    fun activationMaxActiveCandidatesMs(cloudActiveExpireMs: Long): List<Long> {
+        val cloudMs = sanitizeActiveExpireMs(cloudActiveExpireMs)
+            .takeIf { it > 0L }
+            ?: DEFAULT_ACTIVE_EXPIRE_MS
+        val candidates = mutableListOf<Long>()
+        if (cloudMs > EXTENDED_LIFETIME_MS) candidates += cloudMs
+        (EXTENDED_LIFETIME_DAYS downTo 15).forEach { days ->
+            candidates += days * 24L * 3600L * 1000L
+        }
+        candidates += cloudMs
+        return candidates.distinct()
     }
+
+    @JvmStatic
+    fun expectedLifetimeMs(cloudActiveExpireMs: Long, acceptedMaxActiveMs: Long): Long =
+        sanitizeActiveExpireMs(acceptedMaxActiveMs).takeIf { it > 0L }
+            ?: sanitizeActiveExpireMs(cloudActiveExpireMs).takeIf { it > 0L }
+            ?: DEFAULT_ACTIVE_EXPIRE_MS
 
     @JvmStatic
     fun shouldAttemptEndedSensorRecovery(commandStatus: Int, activeTimeMs: Long, nowMs: Long): Boolean =
@@ -212,6 +237,72 @@ object OttaiConstants {
     /** Sensor command state is authoritative; cloud/provisional timestamps are not. */
     fun commandNeedsActivation(commandStatus: Int): Boolean = commandStatus in 0..2
 
+    /** Starting the irreversible lifetime additionally requires an explicit user action. */
+    fun shouldStartActivation(commandStatus: Int, explicitlyRequested: Boolean): Boolean =
+        explicitlyRequested && commandNeedsActivation(commandStatus)
+
+    fun shouldRescanPendingSetupActivation(
+        commandStatus: Int,
+        explicitlyRequested: Boolean,
+    ): Boolean = commandStatus < 0 && explicitlyRequested
+
+    /** CN Ottai and Syai sensors need a physical NFC field wake around activation attempts. */
+    fun requiresNfcActivationWake(apiBase: String): Boolean =
+        apiBase == API_BASE || apiBase == API_BASE_SYAI
+
+    /**
+     * A Chinese sensor can resume advertising under a different Android BLE address
+     * after NFC wake. Only admit that address while an activation recovery scan is
+     * already armed; the BLE manager still requires the sensor's auth signature before
+     * persisting the candidate.
+     *
+     * [allowNameMatch] governs the name-only fallback, which exists solely for the
+     * address-changed case. It admits ANY advertisement whose name contains "ottai" —
+     * including a stranger's sensor in range — so callers must disable it once this
+     * sensor's own address is known to be stable (i.e. it is already activated).
+     * Otherwise the manager retargets its transport at every neighbouring Ottai in turn,
+     * each one failing the auth-signature check, and never reaches its own sensor.
+     */
+    /**
+     * How long a freshly armed candidate scan insists on the sensor's own address before the
+     * name-only fallback is allowed to admit anything else.
+     *
+     * The fallback exists for the address-changed case, but the scanner stops on the first hit,
+     * so every stranger it admits costs a whole connect/discover/auth cycle and another scan
+     * restart before the real sensor can be seen. On 2026-07-29 three wrong units were probed at
+     * +0 s, +12 s and +15 s and the correct one was only reached at +21 s; the sensor's own
+     * advertisement is normally in the very first burst, so holding out briefly costs nothing
+     * when the address is unchanged and delays only the genuine address-changed case.
+     */
+    const val ACTIVATION_EXACT_ONLY_WINDOW_MS = 15_000L
+
+    @JvmStatic
+    fun isActivationExactOnlyWindowOpen(discoveryStartedAtMs: Long, nowMs: Long): Boolean =
+        discoveryStartedAtMs > 0L && nowMs - discoveryStartedAtMs < ACTIVATION_EXACT_ONLY_WINDOW_MS
+
+    fun shouldProbeActivationAdvertisement(
+        discoveryPending: Boolean,
+        scannedAddress: String?,
+        expectedAddress: String?,
+        advertisedName: String?,
+        rejectedAddresses: Set<String> = emptySet(),
+        allowNameMatch: Boolean = true,
+        exactOnlyWindowOpen: Boolean = false,
+    ): Boolean {
+        if (!discoveryPending) return false
+        val scanned = normalizeBleAddress(scannedAddress, allowPlain = false) ?: return false
+        if (rejectedAddresses.any {
+                normalizeBleAddress(it, allowPlain = false)?.equals(scanned, ignoreCase = true) == true
+            }
+        ) {
+            return false
+        }
+        val expected = normalizeBleAddress(expectedAddress, allowPlain = false)
+        if (expected?.equals(scanned, ignoreCase = true) == true) return true
+        if (!allowNameMatch || exactOnlyWindowOpen) return false
+        return advertisedName?.trim()?.contains("ottai", ignoreCase = true) == true
+    }
+
     /** Past the extended end, only declare the sensor expired once samples stop this long. */
     const val EXPIRED_STALE_GRACE_MS = 6L * 3600L * 1000L
 
@@ -222,13 +313,46 @@ object OttaiConstants {
     const val DEFAULT_WARMUP_SECONDS = 3200
     const val DEFAULT_PREHEAT_PERIOD_MS = 3_600_000L
 
+    /**
+     * Post-activation window during which readings are decoded and logged but never published,
+     * stored or exported.
+     *
+     * The vendor's own preheat (DEFAULT_PREHEAT_PERIOD_MS, or the cloud's preheatPeriodTime) is
+     * 60 min, but the settling ramp measured on this hardware is over well inside 10 minutes: on
+     * the 2026-07-29 activation dataNo 3 read 2.80 mmol (published as 50 mg/dL) and climbed
+     * monotonically — 3.00, 3.30, 3.80, 5.00, 5.70, 6.00, 6.10 — reaching plateau by dataNo 11.
+     * Suppressing a full hour would throw away usable data, so this window is deliberately
+     * shorter than the vendor's and is the value this fork enforces.
+     */
+    const val WARMUP_SUPPRESS_MS = 600_000L
+
+    /**
+     * Whether a sample falls inside the post-activation settling window and so must not be
+     * published, stored or exported.
+     *
+     * Deliberately a property of the SAMPLE rather than of the wall clock: a history replay of
+     * the same records then reaches the same verdict on every pass and across restarts, instead
+     * of re-admitting during warmup whatever the live path already refused.
+     *
+     * [activationStartMs] must be an authoritative start — pass 0 to disable the gate rather than
+     * feeding it a provisional, which for a vendor-activated sensor always reads "just now" and
+     * would blank ten minutes of good readings on every fresh connect.
+     */
+    @JvmStatic
+    fun isWithinWarmup(activationStartMs: Long, sampleMs: Long): Boolean =
+        activationStartMs > 0L &&
+            sampleMs > 0L &&
+            sampleMs < activationStartMs + WARMUP_SUPPRESS_MS
+
     // ---- SharedPreferences keys ----
 
     const val PREF_SENSORS_KEY = "ottai_sensors"
     const val PREF_ACCESS_TOKEN = "ottai_access_token"
     const val PREF_GLUCOSE_SECRET = "ottai_glucose_secret_key"
     const val PREF_USER_ID = "ottai_user_id"
+    const val PREF_ACCOUNT_LOGIN = "ottai_account_login"  // login typed at sign-in (phone/email/username), display only
     const val PREF_API_BASE = "ottai_api_base"  // which backend the signed-in account is on (CN vs global)
+    const val PREF_SESSION_PROFILE = "ottai_session_profile"  // identity which issued the current access token
     const val PREF_KEYA_PREFIX = "ottai_keya_"            // decrypted 6x16 hex (192)
     const val PREF_METHOD_PREFIX = "ottai_method_"        // decrypted method text
     const val PREF_COEFF_PREFIX = "ottai_coeff_"          // decrypted coefficient CSV
@@ -238,11 +362,28 @@ object OttaiConstants {
     // the first post-restart sample bypass the continuity gate.
     const val PREF_CONTINUITY_BASELINE_PREFIX = "ottai_continuity_baseline_"
     const val PREF_ACTIVE_EXPIRE_PREFIX = "ottai_active_expire_"  // activeExpireTime ms (maxActive duration)
+    // Actual maxActive duration (ms) the firmware ACCEPTED at activation — the real
+    // sensor lifetime. Persisted when the firmware ACKs the maxActive write, and/or
+    // recovered by reading b8fd9848 back off the sensor. Drives expected-end/remaining.
+    const val PREF_ACCEPTED_MAX_ACTIVE_PREFIX = "ottai_accepted_max_active_"
     const val PREF_PREHEAT_PERIOD_PREFIX = "ottai_preheat_period_"
     const val PREF_RETAIN_TIME_PREFIX = "ottai_retain_time_"      // retainTime ms (destruction value)
     const val PREF_DEVICE_VERSION_PREFIX = "ottai_device_version_"
     const val PREF_LAST_DATA_NO_PREFIX = "ottai_last_datano_"
+    // Realtime delivery high-water. Unlike Room's newest timestamp, this records only a sample
+    // that actually claimed the alert/voice/exchange path, so history imports cannot suppress a
+    // later live delivery after the manager is recreated.
+    const val PREF_LAST_PUBLISHED_GLUCOSE_PREFIX = "ottai_last_published_glucose_"
+    // BLE record layout (8 or 9) once a payload big enough to prove it has been seen. Held
+    // per sensor so a short live notify, which cannot tell the two apart, never re-decides it.
+    const val PREF_RECORD_SIZE_PREFIX = "ottai_record_size_"
+    // Requested-but-undelivered history windows: "start:endExclusive:attempts" joined by ';'.
+    const val PREF_HISTORY_HOLES_PREFIX = "ottai_history_holes_"
     const val PREF_DEVICE_ID_PREFIX = "ottai_device_id_"
     const val PREF_ACTIVATION_ATTEMPTED_PREFIX = "ottai_act_tried_"  // one-shot auto-activate guard
+    // "dataNo,sampleMs,tempC*10;" per accepted reading — feeds the stats temperature card.
+    const val PREF_TEMPERATURE_HISTORY_PREFIX = "ottai_temp_history_"
     const val PREF_SELF_DEVICE_ID = "ottai_self_device_id"
+    // CN phone SDK common-header identity. This is separate from the legacy watch/global id.
+    const val PREF_CN_COMMON_DEVICE_ID = "ottai_cn_common_device_id"
 }

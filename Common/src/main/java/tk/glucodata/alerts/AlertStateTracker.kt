@@ -1,6 +1,7 @@
 package tk.glucodata.alerts
 
 import tk.glucodata.Log
+import tk.glucodata.sms.SmsWatchdog
 
 /**
  * Tracks episode state for active alerts.
@@ -17,6 +18,10 @@ object AlertStateTracker {
     // Last time an alert of this type was triggered (ms)
     private val lastTriggerTime = mutableMapOf<AlertType, Long>()
     private val cooldownUntilTime = mutableMapOf<AlertType, Long>()
+
+    // Acknowledgement of the last delivery outlives its episode and snooze.
+    // Only a new real firing replaces it; the directional window owns expiry/reversal.
+    private val lastFiringAcknowledged = mutableMapOf<AlertType, Boolean>()
     
     // User explicitly dismissed this alert for the current episode.
     // It stays suppressed until the condition clears and resetState() is called.
@@ -48,7 +53,7 @@ object AlertStateTracker {
         }
 
         // 1. Snooze Check (Global priority)
-        if (SnoozeManager.isSnoozed(type)) {
+        if (SnoozeManager.isSnoozed(type) || tk.glucodata.WearAlertSync.isSuppressed(type.id)) {
             Log.i(LOG_ID, "${type.name}: Suppressed by snooze")
             return false
         }
@@ -80,25 +85,53 @@ object AlertStateTracker {
      * Call this when the alert ACTUALLY fires (sound/notification played).
      * Updates timestamps and counters.
      */
+    @JvmOverloads
     @Synchronized
-    fun onAlertTriggered(type: AlertType): Boolean {
+    fun onAlertTriggered(type: AlertType, config: AlertConfig? = null): Boolean {
         if (manualTests.isActive(type)) {
             return false
         }
         dismissedAlerts.remove(type)
+        lastFiringAcknowledged[type] = false
         lastTriggerTime[type] = System.currentTimeMillis()
-        cooldownUntilTime[type] = lastTriggerTime.getValue(type) + DEFAULT_REARM_COOLDOWN_MS
+        cooldownUntilTime[type] = lastTriggerTime.getValue(type) + effectiveRearmCooldownMs(config)
+        SmsWatchdog.onAlertFired(type.id)
         return true
     }
 
+    /**
+     * The rearm cooldown after a firing. The configured minimum re-arm
+     * interval (forecast alerts) extends the built-in short cooldown, never
+     * shortens it; unset/0 keeps today's behaviour.
+     */
+    internal fun effectiveRearmCooldownMs(config: AlertConfig?): Long {
+        val configuredMs = (config?.rearmMinIntervalMinutes ?: 0).coerceAtLeast(0) * 60_000L
+        return maxOf(DEFAULT_REARM_COOLDOWN_MS, configuredMs)
+    }
+
     @Synchronized
-    fun onAlertDismissed(type: AlertType): Boolean {
+    @JvmOverloads
+    fun onAlertDismissed(type: AlertType, cooldownUntilMs: Long = System.currentTimeMillis() + DEFAULT_REARM_COOLDOWN_MS): Boolean {
         if (manualTests.consumeAction(type)) {
             return false
         }
         dismissedAlerts.add(type)
+        cooldownUntilTime[type] = maxOf(cooldownUntilTime[type] ?: 0L, cooldownUntilMs)
+        lastFiringAcknowledged.replace(type, true)
+        SmsWatchdog.onAlertAcknowledged(type.id)
+        // Acknowledged: a quiet window's silenced episode must not break through now.
+        QuietWindow.clearSilencedEpisode(type.id)
         Log.i(LOG_ID, "Dismissed ${type.name} for current episode")
         return true
+    }
+
+    @Synchronized
+    fun isManualTestActive(type: AlertType): Boolean = manualTests.isActive(type)
+
+    /** LOSS does not use shouldTrigger for production; retire its test only on real delivery. */
+    @Synchronized
+    fun supersedeManualTest(type: AlertType) {
+        manualTests.supersede(type)
     }
 
     @Synchronized
@@ -117,6 +150,26 @@ object AlertStateTracker {
         manualTests.arm(type)
     }
 
+    /** True between the episode's first firing and [resetState]. */
+    @Synchronized
+    fun isEpisodeActive(type: AlertType): Boolean = lastTriggerTime.containsKey(type)
+
+    /** True once [onAlertDismissed] took this episode, until [resetState]. */
+    @Synchronized
+    fun isDismissed(type: AlertType): Boolean = type in dismissedAlerts
+
+    /** Whether the last real firing was acknowledged for the cross-family quiet period. */
+    @Synchronized
+    internal fun wasLastFiringAcknowledged(type: AlertType): Boolean = lastFiringAcknowledged[type] == true
+
+    /** Called for an accepted alarm snooze, never for a preemptive snooze. */
+    @Synchronized
+    internal fun onAlertSnoozed(type: AlertType) {
+        if (!manualTests.isActive(type)) {
+            lastFiringAcknowledged.replace(type, true)
+        }
+    }
+
     /**
      * Reset state for an alert type.
      * Call this when:
@@ -132,9 +185,13 @@ object AlertStateTracker {
         ) {
             Log.i(LOG_ID, "Resetting state for ${type.name}")
         }
+        // The condition cleared: a quiet window's silenced episode for this kind
+        // is over too, so it must not break through later.
+        QuietWindow.clearSilencedEpisode(type.id)
         lastTriggerTime.remove(type)
         dismissedAlerts.remove(type)
         manualTests.clearPending(type)
+        SmsWatchdog.onAlertResolved(type.id)
     }
 }
 

@@ -16,16 +16,15 @@ import java.text.DecimalFormat
 import java.text.DecimalFormatSymbols
 import java.util.Locale
 import tk.glucodata.GlucosePoint
+import tk.glucodata.Log
+import tk.glucodata.MainActivity
 import tk.glucodata.Natives
 import tk.glucodata.Notify
 import tk.glucodata.SensorBluetooth
 import tk.glucodata.alerts.AlertDisplayText
 import tk.glucodata.alerts.AlertRepository
-import tk.glucodata.alerts.AlertStateTracker
 import tk.glucodata.alerts.AlertType
 import tk.glucodata.ui.util.GlucoseFormatter
-import tk.glucodata.alerts.SnoozeManager
-import tk.glucodata.logic.CustomAlertManager
 import tk.glucodata.logic.TrendEngine
 
 class AlarmActivity : ComponentActivity() {
@@ -51,18 +50,36 @@ class AlarmActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
+        if (closeIfAcknowledged()) return
         Notify.setAlarmUiVisible(true)
+        observeAcknowledgement()
         turnScreenOnAndKeyguard()
     }
 
     override fun onStop() {
+        AlarmActivityAccess.removeObserver(this)
         Notify.setAlarmUiVisible(false)
         wakeHoldHandler.removeCallbacks(releaseWakeHold)
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         super.onStop()
     }
 
+    private fun observeAcknowledgement() {
+        AlarmActivityAccess.removeObserver(this)
+        if (intent.getStringExtra(Notify.EXTRA_CUSTOM_ALERT_ID) == null) {
+            AlarmActivityAccess.observeAcknowledgement(this, intent.getIntExtra(EXTRA_ALERT_TYPE_ID, -1)) { finish() }
+        }
+    }
+
+    private fun closeIfAcknowledged(): Boolean {
+        if (!AlarmActivityAccess.isAcknowledged(intent)) return false
+        finish()
+        return true
+    }
+
     private fun showAlarmContent() {
+        if (closeIfAcknowledged()) return
+        observeAcknowledgement()
         val model = buildUiModel(intent)
         val customAlertId = intent.getStringExtra(Notify.EXTRA_CUSTOM_ALERT_ID)
         val deliveryMode = intent.getStringExtra(Notify.EXTRA_ALERT_DELIVERY_MODE)
@@ -76,6 +93,7 @@ class AlarmActivity : ComponentActivity() {
             cancelAlarmNotification()
         }
 
+        window.decorView.optOutOfForceDark()
         setContent {
             AlarmScreen(
                 primaryGlucose = model.primaryGlucose,
@@ -86,52 +104,16 @@ class AlarmActivity : ComponentActivity() {
                 trendResult = model.trendResult,
                 timeText = model.timeText,
                 onSnooze = {
-                    Notify.cancelQueuedAlarmActivityLaunch(
-                        Notify.resolveAlertKind(model.alertType?.id ?: -1),
-                        customAlertId,
-                        "alarm-activity-snooze"
+                    tk.glucodata.alerts.AlertActions.handle(
+                        model.alertType?.id ?: Notify.resolveAlertKind(-1), customAlertId, model.snoozeMinutes
                     )
-                    var productionAction = true
-                    if (customAlertId != null) {
-                        CustomAlertManager.snoozeAlert(customAlertId, model.snoozeMinutes)
-                        Notify.cancelCurrentRetrySession("alarm-activity-snooze-custom-before-stop")
-                    } else {
-                        val alertType = AlertType.fromId(Notify.resolveAlertKind(model.alertType?.id ?: -1))
-                        productionAction = alertType?.let { !AlertStateTracker.consumeManualTestAction(it) } ?: true
-                        if (productionAction) {
-                            alertType?.let {
-                                SnoozeManager.snooze(it, model.snoozeMinutes)
-                                AlertStateTracker.resetState(it)
-                            }
-                            Notify.cancelCurrentRetrySession("alarm-activity-snooze-before-stop")
-                        }
-                    }
-                    Notify.stopalarm()
-                    if (productionAction) {
-                        Notify.cancelCurrentRetrySession("alarm-activity-snooze-after-stop")
-                    }
-                    cancelAlarmNotification()
-                    finish()
+                    leaveAlarmScreen()
                 },
                 onDismiss = {
-                    Notify.cancelQueuedAlarmActivityLaunch(
-                        Notify.resolveAlertKind(model.alertType?.id ?: -1),
-                        customAlertId,
-                        "alarm-activity-dismiss"
+                    tk.glucodata.alerts.AlertActions.handle(
+                        model.alertType?.id ?: Notify.resolveAlertKind(-1), customAlertId
                     )
-                    Notify.stopalarm()
-                    if (customAlertId != null) {
-                        CustomAlertManager.dismissAlert(customAlertId)
-                    } else {
-                        AlertType.fromId(Notify.resolveAlertKind(model.alertType?.id ?: -1))?.let {
-                            if (AlertStateTracker.onAlertDismissed(it)) {
-                                SnoozeManager.clearSnooze(it)
-                                Notify.cancelCurrentRetrySession("alarm-activity-dismiss")
-                            }
-                        }
-                    }
-                    cancelAlarmNotification()
-                    finish()
+                    leaveAlarmScreen()
                 }
             )
         }
@@ -145,11 +127,17 @@ class AlarmActivity : ComponentActivity() {
         } catch (_: Throwable) {
             null
         }
-        val fallbackRate = selectAlarmRate(
-            intent.getFloatExtra(EXTRA_RATE, Float.NaN).takeIf { it.isFinite() },
-            latestRate
-        )
-        val trendResult = computeAlarmTrendResult(fallbackRate)
+        // The rate the alert fired on, carried in the intent. An alarm has to point the way
+        // the movement it fired on was going: read again here it can describe the run-up
+        // instead, and a "high" arriving with a falling arrow argues against itself in the
+        // one moment it needs to be believed.
+        val firedRate = intent.getFloatExtra(EXTRA_RATE, Float.NaN).takeIf { it.isFinite() }
+        val trendResult = if (firedRate != null) {
+            alarmTrendResult(firedRate)
+        } else {
+            // No rate came with the alarm: read one, as before.
+            computeAlarmTrendResult(selectAlarmRate(null, latestRate))
+        }
         val alertType = AlertType.fromId(intent.getIntExtra(EXTRA_ALERT_TYPE_ID, -1))
         val customAlertId = intent.getStringExtra(Notify.EXTRA_CUSTOM_ALERT_ID)
 
@@ -292,38 +280,58 @@ class AlarmActivity : ComponentActivity() {
         } ?: return false
 
         return try {
-            synchronized(SensorBluetooth.gattcallbacks) {
-                SensorBluetooth.gattcallbacks.firstOrNull { cb ->
-                    cb.SerialNumber != null && cb.SerialNumber == activeSensorSerial
-                }?.let { cb ->
-                    val viewMode = Natives.getViewMode(cb.dataptr)
-                    viewMode == 1 || viewMode == 3
-                } ?: false
-            }
+            SensorBluetooth.mygatts().firstOrNull { cb ->
+                cb.SerialNumber != null && cb.SerialNumber == activeSensorSerial
+            }?.let { cb ->
+                val viewMode = tk.glucodata.CurrentDisplaySource.resolveViewModeForSensor(cb.SerialNumber)
+                viewMode == 1 || viewMode == 3
+            } ?: false
         } catch (_: Throwable) {
             false
         }
     }
 
-    private fun fallbackAlarmTrendResult(rate: Float): TrendEngine.TrendResult {
+    /**
+     * An arrow for a rate somebody else measured. The boundaries are the engine's own, so an
+     * alarm drawn from the fired rate and a row drawn from a measured one mean the same
+     * thing by the same picture.
+     */
+    private fun alarmTrendResult(rate: Float): TrendEngine.TrendResult {
         if (!rate.isFinite()) {
             return TrendEngine.TrendResult(TrendEngine.TrendState.Unknown, 0f, 0f, 0f, 0f)
         }
-
-        val state = when {
-            rate > 2.0f -> TrendEngine.TrendState.DoubleUp
-            rate > 1.0f -> TrendEngine.TrendState.SingleUp
-            rate > 0.05f -> TrendEngine.TrendState.FortyFiveUp
-            rate >= -0.05f -> TrendEngine.TrendState.Flat
-            rate >= -1.0f -> TrendEngine.TrendState.FortyFiveDown
-            rate >= -2.0f -> TrendEngine.TrendState.SingleDown
-            else -> TrendEngine.TrendState.DoubleDown
-        }
-        return TrendEngine.TrendResult(state, rate, 0f, 1f, 0f)
+        return TrendEngine.TrendResult(TrendEngine.stateFor(rate), rate, 0f, 1f, 0f)
     }
+
+    private fun fallbackAlarmTrendResult(rate: Float): TrendEngine.TrendResult = alarmTrendResult(rate)
 
     private fun cancelAlarmNotification() {
         (getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager)?.cancel(81432)
+    }
+
+    /**
+     * Called after snooze/dismiss has been fully handled. The activity lives in
+     * its own task (taskAffinity=""), so removing that task hands the screen back
+     * to whatever was visible before the alarm: the previous app, or the lock
+     * screen. Only the task goes away; the process, the foreground service and
+     * the alarm pipeline are untouched. With the setting off, JugglucoNG is
+     * brought to the front first, which is what the shared-task setup used to do.
+     */
+    private fun leaveAlarmScreen() {
+        if (!AlertRepository.loadReturnToPreviousAppAfterAlarm()) {
+            openMainApp()
+        }
+        finishAndRemoveTask()
+    }
+
+    private fun openMainApp() {
+        try {
+            val launch = packageManager.getLaunchIntentForPackage(packageName)
+                ?: Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            startActivity(launch)
+        } catch (t: Throwable) {
+            Log.stack(LOG_ID, "openMainApp", t)
+        }
     }
 
     private fun turnScreenOnAndKeyguard() {
@@ -363,6 +371,7 @@ class AlarmActivity : ComponentActivity() {
         const val EXTRA_ALERT_TYPE_ID = "EXTRA_ALERT_TYPE_ID"
         const val EXTRA_RATE = "EXTRA_RATE"
         private const val ALARM_SCREEN_WAKE_HOLD_MS = 45_000L
+        private const val LOG_ID = "AlarmActivity"
 
         fun createIntent(
             context: Context,
@@ -378,7 +387,7 @@ class AlarmActivity : ComponentActivity() {
                 putExtra(EXTRA_ALARM_MESSAGE, alarmMessage)
                 putExtra(EXTRA_ALERT_TYPE_ID, alertTypeId)
                 putExtra(EXTRA_RATE, rate)
-                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK
             }
         }
     }

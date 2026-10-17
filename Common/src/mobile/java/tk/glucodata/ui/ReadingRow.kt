@@ -2,6 +2,7 @@
 
 package tk.glucodata.ui
 
+import androidx.compose.material3.ButtonDefaults
 import android.view.HapticFeedbackConstants
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
@@ -22,6 +23,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.CloudDownload
 import androidx.compose.material.icons.filled.WaterDrop
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -40,19 +42,25 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.graphics.drawOutline
+import androidx.compose.foundation.layout.height
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.Layout
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
-import androidx.core.graphics.ColorUtils
 import kotlinx.coroutines.delay
 import tk.glucodata.R
+import tk.glucodata.GlucoseReadingSource
 import tk.glucodata.SensorIdentity
 import tk.glucodata.data.journal.JournalEntry
 import tk.glucodata.data.journal.JournalFood
@@ -68,6 +76,14 @@ fun ReadingRow(
     index: Int = 0,
     totalCount: Int = 1,
     history: List<GlucosePoint> = emptyList(), // Advanced Trend: Need history
+    // The row's historical "Δ" (see readingDeltaTexts); null hides the slot entirely.
+    deltaText: String? = null,
+    /**
+     * The same movement the Δ beside it states, in mg/dL per minute. When it is there the
+     * arrow turns by it, so the two cannot disagree; without it the arrow falls back to the
+     * regression, which is also the case where no number sits next to it.
+     */
+    deltaRateMgdlPerMinute: Float? = null,
     peerReadings: List<GlucosePoint> = emptyList(),
     peerSeries: Map<String, PeerSensorSeries> = emptyMap(),
     // True whenever the dashboard is in multi-sensor mode, even if THIS row has
@@ -91,6 +107,7 @@ fun ReadingRow(
     isGroupStart: Boolean = index == 0,
     isGroupEnd: Boolean = index == totalCount - 1,
     dividerHorizontalInset: Dp = 16.dp,
+    onBaselineHeightMeasured: ((Int) -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     // --- DYNAMIC COLOR LOGIC ---
@@ -121,52 +138,18 @@ fun ReadingRow(
     val stockColor = MaterialTheme.colorScheme.surfaceContainerLow
     val staleColor = MaterialTheme.colorScheme.surfaceContainerHighest // Slightly darker/different
 
-    val ageState = remember(point.timestamp) { mutableStateOf(System.currentTimeMillis() - point.timestamp) }
-    // Timer to update age for the active item
+    // The newest row eases from the accent colour to the stock row colour over its first minute
+    // and darkens once the reading is overdue. The age ticks once a second, so it is read only
+    // in the draw phase below: a tick redraws this row's background and divider, and never
+    // recomposes the row.
+    val ageState = remember(point.timestamp) { mutableLongStateOf(System.currentTimeMillis() - point.timestamp) }
     if (isActive) {
         LaunchedEffect(point.timestamp) {
             while (true) {
-                ageState.value = System.currentTimeMillis() - point.timestamp
-                delay(1000) // Update every second
+                ageState.longValue = System.currentTimeMillis() - point.timestamp
+                delay(1000)
             }
         }
-    }
-
-    val containerColor = if (isActive) {
-        val age = ageState.value
-        when {
-            age < 60_000 -> {
-                // Phase 1: Fade to Stock
-                val progress = age / 60_000f
-                Color(
-                    ColorUtils.blendARGB(
-                        activeColor.toArgb(),
-                        stockColor.toArgb(),
-                        progress.coerceIn(0f, 1f)
-                    )
-                )
-            }
-            age < 90_000 -> {
-                // Phase 2: Stock (Stable)
-                stockColor
-            }
-            else -> {
-                 // Phase 3: Stale (Darken slowly)
-                 // "slowly start getting different darker shade"
-                 // Let's cap the darkening at 100% after another 60s (just to have a bound)
-                 val staleProgress = ((age - 90_000) / 60_000f).coerceIn(0f, 1f)
-                 Color(
-                    ColorUtils.blendARGB(
-                        stockColor.toArgb(),
-                        staleColor.toArgb(),
-                        staleProgress
-                    )
-                )
-            }
-        }
-    } else {
-        // History: Always Stock
-        stockColor
     }
 
     // Shape:
@@ -181,41 +164,41 @@ fun ReadingRow(
         else -> RectangleShape
     }
 
-    // Divider Alpha Logic
-    val baseDividerAlpha = 0.1f // User Request: "perhaps make it 0.1f"
-    val dividerAlpha = if (isActive) {
-        val age = ageState.value
-        when {
-            age < 60_000 -> {
-                // Fresh: Color is Distinct -> Stock. Divider: Hidden -> Visible.
-                val progress = age / 60_000f
-                baseDividerAlpha * progress.coerceIn(0f, 1f)
-            }
-            age < 90_000 -> {
-                // Normal: Color is Stock. Divider: Visible.
-                baseDividerAlpha
-            }
-            else -> {
-                // Stale: Color is Stock -> Distinct. Divider: Visible -> Hidden.
-                val staleProgress = ((age - 90_000) / 60_000f).coerceIn(0f, 1f)
-                baseDividerAlpha * (1f - staleProgress)
-            }
-        }
-    } else {
-        baseDividerAlpha
-    }
-
     // --- ADVANCED TREND ENGINE ---
-    // Calculate on the fly using the passed history subset
-    val trendResult = remember(history, index) {
-        val relevantHistory = if (history.isNotEmpty()) history.drop(index) else listOf(point)
-        val nativeList = relevantHistory.map { tk.glucodata.GlucosePoint(it.timestamp, it.value, it.rawValue) }
-        tk.glucodata.logic.TrendEngine.calculateTrend(nativeList, useRaw = (viewMode == 1 || viewMode == 3), isMmol = tk.glucodata.ui.util.GlucoseFormatter.isMmol(unit))
+    // Calculate on the fly using the passed history subset. The engine reads
+    // only timestamp, value and raw value, so it is handed the points as they
+    // are: the round trip through the native point type was two copies of the
+    // tail per row for nothing.
+    val regressed = remember(history, index) {
+        val relevantHistory = when {
+            history.isEmpty() -> listOf(point)
+            index == 0 -> history
+            else -> history.drop(index)
+        }
+        tk.glucodata.logic.TrendEngine.calculateTrend(relevantHistory, useRaw = (viewMode == 1 || viewMode == 3), isMmol = tk.glucodata.ui.util.GlucoseFormatter.isMmol(unit))
+    }
+    // A row states one movement. Where the Δ knows it, the arrow says the same thing rather
+    // than the longer regression, which answers a different question and can point the other
+    // way during a reversal — Δ −5 beside an arrow up is the app contradicting itself.
+    val trendResult = remember(regressed, deltaRateMgdlPerMinute) {
+        rowTrendResult(regressed, deltaRateMgdlPerMinute)
     }
 
     Surface(
         modifier = modifier
             .fillMaxWidth()
+            .then(
+                if (isActive) {
+                    Modifier.drawBehind {
+                        drawOutline(
+                            outline = shape.createOutline(size, layoutDirection, this),
+                            color = activeRowColor(ageState.longValue, activeColor, stockColor, staleColor)
+                        )
+                    }
+                } else {
+                    Modifier
+                }
+            )
             .then(
                 when {
                     onDeleteReading != null && hasValueClick -> Modifier.combinedClickable(
@@ -231,7 +214,7 @@ fun ReadingRow(
                 }
             ),
         shape = shape,
-        color = containerColor,
+        color = if (isActive) Color.Transparent else stockColor,
         // User Request: Kill shadows (0dp)
         tonalElevation = 0.dp,
         shadowElevation = 0.dp
@@ -240,32 +223,28 @@ fun ReadingRow(
             val hasInlineJournalEntries = journalEntries.isNotEmpty() && onJournalEntryClick != null
             val useClassicLayout = !hasInlineJournalEntries
             val rowMinHeight = if (journalChipExpanded && hasInlineJournalEntries) 64.dp else 48.dp
-            val valueMinWidth = if (showLeadingAction || hasInlineJournalEntries) 104.dp else 124.dp
+            val valueMinWidth = when {
+                // The value already measures at its natural width. Reserving another
+                // 104 dp here forced three short journal chips onto two lines.
+                hasInlineJournalEntries -> 80.dp
+                showLeadingAction -> 104.dp
+                else -> 124.dp
+            }
             val leadingActionSlotWidth = 44.dp
             val trendSlotWidth = 30.dp
-            val timeStyle = MaterialTheme.typography.bodySmall
+            val timeStyle = if (isActive) MaterialTheme.typography.bodySmallEmphasized else MaterialTheme.typography.bodySmall
             val timeColor = if (isActive) MaterialTheme.colorScheme.onSecondaryContainer else MaterialTheme.colorScheme.onSurfaceVariant
-            val timeWeight = if (isActive) FontWeight.Bold else FontWeight.Normal
+            val cloneTransport = GlucoseReadingSource.cloneTransport(point.source)
+            val isNightscoutSource = point.source == GlucoseReadingSource.NIGHTSCOUT
             val isRawModeRR = viewMode == 1 || viewMode == 3
             val calibrationSensorId = sensorId?.takeIf { it.isNotBlank() }
-            val hasCalibrationRR = !tk.glucodata.data.calibration.CalibrationManager.shouldOverwriteSensorValues() &&
-                tk.glucodata.data.calibration.CalibrationManager.hasActiveCalibration(
-                    isRawModeRR,
-                    calibrationSensorId
-                )
-            val calibratedValueRR = if (hasCalibrationRR) {
-                val baseValue = if (isRawModeRR) point.rawValue else point.value
-                if (baseValue.isFinite() && baseValue > 0.1f) {
-                    tk.glucodata.data.calibration.CalibrationManager.getCalibratedValue(
-                        baseValue,
-                        point.timestamp,
-                        isRawModeRR,
-                        sensorIdOverride = calibrationSensorId
-                    )
-                } else {
-                    null
-                }
-            } else null
+            // Recorded value if this reading has one, otherwise the projection —
+            // see SealedGlucoseValue for why every surface asks the same way.
+            val calibratedValueRR = SealedGlucoseValue.calibratedFor(
+                point = point,
+                isRawMode = isRawModeRR,
+                sensorId = calibrationSensorId
+            )
             val dvs = getDisplayValues(point, viewMode, unit, calibratedValueRR)
             val primaryBaseColor = if (isActive) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.8f)
             // Multi-sensor: every sensor's value carries a subtle identity tint
@@ -296,11 +275,50 @@ fun ReadingRow(
             val primaryTrendColor = if (isMultiSensor) primaryColor.copy(alpha = 0.7f) else tertiaryColor
 
             @Composable
+            fun ReadingTime() {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = tk.glucodata.MinuteTimeFormat.format(point.timestamp),
+                        style = timeStyle,
+                        color = timeColor
+                    )
+                    if (cloneTransport != null) {
+                        Spacer(modifier = Modifier.width(4.dp))
+                        CloneSourceMark(
+                            transport = cloneTransport,
+                            showLabel = false,
+                            tint = timeColor,
+                            iconSize = 13.dp,
+                        )
+                    } else if (isNightscoutSource) {
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Icon(
+                            imageVector = Icons.Default.CloudDownload,
+                            contentDescription = stringResource(R.string.journal_source_nightscout),
+                            tint = timeColor,
+                            modifier = Modifier.size(14.dp),
+                        )
+                    }
+                }
+            }
+
+            @Composable
             fun ReadingValueContent(modifier: Modifier = Modifier) {
                 Row(
                     modifier = modifier,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
+                    if (!deltaText.isNullOrEmpty()) {
+                        Text(
+                            text = deltaText,
+                            style = timeStyle.copy(fontFeatureSettings = "tnum"),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(
+                                alpha = if (isActive) 0.65f else 0.5f
+                            )
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                    }
+
                     if (tk.glucodata.data.calibration.CalibrationManager.hasCalibrationAt(point.timestamp, isRawModeRR)) {
                         Icon(
                             imageVector = Icons.Filled.WaterDrop,
@@ -364,23 +382,11 @@ fun ReadingRow(
                     peerMode,
                     calibrations
                 ) {
-                    if (!tk.glucodata.data.calibration.CalibrationManager.shouldOverwriteSensorValues() &&
-                        tk.glucodata.data.calibration.CalibrationManager.hasActiveCalibration(isRawModePeer, peerSensorId)
-                    ) {
-                        val baseValue = if (isRawModePeer) peer.rawValue else peer.value
-                        if (baseValue.isFinite() && baseValue > 0.1f) {
-                            tk.glucodata.data.calibration.CalibrationManager.getCalibratedValue(
-                                baseValue,
-                                peer.timestamp,
-                                isRawModePeer,
-                                sensorIdOverride = peerSensorId
-                            )
-                        } else {
-                            null
-                        }
-                    } else {
-                        null
-                    }
+                    SealedGlucoseValue.calibratedFor(
+                        point = peer,
+                        isRawMode = isRawModePeer,
+                        sensorId = peerSensorId
+                    )
                 }
                 val peerTrendResult = remember(peer.timestamp, peer.sensorSerial, peerSensorSeries, peerMode, unit) {
                     val nativeList = MultiSensorDisplay.recentWindow(
@@ -478,7 +484,7 @@ fun ReadingRow(
                             Icon(
                                 imageVector = Icons.Default.Add,
                                 contentDescription = null,
-                                modifier = Modifier.size(13.dp),
+                                modifier = Modifier.size(14.dp),
                                 tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(
                                     alpha = 0.54f + (0.34f * leadingActionEmphasis.coerceIn(0f, 1f))
                                 )
@@ -492,18 +498,17 @@ fun ReadingRow(
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
+                        .then(
+                            if (onBaselineHeightMeasured != null) {
+                                Modifier.onSizeChanged { onBaselineHeightMeasured(it.height) }
+                            } else {
+                                Modifier
+                            }
+                        )
                         .padding(horizontal = 16.dp, vertical = 12.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text(
-                        text = java.text.SimpleDateFormat(
-                            "HH:mm",
-                            java.util.Locale.getDefault()
-                        ).format(java.util.Date(point.timestamp)),
-                        style = timeStyle,
-                        fontWeight = timeWeight,
-                        color = timeColor
-                    )
+                    ReadingTime()
 
                     if (showLeadingAction) {
                         Box(
@@ -531,18 +536,23 @@ fun ReadingRow(
                         .fillMaxWidth()
                         .heightIn(min = rowMinHeight)
                         .padding(start = 16.dp),
-                    verticalAlignment = Alignment.CenterVertically
+                    // Keep the timestamp and glucose anchored to the first chip line when
+                    // compact entries wrap. Extra chip lines grow only the middle slot.
+                    verticalAlignment = Alignment.Top
                 ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(
-                            text = java.text.SimpleDateFormat(
-                                "HH:mm",
-                                java.util.Locale.getDefault()
-                            ).format(java.util.Date(point.timestamp)),
-                            style = timeStyle,
-                            fontWeight = timeWeight,
-                            color = timeColor
-                        )
+                    Row(
+                        modifier = Modifier
+                            .defaultMinSize(minHeight = rowMinHeight)
+                            .then(
+                                if (onBaselineHeightMeasured != null) {
+                                    Modifier.onSizeChanged { onBaselineHeightMeasured(it.height) }
+                                } else {
+                                    Modifier
+                                }
+                            ),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        ReadingTime()
 
                         if (showLeadingAction) {
                             Box(
@@ -563,25 +573,43 @@ fun ReadingRow(
                                 .defaultMinSize(minHeight = rowMinHeight)
                                 .padding(
                                     top = if (journalChipExpanded) 8.dp else 0.dp,
-                                    end = 12.dp,
+                                    end = 8.dp,
                                     bottom = if (journalChipExpanded) 8.dp else 0.dp
                                 ),
                             contentAlignment = Alignment.CenterStart
                         ) {
-                            FlowRow(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                verticalArrangement = Arrangement.spacedBy(8.dp)
-                            ) {
-                                journalEntries.forEach { entry ->
-                                    JournalInlineChip(
-                                        entry = entry,
-                                        unit = unit,
-                                        insulinPreset = entry.insulinPresetId?.let(journalPresetsById::get),
-                                        food = entry.foodId?.let(journalFoodsById::get),
-                                        expanded = journalChipExpanded,
-                                        onClick = { onJournalEntryClick?.invoke(entry) }
-                                    )
+                            if (journalChipExpanded) {
+                                FlowRow(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                                ) {
+                                    journalEntries.forEach { entry ->
+                                        JournalInlineChip(
+                                            entry = entry,
+                                            unit = unit,
+                                            insulinPreset = entry.insulinPresetId?.let(journalPresetsById::get),
+                                            food = entry.foodId?.let(journalFoodsById::get),
+                                            expanded = true,
+                                            onClick = { onJournalEntryClick?.invoke(entry) }
+                                        )
+                                    }
+                                }
+                            } else {
+                                CompactJournalFlowRow(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    firstLineSlotHeight = rowMinHeight
+                                ) {
+                                    journalEntries.forEach { entry ->
+                                        JournalInlineChip(
+                                            entry = entry,
+                                            unit = unit,
+                                            insulinPreset = entry.insulinPresetId?.let(journalPresetsById::get),
+                                            food = entry.foodId?.let(journalFoodsById::get),
+                                            expanded = false,
+                                            onClick = { onJournalEntryClick?.invoke(entry) }
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -613,10 +641,16 @@ fun ReadingRow(
             }
 
             if (index < totalCount - 1) {
-                HorizontalDivider(
-                    modifier = Modifier.padding(horizontal = dividerHorizontalInset),
-                    color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = dividerAlpha),
-                    thickness = 1.dp
+                val dividerColor = MaterialTheme.colorScheme.outlineVariant
+                Spacer(
+                    modifier = Modifier
+                        .padding(horizontal = dividerHorizontalInset)
+                        .fillMaxWidth()
+                        .height(1.dp)
+                        .drawBehind {
+                            val alpha = if (isActive) activeRowDividerAlpha(ageState.longValue) else ROW_DIVIDER_ALPHA
+                            drawRect(dividerColor.copy(alpha = alpha))
+                        }
                 )
             }
         }
@@ -632,17 +666,93 @@ fun ReadingRow(
                     onClick = {
                         onDeleteReading(point)
                         showDeleteDialog = false
-                    }
+                    },
+                    shapes = ButtonDefaults.shapes(),
+                    contentPadding = ButtonDefaults.TextButtonContentPadding
                 ) {
                     Text(text = stringResource(R.string.delete))
                 }
             },
             dismissButton = {
-                TextButton(onClick = { showDeleteDialog = false }) {
+                TextButton(onClick = { showDeleteDialog = false }, shapes = ButtonDefaults.shapes(), contentPadding = ButtonDefaults.TextButtonContentPadding) {
                     Text(text = stringResource(R.string.cancel))
                 }
             }
         )
+    }
+}
+
+/**
+ * Packs compact journal chips by their visible bounds while keeping the first line aligned
+ * with the reading's fixed-height timestamp and value slots.
+ */
+@Composable
+private fun CompactJournalFlowRow(
+    modifier: Modifier = Modifier,
+    firstLineSlotHeight: Dp,
+    horizontalSpacing: Dp = 6.dp,
+    verticalSpacing: Dp = 4.dp,
+    content: @Composable () -> Unit
+) {
+    Layout(
+        modifier = modifier,
+        content = content
+    ) { measurables, constraints ->
+        val horizontalSpacingPx = horizontalSpacing.roundToPx()
+        val verticalSpacingPx = verticalSpacing.roundToPx()
+        val firstLineSlotHeightPx = firstLineSlotHeight.roundToPx()
+        val childConstraints = constraints.copy(minWidth = 0, minHeight = 0)
+        val placeables = measurables.map { it.measure(childConstraints) }
+        val xPositions = IntArray(placeables.size)
+        val lineIndices = IntArray(placeables.size)
+        val lineHeights = mutableListOf<Int>()
+        val availableWidth = if (constraints.hasBoundedWidth) constraints.maxWidth else Int.MAX_VALUE
+
+        var lineIndex = 0
+        var lineX = 0
+        var usedWidth = 0
+        placeables.forEachIndexed { index, placeable ->
+            val spacedX = if (lineX == 0) 0 else lineX + horizontalSpacingPx
+            if (lineX > 0 && spacedX + placeable.width > availableWidth) {
+                lineIndex += 1
+                lineX = 0
+            } else {
+                lineX = spacedX
+            }
+            while (lineHeights.size <= lineIndex) lineHeights.add(0)
+            xPositions[index] = lineX
+            lineIndices[index] = lineIndex
+            lineHeights[lineIndex] = maxOf(lineHeights[lineIndex], placeable.height)
+            lineX += placeable.width
+            usedWidth = maxOf(usedWidth, lineX)
+        }
+
+        val lineY = IntArray(lineHeights.size)
+        var firstLineInset = 0
+        if (lineHeights.isNotEmpty()) {
+            firstLineInset = ((firstLineSlotHeightPx - lineHeights[0]) / 2).coerceAtLeast(0)
+            lineY[0] = firstLineInset
+            for (index in 1 until lineHeights.size) {
+                lineY[index] = lineY[index - 1] + lineHeights[index - 1] + verticalSpacingPx
+            }
+        }
+        val contentHeight = if (lineHeights.isEmpty()) {
+            firstLineSlotHeightPx
+        } else {
+            maxOf(firstLineSlotHeightPx, lineY.last() + lineHeights.last() + firstLineInset)
+        }
+        val requestedWidth = if (constraints.hasBoundedWidth) constraints.maxWidth else usedWidth
+
+        layout(
+            width = requestedWidth.coerceIn(constraints.minWidth, constraints.maxWidth),
+            height = contentHeight.coerceIn(constraints.minHeight, constraints.maxHeight)
+        ) {
+            placeables.forEachIndexed { index, placeable ->
+                val childLine = lineIndices[index]
+                val centeredY = lineY[childLine] + (lineHeights[childLine] - placeable.height) / 2
+                placeable.placeRelative(xPositions[index], centeredY)
+            }
+        }
     }
 }
 
@@ -698,8 +808,7 @@ fun JournalTimelineRow(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault())
-                        .format(java.util.Date(timestamp)),
+                    text = tk.glucodata.MinuteTimeFormat.format(timestamp),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.width(timeSlotWidth)
@@ -744,4 +853,37 @@ fun JournalTimelineRow(
             }
         }
     }
+}
+
+/**
+ * The arrow's own reading of a row: the movement the Δ beside it states when there is one,
+ * the regression otherwise. Only the velocity and the state it maps to are replaced; how
+ * confident and how noisy the neighbourhood is are properties of the data, not of which
+ * window was measured.
+ */
+internal fun rowTrendResult(
+    regressed: tk.glucodata.logic.TrendEngine.TrendResult,
+    deltaRateMgdlPerMinute: Float?,
+): tk.glucodata.logic.TrendEngine.TrendResult {
+    val rate = deltaRateMgdlPerMinute?.takeIf { it.isFinite() } ?: return regressed
+    return regressed.copy(state = tk.glucodata.logic.TrendEngine.stateFor(rate), velocity = rate)
+}
+
+private const val ROW_DIVIDER_ALPHA = 0.1f
+private const val ACTIVE_ROW_SETTLE_MS = 60_000L
+private const val ACTIVE_ROW_STALE_AFTER_MS = 90_000L
+private const val ACTIVE_ROW_STALE_SPAN_MS = 60_000L
+
+/** Newest row: accent to stock over its first minute, stock until 90s, then toward the stale shade. */
+internal fun activeRowColor(ageMs: Long, active: Color, stock: Color, stale: Color): Color = when {
+    ageMs < ACTIVE_ROW_SETTLE_MS -> lerp(active, stock, (ageMs / ACTIVE_ROW_SETTLE_MS.toFloat()).coerceIn(0f, 1f))
+    ageMs < ACTIVE_ROW_STALE_AFTER_MS -> stock
+    else -> lerp(stock, stale, ((ageMs - ACTIVE_ROW_STALE_AFTER_MS) / ACTIVE_ROW_STALE_SPAN_MS.toFloat()).coerceIn(0f, 1f))
+}
+
+/** The newest row's divider follows its colour: hidden while accented, back once settled, gone again when stale. */
+internal fun activeRowDividerAlpha(ageMs: Long): Float = when {
+    ageMs < ACTIVE_ROW_SETTLE_MS -> ROW_DIVIDER_ALPHA * (ageMs / ACTIVE_ROW_SETTLE_MS.toFloat()).coerceIn(0f, 1f)
+    ageMs < ACTIVE_ROW_STALE_AFTER_MS -> ROW_DIVIDER_ALPHA
+    else -> ROW_DIVIDER_ALPHA * (1f - ((ageMs - ACTIVE_ROW_STALE_AFTER_MS) / ACTIVE_ROW_STALE_SPAN_MS.toFloat()).coerceIn(0f, 1f))
 }

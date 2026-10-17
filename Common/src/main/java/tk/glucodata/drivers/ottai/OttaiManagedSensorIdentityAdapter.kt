@@ -7,8 +7,10 @@ import tk.glucodata.Applic
 import tk.glucodata.SensorBluetooth
 import tk.glucodata.SuperGattCallback
 import tk.glucodata.drivers.ManagedSensorIdentityAdapter
+import tk.glucodata.drivers.ManagedSensorUiFamily
 
 object OttaiManagedSensorIdentityAdapter : ManagedSensorIdentityAdapter {
+    override val uiFamily = ManagedSensorUiFamily.OTTAI
 
     override fun matchesCallbackId(callbackId: String?, sensorId: String): Boolean {
         val normalized = callbackId?.trim().takeIf { !it.isNullOrEmpty() } ?: return false
@@ -64,6 +66,7 @@ object OttaiManagedSensorIdentityAdapter : ManagedSensorIdentityAdapter {
 
     override fun persistedSensorIds(context: Context): List<String> =
         OttaiRegistry.persistedRecords(context)
+            .filter { OttaiRegistry.isManagedConnectionAuthorized(context, it.sensorId) }
             .map { OttaiRegistry.resolveCanonicalSensorId(context, it.sensorId) ?: it.sensorId }
             .distinct()
 
@@ -77,6 +80,10 @@ object OttaiManagedSensorIdentityAdapter : ManagedSensorIdentityAdapter {
     }
 
     override fun removePersistedSensor(context: Context, sensorId: String?) {
+        // Local only. Releasing the account binding is permanent: the account can no longer fetch
+        // this sensor's credentials and the official app loses it too. That is the wizard's
+        // explicit Unbind action; doing it on every Disconnect (as fa70a8af did) destroyed the
+        // only remaining way back for a sensor whose credentials were never exported.
         OttaiRegistry.removeSensor(context, sensorId)
     }
 

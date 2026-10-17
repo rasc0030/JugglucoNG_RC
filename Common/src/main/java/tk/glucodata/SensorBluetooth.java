@@ -46,6 +46,7 @@ import java.util.Objects;
 import java.util.Arrays;
 import java.util.UUID;
 import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 
 import androidx.annotation.RequiresApi;
@@ -102,6 +103,9 @@ public class SensorBluetooth {
             boolean shouldnotscan = true;
             final var now = System.currentTimeMillis();
             for (var cb : wasblue.gattcallbacks) {
+                if (SensorOwnershipRuntime.blocksLocalConnection(cb.SerialNumber)) {
+                    continue;
+                }
                 shouldnotscan = (cb.reconnect(now) && shouldnotscan);
             }
             if (!shouldnotscan) {
@@ -133,10 +137,14 @@ public class SensorBluetooth {
             return false;
         }
         boolean scan = false;
-        for (var cb : gattcallbacks)
+        for (var cb : gattcallbacks) {
+            if (mirroredOverClone(cb, "connectToAllActiveDevices")) {
+                continue;
+            }
             if (!cb.connectDevice(delayMillis)) {
                 scan = true;
             }
+        }
         if (scan) {
             return scanStarter(delayMillis);
         }
@@ -148,6 +156,9 @@ public class SensorBluetooth {
             Log.i(LOG_ID, "connectToActiveDevice(" + cb.SerialNumber + "," + delayMillis + ")");
         }
         ;
+        if (mirroredOverClone(cb, "connectToActiveDevice")) {
+            return false;
+        }
         if (!cb.connectDevice(delayMillis) && !mScanning) {
             return scanStarter(delayMillis);
         }
@@ -209,7 +220,7 @@ public class SensorBluetooth {
         } catch (Throwable e) {
             Log.stack(LOG_ID, "getCallback", e);
             if (!Applic.canBluetooth())
-                Applic.Toaster(R.string.turn_on_nearby_devices_permission);
+                Applic.missingScanPermission();
             return null;
         }
     }
@@ -287,7 +298,7 @@ public class SensorBluetooth {
         } catch (Throwable e) {
             Log.stack(LOG_ID, "checkdevice", e);
             if (Build.VERSION.SDK_INT > 30 && !Applic.mayscan())
-                Applic.Toaster(R.string.turn_on_nearby_devices_permission);
+                Applic.missingScanPermission();
             return true;
         }
     }
@@ -337,7 +348,7 @@ public class SensorBluetooth {
                         ? null
                         : scanResult.getScanRecord().getDeviceName();
                 SuperGattCallback cb = getCallback(scanResult.getDevice(), advertisedName, scanResult);
-                if (cb != null) {
+                if (cb != null && !SensorOwnershipRuntime.blocksLocalConnection(cb.SerialNumber)) {
                     cb.onScanResult(scanResult);
                 }
             }
@@ -458,7 +469,7 @@ public class SensorBluetooth {
                 } catch (Throwable e) {
                     Log.stack(LOG_ID, e);
                     if (Build.VERSION.SDK_INT > 30 && !Applic.mayscan())
-                        Applic.Toaster(R.string.turn_on_nearby_devices_permission);
+                        Applic.missingScanPermission();
                     return false;
                 }
                 return true;
@@ -579,6 +590,19 @@ public class SensorBluetooth {
     }
 
     private boolean scanstart = false;
+
+    /**
+     * Whether the managed scan is running or about to run, the same condition scanStarter()
+     * refuses a second scan on. Android throttles startScan per app, not per scanner: a driver
+     * opening its own scanner while this one is up spends one of the five starts the platform
+     * allows in 30s, and the call the platform then fails can be this scan -- the discovery and
+     * recovery path for every sensor family.
+     */
+    static public boolean scanActiveOrPending() {
+        final SensorBluetooth blue = blueone;
+        return blue != null && (blue.mScanning || blue.scanstart);
+    }
+
     long scantime = 0L;
     final private Runnable scanRunnable = new Runnable() {
         @Override
@@ -637,8 +661,9 @@ public class SensorBluetooth {
         ;
         var main = MainActivity.thisone;
         if (!((main == null && Applic.mayscan()) || (main != null && main.finepermission()))) {
-            Applic.Toaster((Build.VERSION.SDK_INT > 30) ? R.string.turn_on_nearby_devices_permission
-                    : R.string.turn_on_location_permission);
+            // Without an Activity the permission cannot be asked for here; note
+            // it so the next resume does, instead of only toasting forever.
+            Applic.missingScanPermission();
             return true;
         }
 
@@ -722,13 +747,12 @@ public class SensorBluetooth {
         scanstart = false;
     }
 
-    // static final ArrayList<SuperGattCallback> gattcallbacks = new ArrayList<>();
-    public static final ArrayList<SuperGattCallback> gattcallbacks = new ArrayList<>();
+    // Readers take snapshots without waiting for connection processing or teardown.
+    // Compound roster updates still use this object's monitor to serialize writers.
+    public static final CopyOnWriteArrayList<SuperGattCallback> gattcallbacks = new CopyOnWriteArrayList<>();
 
     public static ArrayList<SuperGattCallback> mygatts() {
-        synchronized (gattcallbacks) {
-            return new ArrayList<>(gattcallbacks);
-        }
+        return new ArrayList<>(gattcallbacks);
     }
 
     private static void addSelectionCandidate(List<String> candidates, Set<String> seen, String serial) {
@@ -780,10 +804,8 @@ public class SensorBluetooth {
         } catch (Throwable t) {
             Log.e(LOG_ID, "resolvePreferredCurrentSensor activeSensors failed: " + t.getMessage());
         }
-        synchronized (gattcallbacks) {
-            for (SuperGattCallback cb : gattcallbacks) {
-                addSelectionCandidate(candidates, seen, cb.SerialNumber);
-            }
+        for (SuperGattCallback cb : mygatts()) {
+            addSelectionCandidate(candidates, seen, cb.SerialNumber);
         }
         return SensorIdentity.resolveAvailableMainSensor(
                 Natives.lastsensorname(),
@@ -1078,6 +1100,25 @@ public class SensorBluetooth {
         Natives.setmaxsensors(gattcallbacks.size());
     }
 
+    /**
+     * Materialize drivers for managed sensors that were persisted after Bluetooth already
+     * started. {@link #addPersistedManagedCallbacks()} otherwise runs only from start()/
+     * startDevices(), so a sensor that arrives mid-run — a watch receiving a handoff — has a
+     * stored record and no driver: nothing connects, nothing falls back to broadcast, and the
+     * claim just times out.
+     */
+    public static void ensurePersistedManagedCallbacks() {
+        final SensorBluetooth one = blueone;
+        if (one == null) {
+            return;
+        }
+        try {
+            one.addPersistedManagedCallbacks();
+        } catch (Throwable th) {
+            Log.stack(LOG_ID, "ensurePersistedManagedCallbacks", th);
+        }
+    }
+
     synchronized void addPersistedManagedCallbacks() {
         final Context context = Applic.app;
         if (context == null) {
@@ -1093,7 +1134,11 @@ public class SensorBluetooth {
                 continue;
             }
             if (findGattCallbackIndex(cb.SerialNumber) >= 0) {
-                cb.free();
+                // The persisted id and the driver's own serial can spell the same sensor
+                // differently, so this is reachable even though the id was checked above.
+                // The duplicate shares the live callback's dataptr — freeing it would
+                // release that sensor's native data out from under it.
+                cb.discard();
                 continue;
             }
             gattcallbacks.add(cb);
@@ -1168,6 +1213,43 @@ public class SensorBluetooth {
                 && gatt.charcha[0] > gatt.constatchange[1];
     }
 
+    /** Wall-clock time of the last connection failure recorded for the sensor. */
+    public static long connectionStatusChangedAt(SuperGattCallback gatt) {
+        return gatt == null ? 0L : gatt.constatchange[1];
+    }
+
+    /** Keep mirrored sensor records visible without claiming their physical transmitter. */
+    public static void blockLocalCloneConnection(String sensorId) {
+        if (sensorId == null || sensorId.isEmpty()) return;
+        synchronized (gattcallbacks) {
+            for (SuperGattCallback callback : gattcallbacks) {
+                if (SensorIdentity.matches(callback.SerialNumber, sensorId)) {
+                    callback.setPause(true);
+                    callback.closeGattTransport();
+                }
+            }
+        }
+    }
+
+    public static void retireCloneSensor(String sensorId) {
+        if (sensorId == null || sensorId.isEmpty()) return;
+        synchronized (gattcallbacks) {
+            for (int index = gattcallbacks.size() - 1; index >= 0; index--) {
+                SuperGattCallback callback = gattcallbacks.get(index);
+                if (SensorIdentity.matches(callback.SerialNumber, sensorId)) {
+                    callback.free();
+                    gattcallbacks.remove(index);
+                }
+            }
+            Natives.setmaxsensors(gattcallbacks.size());
+        }
+        final String current = SensorIdentity.resolveMainSensor();
+        if (SensorIdentity.matches(current, sensorId)) {
+            final String replacement = resolveReplacementSensorSerial(sensorId);
+            setCurrentSensorSelection(replacement != null ? replacement : "");
+        }
+    }
+
     // --- KOTLIN SENSORS (AiDex) SUPPORT ---
     public static void addAiDexSensor(Context context, String name, String address) {
         if (context == null || name == null || name.trim().isEmpty() || address == null || address.trim().isEmpty()) {
@@ -1192,6 +1274,8 @@ public class SensorBluetooth {
             java.util.Set<String> newSensors = new java.util.HashSet<>(sensors);
             newSensors.add(name + "|" + address);
             prefs.edit().putStringSet("aidex_sensors", newSensors).apply();
+            // aidex_sensors feeds AiDexManagedSensorIdentityAdapter.resolveCanonicalSensorId.
+            SensorIdentity.invalidateCaches();
 
             // If SensorBluetooth is alive, add it immediately
             if (blueone != null) {
@@ -1243,6 +1327,10 @@ public class SensorBluetooth {
             if (active != null && active.length > 0) {
                 blueone.setDevices(active);
             }
+            // With no native sensors setDevices() is skipped, and with it the managed
+            // callbacks removeDevices() just freed; a Nightscout follower would stay gone.
+            tk.glucodata.drivers.nightscout.NightscoutFollowerRegistry.INSTANCE
+                    .ensureFollowerRunning(Applic.app);
             return true;
         } catch (Throwable t) {
             Log.stack(LOG_ID, "syncNativeDevicesNoBluetooth", t);
@@ -1419,113 +1507,117 @@ public class SensorBluetooth {
             blueone = null;
             return false;
         }
-        String[] nativeDevs = filterActiveSensorNames(Natives.activeSensors());
-
-        ArrayList<String> candidateDevs = new ArrayList<>();
-        if (nativeDevs != null) {
-            for (String s : nativeDevs) {
-                if (isValidShortSensorName(s)) {
-                    candidateDevs.add(s);
-                }
-            }
-        }
-        for (String serial : ManagedSensorIdentityRegistry.INSTANCE.persistedSensorIds(Applic.app)) {
-            if (isValidShortSensorName(serial)) {
-                candidateDevs.add(serial);
-            }
-        }
-        ArrayList<String> allDevs = distinctRuntimeSensorIds(candidateDevs);
-
-        String[] devs = allDevs.toArray(new String[0]);
-        ArrayList<Integer> rem = new ArrayList<>();
-        int gatnr = gattcallbacks.size();
-        if (devs == null) {
-            for (int i = 0; i < gatnr; i++) {
-                String was = gattcallbacks.get(i).SerialNumber;
-                rem.add(i);
-            }
-            if (rem.size() == 0) {
-                return false;
-            }
-        } else {
-
-            int heb = 0;
-
-            for (int i = 0; i < gatnr; i++) {
-                var gatt = gattcallbacks.get(i);
-                String was = gatt.SerialNumber;
-                int matched = consumeMatchingDeviceIds(devs, gatt);
-                if (matched == 0) {
-                    rem.add(i);
-                } else {
-                    gatt.stopHealth = false;
-                    heb += matched;
-                }
-            }
-            if (devs.length == heb && rem.size() == 0) {
-                return false;
-            }
-        }
-        if (mBluetoothManager != null)
-            stopScan(false);
-        // rem.sort((x,y)->{return x-y;});
-        Collections.sort(rem, (x, y) -> {
-            return x - y;
-        });
-
-        for (int el = rem.size() - 1; el >= 0; el--) {
-            int weg = rem.get(el);
-            final String removedSerial = gattcallbacks.get(weg).SerialNumber;
-            {
-                if (doLog) {
-                    Log.i(LOG_ID, "remove " + removedSerial);
-                }
-                ;
-            }
-            ;
-            gattcallbacks.get(weg).free();
-            gattcallbacks.remove(weg);
-            rehomeCurrentSensorAfterRemoval(removedSerial, allDevs);
-        }
-        int index = gattcallbacks.size();
-        if (devs != null) {
-            for (String dev : devs) {
-                if (dev != null) {
-                    if (!isValidShortSensorName(dev)) {
-                        if (doLog) {
-                            Log.w(LOG_ID, "add skip invalid name " + dev);
-                        }
-                        continue;
+        // Clone disable can retire managed callbacks from the UI thread while a
+        // native sync asks us to rebuild this same roster. Take the native and
+        // managed snapshots under the same monitor as comparison and mutation;
+        // otherwise a pre-disable snapshot can re-add a callback after retirement.
+        synchronized (gattcallbacks) {
+            String[] nativeDevs = filterActiveSensorNames(Natives.activeSensors());
+            ArrayList<String> candidateDevs = new ArrayList<>();
+            if (nativeDevs != null) {
+                for (String s : nativeDevs) {
+                    if (isValidShortSensorName(s)) {
+                        candidateDevs.add(s);
                     }
-                    {
-                        if (doLog) {
-                            Log.i(LOG_ID, "add " + dev);
-                        }
-                        ;
+                }
+            }
+            for (String serial : ManagedSensorIdentityRegistry.INSTANCE.persistedSensorIds(Applic.app)) {
+                if (isValidShortSensorName(serial)) {
+                    candidateDevs.add(serial);
+                }
+            }
+            ArrayList<String> allDevs = distinctRuntimeSensorIds(candidateDevs);
+            String[] devs = allDevs.toArray(new String[0]);
+            ArrayList<Integer> rem = new ArrayList<>();
+            int gatnr = gattcallbacks.size();
+            if (devs == null) {
+                for (int i = 0; i < gatnr; i++) {
+                    String was = gattcallbacks.get(i).SerialNumber;
+                    rem.add(i);
+                }
+                if (rem.size() == 0) {
+                    return false;
+                }
+            } else {
+
+                int heb = 0;
+
+                for (int i = 0; i < gatnr; i++) {
+                    var gatt = gattcallbacks.get(i);
+                    String was = gatt.SerialNumber;
+                    int matched = consumeMatchingDeviceIds(devs, gatt);
+                    if (matched == 0) {
+                        rem.add(i);
+                    } else {
+                        gatt.stopHealth = false;
+                        heb += matched;
+                    }
+                }
+                if (devs.length == heb && rem.size() == 0) {
+                    return false;
+                }
+            }
+            if (mBluetoothManager != null)
+                stopScan(false);
+            // rem.sort((x,y)->{return x-y;});
+            Collections.sort(rem, (x, y) -> {
+                return x - y;
+            });
+
+            for (int el = rem.size() - 1; el >= 0; el--) {
+                int weg = rem.get(el);
+                final String removedSerial = gattcallbacks.get(weg).SerialNumber;
+                {
+                    if (doLog) {
+                        Log.i(LOG_ID, "remove " + removedSerial);
                     }
                     ;
-                    final boolean persistedManaged = hasPersistedManagedRecord(dev);
-                    final boolean suppressGenericManagedShell = shouldSuppressGenericManagedShell(dev);
-                    final long managedDataptr =
-                        (persistedManaged || suppressGenericManagedShell) ? resolvePersistedManagedDataptr(dev) : 0L;
-                    if (persistedManaged || suppressGenericManagedShell) {
-                        final SuperGattCallback managed = ManagedSensorIdentityRegistry.INSTANCE.createManagedCallback(Applic.app, dev, managedDataptr);
-                        if (managed != null) {
-                            gattcallbacks.add(managed);
-                            if (managedDataptr != 0L) {
-                                adoptCurrentSensorIfBlank(dev);
+                }
+                ;
+                gattcallbacks.get(weg).free();
+                gattcallbacks.remove(weg);
+                rehomeCurrentSensorAfterRemoval(removedSerial, allDevs);
+            }
+            int index = gattcallbacks.size();
+            if (devs != null) {
+                for (String dev : devs) {
+                    if (dev != null) {
+                        if (!isValidShortSensorName(dev)) {
+                            if (doLog) {
+                                Log.w(LOG_ID, "add skip invalid name " + dev);
                             }
+                            continue;
+                        }
+                        {
+                            if (doLog) {
+                                Log.i(LOG_ID, "add " + dev);
+                            }
+                            ;
+                        }
+                        ;
+                        final boolean persistedManaged = hasPersistedManagedRecord(dev);
+                        final boolean suppressGenericManagedShell = shouldSuppressGenericManagedShell(dev);
+                        final long managedDataptr =
+                            (persistedManaged || suppressGenericManagedShell) ? resolvePersistedManagedDataptr(dev) : 0L;
+                        if (persistedManaged || suppressGenericManagedShell) {
+                            final SuperGattCallback managed = ManagedSensorIdentityRegistry.INSTANCE.createManagedCallback(Applic.app, dev, managedDataptr);
+                            if (managed != null) {
+                                gattcallbacks.add(managed);
+                                if (managedDataptr != 0L) {
+                                    adoptCurrentSensorIfBlank(dev);
+                                }
+                                increasedwait = startincreasedwait;
+                                index++;
+                            }
+                            continue;
+                        }
+                        final long dataptr = Natives.getdataptr(dev);
+                        if (dataptr != 0L) {
+                            gattcallbacks.add(getGattCallback(dev, dataptr));
+                            adoptCurrentSensorIfBlank(dev);
                             increasedwait = startincreasedwait;
                             index++;
                         }
-                        continue;
-                    }
-                    final long dataptr = Natives.getdataptr(dev);
-                    if (dataptr != 0L) {
-                        gattcallbacks.add(getGattCallback(dev, dataptr));
-                        adoptCurrentSensorIfBlank(dev);
-                        increasedwait = startincreasedwait;
-                        index++;
                     }
                 }
             }
@@ -1552,7 +1644,56 @@ public class SensorBluetooth {
         ;
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
         }
-        return blueone.updateDevicers();
+        // blueone is null until BLE init completes; callers include Compose
+        // view models built at first frame and the wear handoff receiver, so
+        // this must never throw.
+        final SensorBluetooth one = blueone;
+        if (one == null) {
+            Log.i(LOG_ID, "updateDevices before bluetooth init — skipped");
+            return false;
+        }
+        return one.updateDevicers();
+    }
+
+    /**
+     * A sensor whose readings are arriving over Clone belongs to the sending
+     * device. Dialling it here puts two phones on one transmitter, and the
+     * loser of that race is whichever one was actually wearing it. The claim
+     * lasts only while the mirror keeps delivering, so unplugging the sender
+     * still lets this device pick the sensor up, and turning Clone off hands
+     * it back immediately. Every path that dials a callback asks this, not only
+     * the periodic check: the restore-all sweep went straight to connectDevice
+     * and put a mirrored Sibionics into a Libre scan on the receiving phone.
+     */
+    private static boolean mirroredOverClone(SuperGattCallback cb, String where) {
+        if (CloneSensorRegistry.isReceptionEnabled()
+                && CloneSensorRegistry.isMirrorDelivering(cb.SerialNumber)) {
+            if (doLog) {
+                Log.i(LOG_ID, where + " skipped: mirrored over Clone " + cb.SerialNumber);
+            }
+            return true;
+        }
+        return false;
+    }
+
+    private static final long GHOST_RECONCILE_MIN_INTERVAL_MS = 60_000L;
+    private static long lastGhostReconcileMs = 0L;
+
+    /**
+     * Rebuilds the callback roster after a sensor was removed from native storage but its
+     * callback is still registered. Rate limited, as it runs on the reading path.
+     *
+     * @return the result of {@link #updateDevices()}; callers must not read it as "roster changed"
+     */
+    public static boolean reconcileGhostMainSensor() {
+        final long now = System.currentTimeMillis();
+        synchronized (SensorBluetooth.class) {
+            if (now - lastGhostReconcileMs < GHOST_RECONCILE_MIN_INTERVAL_MS) {
+                return false;
+            }
+            lastGhostReconcileMs = now;
+        }
+        return updateDevices();
     }
 
     boolean checkandconnect(SuperGattCallback cb, long delay) {
@@ -1560,6 +1701,15 @@ public class SensorBluetooth {
             Log.i(LOG_ID, "checkandconnect(" + cb.SerialNumber + "," + delay + ")");
         }
         ;
+        if (SensorOwnershipRuntime.blocksLocalConnection(cb.SerialNumber)) {
+            if (doLog) {
+                Log.i(LOG_ID, "checkandconnect skipped: ownership released " + cb.SerialNumber);
+            }
+            return false;
+        }
+        if (mirroredOverClone(cb, "checkandconnect")) {
+            return false;
+        }
         BluetoothAdapter adapter = mBluetoothAdapter;
         if (adapter == null && mBluetoothManager != null) {
             try {
@@ -1620,6 +1770,9 @@ public class SensorBluetooth {
                 }
                 if (vers == 0x20) {
                     return new AccuGattCallback(name, dataptr);
+                }
+                if (vers == SensorSourceResolver.SENSOR_KIND_CARESENS_AIR) {
+                    return new AirGattCallback(name, dataptr);
                 }
             }
             if (tk.glucodata.BuildConfig.SiBionics == 1) {
@@ -1698,6 +1851,10 @@ public class SensorBluetooth {
                 }
                 ;
                 cb.resetdataptr();
+                cb.sensorstartmsec = Natives.getSensorStartmsec(cb.dataptr);
+                cb.setPause(false);
+                // NFC created a separate stream wrapper for the same native record.
+                Natives.freedataptr(streamptr);
                 return checkandconnect(cb, 0);
             }
         }
@@ -1902,15 +2059,30 @@ public class SensorBluetooth {
             pairingRequestReceiver = new BroadcastReceiver() {
                 @Override
                 public void onReceive(Context context, Intent intent) {
-                    {
+                    try {
+                        final BluetoothDevice device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
+                        final String address = device != null ? device.getAddress() : null;
                         if (doLog) {
-                            Log.i(LOG_ID, "onReceive ACTION_PAIRING_REQUEST");
+                            Log.i(LOG_ID, "onReceive ACTION_PAIRING_REQUEST " + address);
                         }
-                        ;
+                        if (address == null) {
+                            return;
+                        }
+                        for (var cb : gattcallbacks) {
+                            if (address.equals(cb.mActiveDeviceAddress)) {
+                                // Sensors that pair with a PIN (CareSens Air) answer it themselves.
+                                if (cb.pairingRequest())
+                                    abortBroadcast();
+                                return;
+                            }
+                        }
+                    } catch (Throwable th) {
+                        Log.stack(LOG_ID, "ACTION_PAIRING_REQUEST", th);
                     }
-                    ;
                 }
             };
+            // Protected system broadcasts are exempt from Android 14's export-flag
+            // requirement. NOT_EXPORTED would also reject the Bluetooth process.
             Applic.app.registerReceiver(pairingRequestReceiver,
                     new IntentFilter(BluetoothDevice.ACTION_PAIRING_REQUEST));
         } catch (Throwable e) {
@@ -1934,15 +2106,13 @@ public class SensorBluetooth {
     private void addReceivers() {
         addBluetoothStateReceiver();
         addBondStateReceiver();
-        if (Build.VERSION.SDK_INT < 26)
-            addPairingRequestReceiver();
+        addPairingRequestReceiver();
     }
 
     private void removeReceivers() {
         removeBluetoothStateReceiver();
         removeBondStateReceiver();
-        if (Build.VERSION.SDK_INT < 26)
-            removePairingRequestReceiver();
+        removePairingRequestReceiver();
     }
 
     private BroadcastReceiver bondStateReceiver = null;
@@ -2064,7 +2234,7 @@ public class SensorBluetooth {
         }
         ;
         if (!Applic.canBluetooth()) {
-            Applic.Toaster(R.string.turn_on_nearby_devices_permission);
+            Applic.missingScanPermission();
             Log.e(LOG_ID, "No Blueotooth permission");
             return false;
         }

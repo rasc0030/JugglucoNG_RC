@@ -12,8 +12,9 @@
 //   p.w  bytes->int   : little-endian int32 of the first 4 bytes
 //   p.l0 int->bytes   : 4 bytes little-endian
 //   p.r  BigInt->bytes: toByteArray, drop leading 0x00 sign byte, min-24 left-pad
-//   shared-secret hex : BigInteger(X).toByteArray() with 33->32 sign-byte strip
-//                       (NOT fixed-32 left-pad) — matters for the char-pick.
+//   shared-secret hex : the fixed 32-byte big-endian X, leading zeros kept — the
+//                       hex length feeds the char-pick, so it must not vary
+//                       (see deriveSessionKey).
 
 package tk.glucodata.drivers.ottai
 
@@ -42,15 +43,15 @@ object OttaiBleAuth {
         return kpg.generateKeyPair()
     }
 
-    /** p.r — BigInteger to bytes: strip leading 0x00 sign byte, left-pad to min 24. */
+    /** P-256 coordinate: strip the BigInteger sign byte and left-pad to exactly 32 bytes. */
     fun coordBytes(value: BigInteger): ByteArray {
         var b = value.toByteArray()
         if (b.isNotEmpty() && b[0] == 0.toByte()) {
             b = b.copyOfRange(1, b.size)
         }
-        if (b.size >= 24) return b
-        val out = ByteArray(24)
-        System.arraycopy(b, 0, out, 24 - b.size, b.size)
+        if (b.size >= 32) return b
+        val out = ByteArray(32)
+        System.arraycopy(b, 0, out, 32 - b.size, b.size)
         return out
     }
 
@@ -76,15 +77,17 @@ object OttaiBleAuth {
 
     /**
      * Build the 3-byte app auth time from the device's current-time bytes.
-     * inc = LE32(deviceTime) + 1; low3 = [inc&0xFF, (inc>>8)&0xFF, (inc>>16)&0xFF];
-     * time3 = [low3[2], low3[0], low3[1]]  (the decompiled `[b2,b0,b1]` reorder).
+     * The official client parses the bytes big-endian, adds one, emits four
+     * little-endian bytes, re-parses those big-endian, then emits three bytes
+     * little-endian. This is equivalent to selecting bits 24..8 in that order.
      */
     fun appTime3(deviceTimeBytes: ByteArray): ByteArray {
-        val inc = bytesToIntLE(deviceTimeBytes) + 1
-        val b0 = (inc and 0xFF).toByte()
-        val b1 = ((inc ushr 8) and 0xFF).toByte()
-        val b2 = ((inc ushr 16) and 0xFF).toByte()
-        return byteArrayOf(b2, b0, b1)
+        val inc = BigInteger(1, deviceTimeBytes).add(BigInteger.ONE)
+        return byteArrayOf(
+            inc.shiftRight(24).and(BigInteger.valueOf(0xFF)).toByte(),
+            inc.shiftRight(16).and(BigInteger.valueOf(0xFF)).toByte(),
+            inc.shiftRight(8).and(BigInteger.valueOf(0xFF)).toByte(),
+        )
     }
 
     /**
@@ -133,10 +136,9 @@ object OttaiBleAuth {
 
     /**
      * ECDH session key. Computes the shared point X with the device's public key
-     * and our private key, encodes X exactly as the app does (BigInteger
-     * toByteArray with 33->32 sign-byte strip, no fixed-32 left-pad), hex-encodes
-     * it, then runs the char-pick. Returns the session-key string (>=32 chars) or
-     * null if the pick is too short.
+     * and our private key, hex-encodes X as the fixed-length big-endian field
+     * element, then runs the char-pick. Returns the session-key string (>=32
+     * chars) or null if the pick is too short.
      */
     fun deriveSessionKey(devPubXHex: String, devPubYHex: String, ourPrivate: ECPrivateKey): String? {
         val x = BigInteger(devPubXHex, 16)
@@ -152,14 +154,31 @@ object OttaiBleAuth {
         val ka = KeyAgreement.getInstance("ECDH")
         ka.init(ourPrivate)
         ka.doPhase(devPub, true)
-        val sharedX = BigInteger(1, ka.generateSecret()) // canonical positive X
-        // App encoding: toByteArray, strip a 33-byte leading 0x00 sign byte; keep
-        // shorter results as-is (no left-pad) — this changes the hex length and
-        // therefore the char-pick, so we must replicate it exactly.
-        var xb = sharedX.toByteArray()
-        if (xb.size == 33 && xb[0] == 0.toByte()) xb = xb.copyOfRange(1, 33)
-        val sharedHex = OttaiCrypto.bytesToHex(xb)
+        // generateSecret() already returns X as the fixed-length big-endian field
+        // element (SEC1/RFC 5903), leading zeros kept — the form the sensor derives
+        // too; fieldLen only guards a provider that trims. Do NOT round-trip
+        // through BigInteger the way the vendor app does: toByteArray drops the
+        // leading 0x00 whenever X < 2^247 (1 handshake in 512), leaving 62 hex
+        // chars, so the char-pick yields 30 and the key comes out empty — observed
+        // 2 of 459 handshakes over 16 days, each costing a dead link until the
+        // sensor gave up (status=19). Every X that fills the field encodes
+        // identically either way, so only the case that always failed changes.
+        val fieldLen = (ecSpec.curve.field.fieldSize + 7) / 8 // 32 for secp256r1
+        val sharedHex = OttaiCrypto.bytesToHex(fixedFieldBytes(ka.generateSecret(), fieldLen))
         return sessionKeyPick(sharedHex)
+    }
+
+    /** Big-endian field element of exactly [fieldLen] bytes: left-pad, never strip. */
+    fun fixedFieldBytes(value: ByteArray, fieldLen: Int): ByteArray {
+        if (value.size == fieldLen) return value
+        val out = ByteArray(fieldLen)
+        if (value.size < fieldLen) {
+            System.arraycopy(value, 0, out, fieldLen - value.size, value.size)
+        } else {
+            // over-long can only be a sign-prefixed BigInteger encoding: keep the low bytes
+            System.arraycopy(value, value.size - fieldLen, out, 0, fieldLen)
+        }
+        return out
     }
 
     /**

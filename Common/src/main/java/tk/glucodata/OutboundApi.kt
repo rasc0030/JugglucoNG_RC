@@ -35,6 +35,7 @@ object OutboundApi {
     private const val QUEUE_BUSY_STATUS_INTERVAL_MS = 5 * 60 * 1000L
     private const val ERROR_QUEUE_BUSY = "API send queue is busy; dropped stale live reading"
     private const val ERROR_NETWORK_UNAVAILABLE = "Network unavailable; skipped live API send"
+    private const val STALE_READING_LOOKBACK_MS = 12 * 60 * 60 * 1000L
 
     private val pendingSends = AtomicInteger(0)
     private val lastQueueBusyStatusAtMs = AtomicLong(0)
@@ -287,7 +288,42 @@ object OutboundApi {
         val candidates = destinationId
             ?.let { id -> listOfNotNull(config.findDestination(id)) }
             ?: config.activeDestinations()
-        return candidates.filter { it.isReady() }
+        // SMS destinations are event-driven (see tk.glucodata.sms.SmsWatchdog) and must
+        // never be fed by the reading stream — a text per reading would be ruinous.
+        return candidates.filter { it.isReady() && !it.isSms() }
+    }
+
+    /**
+     * The latest reading as the template engine sees it, or null when the app has
+     * never had one. Tolerates stale data on purpose: the SMS watchdog needs the
+     * last known value precisely when readings have stopped arriving.
+     */
+    internal fun currentReadingOrNull(
+        recipient: String = "",
+        maxAgeMillis: Long = STALE_READING_LOOKBACK_MS
+    ): Reading? {
+        val current = CurrentDisplaySource.resolveCurrent(maxAgeMillis) ?: return null
+        if (current.timeMillis <= 0L || current.sharedMgdl <= 0) return null
+        val trend = ExchangeTrend.resolve(current.sensorId, current.timeMillis, current.rate)
+        return Reading(
+            eventId = "${current.sensorId.orEmpty()}:${current.timeMillis}:${current.sharedMgdl}",
+            recipient = recipient,
+            sensorId = current.sensorId.orEmpty(),
+            primaryText = current.primaryStr,
+            displayValue = current.primaryValue.toDouble(),
+            mgdl = current.sharedMgdl,
+            autoValue = current.autoValue,
+            autoMgdl = displayToMgdl(current.autoValue),
+            rawValue = current.rawValue,
+            rateMgdlPerMinute = current.rate,
+            trendIndex = trend.index,
+            trendNameFromInput = trend.name.orEmpty(),
+            trendRateMgdlPerMinute = trend.rateMgdlPerMinute,
+            timeMillis = current.timeMillis,
+            sensorGen = current.sensorGen,
+            alarm = 0,
+            test = false
+        )
     }
 
     private fun enqueueForDestination(
@@ -461,6 +497,13 @@ object OutboundApi {
                 Natives.getxDripTrendName(rateMgdlPerMinute) ?: ""
             }
         }
+        /**
+         * Latest known skin temperature in °C for this reading's sensor, from
+         * the same sources the Statistics card reads ([SensorTemperature]).
+         * Null when the sensor has no temperature channel — rendered as empty.
+         */
+        val temperatureC: Float? get() =
+            runCatching { SensorTemperature.latestTemperatureC(sensorId) }.getOrNull()
         val trendArrow: String get() = trendArrow(trendName)
         val iob: Float get() = runCatching { Natives.getIOBvalue(timeMillis) }.getOrDefault(Float.NaN)
         val journal: JournalSnapshot get() = loadJournalSnapshot(timeMillis)
@@ -502,22 +545,14 @@ object OutboundApi {
             DateFormat.SHORT,
             Locale.getDefault()
         ).format(Date(reading.timeMillis))
-        val journal = if (
-            template.contains("{journal") ||
-            template.contains("{iob}") ||
-            template.contains("{cob}")
-        ) {
-            reading.journal
-        } else {
-            JournalSnapshot()
-        }
+        val journal = if (needsJournalSnapshot(template)) reading.journal else JournalSnapshot()
         val effectiveIob = journal.iob.takeIf { it.isFinite() } ?: reading.iob
         val journalEvents = journalEventsJsonArray(journal)
         val effectiveStatus = status
             ?: destination?.rangeStatus(reading.mgdl)
             ?: OutboundApiSettings.TUNNEL_STATUS_IN_RANGE
         val statusEmojiValue = statusEmoji(effectiveStatus)
-        return template
+        val rendered = template
             .replace("{event_id}", reading.eventId)
             .replace("{recipient}", reading.recipient)
             .replace("{value}", reading.displayText)
@@ -547,6 +582,7 @@ object OutboundApi {
             .replace("{time}", time)
             .replace("{sensor}", reading.sensorId)
             .replace("{sensor_gen}", reading.sensorGen.toString())
+            .replace("{temp}", formatTemperatureC(reading.temperatureC))
             .replace("{alarm}", reading.alarm.toString())
             .replace("{iob}", if (effectiveIob.isFinite()) formatNumber(effectiveIob, 2) else "0")
             .replace("{journal_iob}", if (journal.iob.isFinite()) formatNumber(journal.iob, 2) else "0")
@@ -557,7 +593,42 @@ object OutboundApi {
             .replace("{test}", reading.test.toString())
             .replace("{status}", effectiveStatus)
             .replace("{status_emoji}", statusEmojiValue)
+        return OutboundApiInsulinTokens.expand(
+            template = rendered,
+            types = OutboundApiInsulinTokens.parse(journal.json),
+            atMillis = reading.timeMillis,
+            formatTime = ::formatTimeOfDay
+        )
     }
+
+    private fun formatTimeOfDay(timeMillis: Long): String =
+        DateFormat.getTimeInstance(DateFormat.SHORT, Locale.getDefault()).format(Date(timeMillis))
+
+    /**
+     * Tokens that need no journal read. Anything else in a template — `{iob}`,
+     * `{cob}`, `{journal…}` or a per-insulin-type token, whose spelling depends
+     * on what the user named their insulin — means the snapshot has to be
+     * loaded, which costs a Room query per send.
+     */
+    private val STATIC_TOKENS = setOf(
+        "event_id", "recipient", "value", "unit", "mgdl", "mmol",
+        "auto", "auto_value", "auto_mgdl", "auto_mmol",
+        "raw", "raw_mgdl", "raw_mmol",
+        "trend", "trend_arrow", "rate_mgdl", "rate_mmol",
+        "timestamp", "time", "sensor", "sensor_gen", "temp", "alarm",
+        "test", "status", "status_emoji"
+    )
+
+    // The closing brace must be escaped: JVM java.util.regex tolerates a bare
+    // `}`, but Android's ICU-backed Pattern (Android 16) rejects it with
+    // PatternSyntaxException, which turns this object's <clinit> into an
+    // ExceptionInInitializerError and force-closes the app on every reading.
+    private val PLACEHOLDER = Regex("\\{[^{}\\s]+\\}")
+
+    internal fun needsJournalSnapshot(template: String): Boolean =
+        PLACEHOLDER.findAll(template).any { match ->
+            match.value.removeSurrounding("{", "}") !in STATIC_TOKENS
+        }
 
     internal fun statusEmoji(status: String): String = when (status) {
         OutboundApiSettings.TUNNEL_STATUS_HIGH -> "\uD83D\uDFE1"      // 🟡
@@ -571,6 +642,13 @@ object OutboundApi {
         if (!value.isFinite()) return ""
         return "%.${decimals}f".format(Locale.US, value)
     }
+
+    /**
+     * Renders a `{temp}` token: 1-decimal °C number, or empty when the sensor
+     * has no known temperature. Never invents a value.
+     */
+    internal fun formatTemperatureC(value: Float?): String =
+        if (value != null && value.isFinite()) formatNumber(value, 1) else ""
 
     internal fun displayToMgdl(value: Float): Int {
         if (!value.isFinite() || value <= 0f) return 0
@@ -590,11 +668,7 @@ object OutboundApi {
     }
 
     private fun loadJournalSnapshot(timeMillis: Long): JournalSnapshot {
-        val raw = runCatching {
-            val type = Class.forName("tk.glucodata.OutboundApiJournalSnapshot")
-            val method = type.getMethod("snapshotJson", java.lang.Long.TYPE)
-            method.invoke(null, timeMillis) as? String
-        }.getOrNull() ?: return JournalSnapshot()
+        val raw = JournalSnapshotAccess.snapshotJson(timeMillis)
         if (raw.isBlank()) return JournalSnapshot()
         return runCatching {
             val json = JSONObject(raw)
@@ -1018,6 +1092,10 @@ class OutboundApiWorker(
                 .put("cob", journal.cob.takeIf { it.isFinite() })
                 .put("journal_cob", journal.cob.takeIf { it.isFinite() })
                 .put("journal_events", journalEvents)
+                .put(
+                    OutboundApiInsulinTokens.JSON_ARRAY,
+                    journal.json?.optJSONArray(OutboundApiInsulinTokens.JSON_ARRAY)
+                )
                 .put("journal", journal.json)
                 .put("message", message)
         }

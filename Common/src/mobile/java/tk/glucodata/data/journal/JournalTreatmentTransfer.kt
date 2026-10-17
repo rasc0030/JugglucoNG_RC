@@ -56,7 +56,7 @@ object JournalTreatmentTransfer {
             .put("enteredBy", "JugglucoNG")
             .put("type", type.storageValue)
             .put("journalTitle", entry.title)
-            .put("journalSource", entry.source)
+            .put("journalSource", entry.originSource ?: entry.source)
             .put("updated_at", formatIso8601(entry.updatedAt.takeIf { it > 0L } ?: timestamp))
 
         when (type) {
@@ -122,16 +122,62 @@ object JournalTreatmentTransfer {
         return json
     }
 
+/**
+     * The same document with the fields v3 will not let a client change taken out.
+     *
+     * v3 answers an update that carries them with 400 "Field date cannot be modified by the
+     * client", and its collection POST rejects a payload with no date. This partial payload
+     * therefore goes to PATCH /treatments/{identifier}; the route identifies the document,
+     * while the body contains only fields the client may change.
+     */
+    fun stripImmutableForUpdate(json: JSONObject): JSONObject = json
+        .apply {
+            remove("date")
+            remove("created_at")
+            remove("utcOffset")
+            // The PATCH route names the document; neither identity field belongs in its body.
+            remove("_id")
+            remove("identifier")
+        }
+
     fun parseTreatment(
         context: Context,
         treatment: JSONObject,
         source: JournalEntrySource,
         sourcePrefix: String,
         insulinPresets: List<JournalInsulinPreset>
+    ): ParsedTreatment? = parseTreatment(
+        treatment = treatment,
+        source = source,
+        sourcePrefix = sourcePrefix,
+        insulinPresets = insulinPresets,
+        stringResource = context::getString
+    )
+
+    internal fun parseTreatment(
+        treatment: JSONObject,
+        source: JournalEntrySource,
+        sourcePrefix: String,
+        insulinPresets: List<JournalInsulinPreset>,
+        stringResource: (Int) -> String
     ): ParsedTreatment? {
         val timestamp = treatment.optTreatmentTimestampMillis()
         val baseId = treatment.sourceBaseId(timestamp) ?: return null
         val remoteId = treatment.optRemoteId()
+        val nightscoutRemoteId = when (source) {
+            JournalEntrySource.NIGHTSCOUT -> remoteId
+            JournalEntrySource.CLONE,
+            JournalEntrySource.CLONE_LOCAL_ICE,
+            JournalEntrySource.CLONE_TURN -> treatment.optNonBlankString("nsRemoteId")
+            else -> null
+        }
+        val recoveryId = if (isCloneJournalSource(source)) {
+            treatment.optNonBlankString("recoveryId")?.let { value ->
+                CloneJournalIdentity.normalizeRecoveryId(value) ?: return null
+            }
+        } else {
+            null
+        }
         val candidateIds = allKinds.map { kind -> sourceRecordId(sourcePrefix, baseId, kind) }
         val isValid = treatment.optBoolean("isValid", true)
         if (!isValid) {
@@ -145,10 +191,13 @@ object JournalTreatmentTransfer {
 
         val eventType = treatment.optNonBlankString("eventType", "eventtype", "event_type")
         val explicitType = treatment.optJournalEntryType()
-        val note = buildNote(
-            treatment.optNonBlankString("notes", "note"),
-            treatment.optNonBlankString("enteredBy", "device", "app")
-        )
+        val sender = treatment.optNonBlankString("enteredBy", "device", "app")
+        // Only what someone wrote can stand as a note of its own. The sender rides inside the
+        // note of whatever entry the treatment does carry.
+        val writtenNote = treatment.optNonBlankString("notes", "note")
+            ?.takeUnless { isSenderOnly(it, treatment.senderNames()) }
+        val note = buildNote(writtenNote, sender)
+        val originSource = treatment.optJournalOriginSource()
         val titleSuffix = treatment.optNonBlankString("journalTitle", "title", "food", "foodType")
             ?: eventType?.takeIf { !it.equals("Note", ignoreCase = true) }
         val inputs = ArrayList<JournalEntryInput>(3)
@@ -164,7 +213,7 @@ object JournalTreatmentTransfer {
                 JournalEntryInput(
                     timestamp = safeTimestamp,
                     type = JournalEntryType.CARBS,
-                    title = titleSuffix ?: context.getString(R.string.journal_aaps_carbs_title),
+                    title = titleSuffix ?: stringResource(R.string.journal_aaps_carbs_title),
                     note = note,
                     amount = carbs,
                     durationMinutes = treatment.optDurationMinutes(),
@@ -172,7 +221,8 @@ object JournalTreatmentTransfer {
                     fatGrams = treatment.optPositiveFloat("fat", "fatGrams"),
                     source = source,
                     sourceRecordId = sourceRecordId(sourcePrefix, baseId, SOURCE_KIND_CARBS),
-                    nsRemoteId = remoteId.takeIf { source == JournalEntrySource.NIGHTSCOUT }
+                    nsRemoteId = nightscoutRemoteId,
+                    originSource = originSource,
                 )
             )
         }
@@ -188,13 +238,14 @@ object JournalTreatmentTransfer {
                     title = treatment.optNonBlankString("insulinType")
                         ?: preset?.displayName
                         ?: titleSuffix
-                        ?: context.getString(R.string.journal_aaps_insulin_title),
+                        ?: stringResource(R.string.journal_aaps_insulin_title),
                     note = note,
                     amount = insulin,
                     insulinPresetId = preset?.id,
                     source = source,
                     sourceRecordId = sourceRecordId(sourcePrefix, baseId, SOURCE_KIND_INSULIN),
-                    nsRemoteId = remoteId.takeIf { source == JournalEntrySource.NIGHTSCOUT }
+                    nsRemoteId = nightscoutRemoteId,
+                    originSource = originSource,
                 )
             )
         }
@@ -210,12 +261,13 @@ object JournalTreatmentTransfer {
                 JournalEntryInput(
                     timestamp = safeTimestamp,
                     type = JournalEntryType.FINGERSTICK,
-                    title = titleSuffix ?: context.getString(R.string.journal_type_fingerstick),
+                    title = titleSuffix ?: stringResource(R.string.journal_type_fingerstick),
                     note = note,
                     glucoseValueMgDl = glucoseMgdl,
                     source = source,
                     sourceRecordId = sourceRecordId(sourcePrefix, baseId, SOURCE_KIND_FINGERSTICK),
-                    nsRemoteId = remoteId.takeIf { source == JournalEntrySource.NIGHTSCOUT }
+                    nsRemoteId = nightscoutRemoteId,
+                    originSource = originSource,
                 )
             )
         }
@@ -225,36 +277,48 @@ object JournalTreatmentTransfer {
                 JournalEntryInput(
                     timestamp = safeTimestamp,
                     type = JournalEntryType.ACTIVITY,
-                    title = titleSuffix ?: context.getString(R.string.journal_type_activity),
+                    title = titleSuffix ?: stringResource(R.string.journal_type_activity),
                     note = note,
                     durationMinutes = treatment.optDurationMinutes(),
                     intensity = treatment.optJournalIntensity(),
                     source = source,
                     sourceRecordId = sourceRecordId(sourcePrefix, baseId, SOURCE_KIND_ACTIVITY),
-                    nsRemoteId = remoteId.takeIf { source == JournalEntrySource.NIGHTSCOUT }
+                    nsRemoteId = nightscoutRemoteId,
+                    originSource = originSource,
                 )
             )
         }
 
-        if (inputs.isEmpty() &&
-            (explicitType == JournalEntryType.NOTE || eventKey.contains("note") || eventKey.contains("announcement") || note != null)
-        ) {
+        // AAPS stamps every treatment with its sender, so counting the stamp as a note turned
+        // each temp basal and profile switch into an "AndroidAPS" chip.
+        if (inputs.isEmpty() && writtenNote != null) {
             inputs.add(
                 JournalEntryInput(
                     timestamp = safeTimestamp,
                     type = JournalEntryType.NOTE,
-                    title = titleSuffix ?: context.getString(R.string.journal_type_note),
-                    note = note ?: eventType,
+                    title = titleSuffix ?: stringResource(R.string.journal_type_note),
+                    note = note,
                     source = source,
                     sourceRecordId = sourceRecordId(sourcePrefix, baseId, SOURCE_KIND_NOTE),
-                    nsRemoteId = remoteId.takeIf { source == JournalEntrySource.NIGHTSCOUT }
+                    nsRemoteId = nightscoutRemoteId,
+                    originSource = originSource,
                 )
             )
         }
 
-        if (inputs.isEmpty()) return null
+        // A treatment that carries nothing for the journal any more, such as a note whose text
+        // was cleared, takes away what it brought in earlier.
+        if (inputs.isEmpty()) {
+            return ParsedTreatment(
+                inputs = emptyList(),
+                candidateSourceRecordIds = candidateIds,
+                remoteId = remoteId,
+                deleteOnly = true
+            )
+        }
+        if (recoveryId != null && inputs.size != 1) return null
         return ParsedTreatment(
-            inputs = inputs,
+            inputs = inputs.map { input -> input.copy(recoveryId = recoveryId) },
             candidateSourceRecordIds = candidateIds,
             remoteId = remoteId
         )
@@ -267,8 +331,17 @@ object JournalTreatmentTransfer {
 
     fun sourceRecordIdsForTreatment(treatment: JSONObject, sourcePrefix: String): List<String> {
         val baseId = treatment.sourceBaseId(treatment.optTreatmentTimestampMillis()) ?: return emptyList()
-        return allKinds.map { kind -> sourceRecordId(sourcePrefix, baseId, kind) }
+        return sourceRecordIdsForBaseId(sourcePrefix, baseId)
     }
+
+    fun sourceRecordIdsForBaseId(sourcePrefix: String, baseId: String): List<String> =
+        allKinds.map { kind -> sourceRecordId(sourcePrefix, baseId, kind) }
+
+    internal fun sourceRecordIdForBaseId(
+        sourcePrefix: String,
+        baseId: String,
+        type: JournalEntryType,
+    ): String = sourceRecordId(sourcePrefix, baseId, type.storageValue)
 
     private fun sourceRecordId(sourcePrefix: String, baseId: String, kind: String): String =
         "$sourcePrefix:$baseId:$kind"
@@ -397,6 +470,11 @@ object JournalTreatmentTransfer {
         return null
     }
 
+    private fun JSONObject.optJournalOriginSource(): JournalEntrySource? {
+        val value = optNonBlankString("journalSource", "originSource") ?: return null
+        return JournalEntrySource.entries.firstOrNull { it.storageValue == value.lowercase(Locale.US) }
+    }
+
     private fun JSONObject.optJournalIntensity(): JournalIntensity? {
         val value = optNonBlankString("intensity")?.lowercase(Locale.US) ?: return null
         return JournalIntensity.fromStorage(value)
@@ -463,6 +541,31 @@ object JournalTreatmentTransfer {
     }
 
     private fun buildNote(vararg parts: String?): String? = mergedNotes(*parts)
+
+    /** Names AAPS signs its treatments with, in either its old or its NSClient v3 form. */
+    private val aapsSenderNames = setOf("androidaps", "aaps")
+
+    private fun JSONObject.senderNames(): Set<String> =
+        listOfNotNull(
+            optNonBlankString("enteredBy"),
+            optNonBlankString("device"),
+            optNonBlankString("app")
+        ).mapTo(HashSet()) { normalizedSender(it) } + aapsSenderNames
+
+    private fun normalizedSender(text: String): String =
+        text.trim().lowercase(Locale.US).removePrefix("openaps://")
+
+    private fun isSenderOnly(text: String, senders: Set<String>): Boolean {
+        val parts = text.split('\n', '|').map { it.trim() }.filter { it.isNotEmpty() }
+        return parts.isNotEmpty() && parts.all { normalizedSender(it) in senders }
+    }
+
+    /**
+     * Whether a stored note says nothing but who sent it to AAPS — what earlier imports wrote for
+     * every temp basal and profile switch.
+     */
+    internal fun isAapsSenderOnlyNote(note: String?): Boolean =
+        note != null && isSenderOnly(note, aapsSenderNames)
 
     private fun defaultAbsorptionMinutes(grams: Float, protein: Float?, fat: Float?): Int {
         val macroExtra = ((protein ?: 0f) * 1.5f) + ((fat ?: 0f) * 2.5f)

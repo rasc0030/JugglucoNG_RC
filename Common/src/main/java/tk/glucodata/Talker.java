@@ -89,9 +89,13 @@ static public final String LOG_ID="Talker";
 
 static    private float curpitch=1.0f;
 static  private float curspeed=1.0f;
-static private    long   cursep=50*1000L;
+// volatile: written on the UI thread by the settings dialog, read on the BLE callback thread
+// by selspeak(). A non-volatile long has neither atomicity (JLS 17.7) nor visibility.
+static private volatile long cursep=50*1000L;
 static private int voicepos=-1;
 static private String playstring=null;
+// The chime setting for playstring: it is spoken from onInit, after the Test press has returned.
+static private boolean playchime=false;
 static private Spinner spinner=null;
 //static final private int minandroid=24; //21
 static final private int minandroid=21; //21
@@ -191,6 +195,7 @@ public static void previewVoice(int index) {
 private void speakPreview() {
     if (DontTalk) return;
     try {
+      synchronized (queueLock) {
         if (android.os.Build.VERSION.SDK_INT >= minandroid) {
             engine.setAudioAttributes(mediaAudio);
             engine.speak("This is a voice preview.", TextToSpeech.QUEUE_FLUSH, null, "voice_preview");
@@ -198,6 +203,7 @@ private void speakPreview() {
         } else {
             engine.speak("This is a voice preview.", TextToSpeech.QUEUE_FLUSH, null);
         }
+      }
     } catch (Throwable th) {
         Log.stack(LOG_ID, "speakPreview failed", th);
     }
@@ -206,7 +212,9 @@ private void speakPreview() {
 public static void stopPreview() {
     var talk = SuperGattCallback.talker;
     if (talk != null && talk.engine != null) {
-        talk.engine.stop();
+        synchronized (talk.queueLock) {
+            talk.engine.stop();
+            }
         talk.setvoice();
     }
     var cb = previewDoneCallback;
@@ -316,13 +324,15 @@ public static void testCurrentValue(Context context) {
         talk.setvalues();
         talk.setvoice();
         // Use media stream so test is audible regardless of notification mute
+        final boolean chime=getChimeBeforeGlucose(context);
         if(android.os.Build.VERSION.SDK_INT >= minandroid)
-            talk.speak(say, mediaAudio);
+            talk.speak(say, mediaAudio, chime);
         else
-            talk.speak(say);
+            talk.speak(say, chime);
         return;
         }
     // Engine not ready yet — queue for after init
+    playchime=getChimeBeforeGlucose(context);
     playstring=say;
     if(talk==null)
         SuperGattCallback.newtalker(context);
@@ -358,6 +368,8 @@ void destruct() {
 if(!DontTalk) {
     engineReady = false;
     if(engine!=null) {
+        // No progress callback follows shutdown(), so words still holding focus would keep it.
+        focus.release(lastWordsId);
         engine.shutdown();
         engine=null;
         }
@@ -384,6 +396,8 @@ if(!DontTalk) {
             }
          if(status ==TextToSpeech.SUCCESS) {
             engineReady = true;
+            gine.addEarcon(LeadIn.SILENCE_EARCON,context.getPackageName(),R.raw.voice_lead_in);
+            gine.addEarcon(LeadIn.CHIME_EARCON,context.getPackageName(),R.raw.voice_chime);
             setvalues();
             if (android.os.Build.VERSION.SDK_INT >= minandroid) {
                 Set<Voice> voices=gine.getVoices();
@@ -427,7 +441,7 @@ if(!DontTalk) {
                 notifyVoiceListeners();
             }
              if(playstring!=null) {
-                 speak(playstring);
+                 speak(playstring,playchime);
                  playstring=null;
                  }
            }
@@ -447,19 +461,36 @@ if(!DontTalk) {
         @Override
         public void onDone(String utteranceId) {
             if(doLog) {Log.i(LOG_ID,"onDone "+utteranceId);};
+            // The words that follow the lead-in still need the focus speak() took for them.
+            if(LeadIn.isLeadIn(utteranceId))
+                return;
             if(!notifyfocus)
-                doTurnFocusoff();
+                focus.release(utteranceId);
             if ("voice_preview".equals(utteranceId)) {
                 var cb = previewDoneCallback;
                 if (cb != null) Applic.RunOnUiThread(cb);
             }
         }
 
+        // stop(), or a later QUEUE_FLUSH, ends an utterance with this instead of onDone/onError -
+        // also when it is flushed while its lead-in plays, before its words ever start.
+        @Override
+        public void onStop(String utteranceId,boolean interrupted) {
+            if(doLog) {Log.i(LOG_ID,"onStop "+utteranceId+" interrupted="+interrupted);};
+            if(LeadIn.isLeadIn(utteranceId))
+                return;
+            if(!notifyfocus)
+                focus.release(utteranceId);
+            }
+
         @Override
         public void onError(String utteranceId) {
             if(doLog) {Log.i(LOG_ID,"onError "+utteranceId);};
+            // A lead-in that failed to play is skipped; the words queued after it still play.
+            if(LeadIn.isLeadIn(utteranceId))
+                return;
             if(!notifyfocus)
-                doTurnFocusoff();
+                focus.release(utteranceId);
             if ("voice_preview".equals(utteranceId)) {
                 var cb = previewDoneCallback;
                 if (cb != null) Applic.RunOnUiThread(cb);
@@ -468,8 +499,13 @@ if(!DontTalk) {
         @Override
         public void onStart(String utteranceId) {
             if(doLog) {Log.i(LOG_ID,"onStart "+utteranceId);};
+            // Words from speak() already hold focus from before their lead-in, so this only
+            // re-confirms them; it is what takes focus for utterances that bypass speak(), such
+            // as the voice preview.
+            if(LeadIn.isLeadIn(utteranceId))
+                return;
             if(!notifyfocus)
-                doTurnFocuson() ;
+                focus.claim(utteranceId);
             }
 
     });
@@ -506,55 +542,210 @@ private static void ensureMinStreamVolume() {
     }
 }
 
-public void speak(String message) {
+/**
+ * Hand an utterance to the engine.
+ *
+ * @return true only when the engine accepted it, i.e. when an
+ *         {@link UtteranceProgressListener} callback is guaranteed to follow. Callers that
+ *         ration announcements must not charge the separation interval for an utterance that
+ *         never reached the engine (see {@link #selspeak}), and callers holding transient audio
+ *         focus must release it themselves on false.
+ */
+public boolean speak(String message) {
+    return speak(message,false);
+    }
+
+/**
+ * As {@link #speak(String)}, optionally sounding the glucose chime first.
+ *
+ * <p>Audio focus is taken before anything is queued. It used to be requested from onStart, once
+ * the first word was already playing, so music or navigation was still at full level over it.
+ * The words then follow a short lead-in, see {@link LeadIn}.
+ */
+boolean speak(String message,boolean chime) {
     if(!DontTalk) {
+        final boolean ownsFocus=!notifyfocus;
+        // Unique, so a callback for an earlier utterance of the same value cannot release this
+        // one's focus.
+        final String wordsId=message+"#"+utteranceSeq.incrementAndGet();
+        boolean queued=false;
         try {
+            // One read: destruct() nulls the field from another thread, and this makes three calls.
+            final TextToSpeech gine=engine;
             ensureMinStreamVolume();
-            if(
-                    ((android.os.Build.VERSION.SDK_INT >= 21)?
-                    engine.speak(message, TextToSpeech.QUEUE_FLUSH, null,message):
-                            engine.speak(message, TextToSpeech.QUEUE_FLUSH, null)) ==TextToSpeech.SUCCESS)
-
-
-            {
+            final int speakResult;
+            // An utterance is now several queue calls. Unlocked, a second speak() could flush
+            // between this one's lead-in and its words, and these older words would then be
+            // appended after the newer ones instead of being replaced by them. Claiming inside
+            // the lock keeps the focus owner the utterance that was queued last.
+            synchronized(queueLock) {
+            if(ownsFocus) {
+                lastWordsId=wordsId;
+                focus.claim(wordsId);
+                }
+            speakResult=LeadIn.queue(new LeadIn.Engine() {
+                @Override
+                public int playEarcon(String earcon,int queueMode,String utteranceId) {
+                    return gine.playEarcon(earcon,queueMode,null,utteranceId);
+                    }
+                @Override
+                public int speak(String text,int queueMode,String utteranceId) {
+                    return gine.speak(text,queueMode,null,utteranceId);
+                    }
+                },message,wordsId,chime);
+                }
+            if(speakResult==TextToSpeech.SUCCESS) {
+                queued=true;
+                health.record(true,engineReady);
                 if(doLog) {Log.i(LOG_ID,"success speak "+message);}
+                return true;
                 }
              else {
-                Log.e(LOG_ID,"failed speak "+message);
+                health.record(false,engineReady);
+                Log.e(LOG_ID,"failed speak "+message+" consecutiveFailures="+health.consecutiveFailures());
                 }
             }
         catch(Throwable th) {
+            // A dead/unbound TTS engine can fail by throwing (e.g. a dead Binder) rather than
+            // returning a non-SUCCESS result - count it the same way, or needsReinit() never
+            // trips for that failure mode.
+            health.record(false,engineReady);
             Log.stack(LOG_ID,"speak failed",th);
             }
+        finally {
+            // Nothing will call onDone for words that were never queued, and the listener
+            // ignores the lead-in, so the focus taken above is ours to give back.
+            if(ownsFocus&&!queued)
+                focus.release(wordsId);
+            }
         }
+    return false;
+    }
+
+/** Held across every write to the engine's queue, so one utterance's items stay together. */
+private final Object queueLock=new Object();
+
+/** Static, as the focus it tracks is: a replaced Talker's late callbacks must not release it. */
+private static final SpeechFocus focus=new SpeechFocus(new SpeechFocus.Audio() {
+    @Override
+    public void request() {
+        doTurnFocuson();
+        }
+    @Override
+    public void abandon() {
+        doTurnFocusoff();
+        }
+    });
+private static final java.util.concurrent.atomic.AtomicLong utteranceSeq=new java.util.concurrent.atomic.AtomicLong();
+/** The words this Talker last claimed focus for, released by destruct(). */
+private volatile String lastWordsId;
+
+private static final String PREFS="tk.glucodata_preferences";
+private static final String KEY_CHIME="voice_chime_before_glucose";
+
+/** Whether glucose announcements start with a short chime. Off unless the user turns it on. */
+public static boolean getChimeBeforeGlucose(Context context) {
+    return context.getSharedPreferences(PREFS,Context.MODE_PRIVATE).getBoolean(KEY_CHIME,false);
+    }
+
+public static void setChimeBeforeGlucose(Context context,boolean chime) {
+    context.getSharedPreferences(PREFS,Context.MODE_PRIVATE).edit().putBoolean(KEY_CHIME,chime).apply();
+    }
+
+// Tracks real engine health, as opposed to istalking() which only checks that
+// SuperGattCallback.talker is non-null. A talker object surviving a TTS-service disconnect
+// (e.g. com.google.android.tts auto-updating overnight, which unbinds the TextToSpeech
+// connection permanently until reconstructed) still passes istalking(), so nothing ever healed
+// it. Observed in the field: "TextToSpeech: Disconnected from TTS engine" once after a
+// com.google.android.tts package REPLACE, then 172 consecutive "failed speak"/"not bound to TTS
+// engine" results with zero recovery over 4+ days. Refusals before onInit are not counted -
+// see SpeakHealth.record().
+private final SpeakHealth health=new SpeakHealth();
+/** How long selspeak() defers after an utterance the engine would not take. Short enough that
+ *  the next reading retries, so a failed attempt costs one reading rather than one whole
+ *  user-configured separation interval. */
+private static final long FAILED_SPEAK_RETRY_MS=30_000L;
+
+/** True once repeated real speak failures show the engine is dead and must be reconstructed. */
+public boolean needsReinit() {
+    return health.needsReinit();
     }
 static boolean notifyfocus=false;
 //private static final AudioAttributes notification_audio = (new AudioAttributes.Builder()) .setLegacyStreamType(TextToSpeech.Engine.DEFAULT_STREAM) .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH) .build(); 
 //private static final AudioAttributes notification_audio =(android.os.Build.VERSION.SDK_INT >= 21)?new AudioAttributes.Builder().setUsage(isWearable? USAGE_ASSISTANCE_SONIFICATION:USAGE_NOTIFICATION ) .build():null;
 //private static final AudioAttributes notification_audio = notification_audio;
-public void speak(String message, AudioAttributes attr) {
-if(!DontTalk) {
-    if(android.os.Build.VERSION.SDK_INT >= minandroid) {
-        if(attr!=notification_audio) {
-            engine.setAudioAttributes(attr);
-           }
-           }
-    
-//    engine.speak(message, TextToSpeech.QUEUE_FLUSH, null);
-    speak(message);
-    if(android.os.Build.VERSION.SDK_INT >= minandroid) {
-        if(attr!=notification_audio)
-            engine.setAudioAttributes(notification_audio);
-         }
-         }
+/**
+ * Speak with a one-shot audio-attribute override, restoring {@link Notify#notification_audio}
+ * afterwards. This is the overload the alarm path uses.
+ *
+ * <p>Reads {@code engine} into a local: {@link #destruct} nulls it from another thread, so the
+ * two setAudioAttributes() calls bracketing the utterance could each dereference null while an
+ * alarm was being announced. The single-argument {@link #speak(String)} swallows that in its own
+ * try/catch; this overload did not, so the throw escaped onto the caller's thread - for
+ * {@link Notify} that is a scheduler thread mid-alarm.
+ *
+ * @return true only when the engine accepted the utterance. See {@link #speak(String)}.
+ */
+public boolean speak(String message, AudioAttributes attr) {
+    return speak(message,attr,false);
     }
-static long nexttime=0L;
+
+boolean speak(String message, AudioAttributes attr, boolean chime) {
+    if(DontTalk)
+        return false;
+    final TextToSpeech gine=engine;
+    if(gine==null) {
+        Log.e(LOG_ID,"speak(message,attr): engine already shut down, dropping \""+message+"\"");
+        return false;
+        }
+    final boolean override=android.os.Build.VERSION.SDK_INT >= minandroid && attr!=notification_audio;
+    boolean spoken=false;
+    // Locked so another speak() cannot queue under these attributes, or restore them, between
+    // the override and this utterance. speak(message,chime) takes the same lock again.
+    synchronized(queueLock) {
+    try {
+        if(override) {
+            gine.setAudioAttributes(attr);
+            }
+        spoken=speak(message,chime);
+        }
+    catch(Throwable th) {
+        Log.stack(LOG_ID,"speak(message,attr)",th);
+        }
+    finally {
+        // Restore in a finally: leaving the override in place would apply the alarm's
+        // attributes to every subsequent routine announcement.
+        if(override) {
+            try {
+                gine.setAudioAttributes(notification_audio);
+                }
+            catch(Throwable th) {
+                Log.stack(LOG_ID,"speak(message,attr) restore",th);
+                }
+            }
+         }
+        }
+    return spoken;
+    }
+// volatile: written and read from the announce path and the settings/UI thread alike.
+volatile static long nexttime=0L;
 void selspeak(String message) {
     if(!DontTalk) {
         var now=System.currentTimeMillis();
         if(now>nexttime && SpeakSchedule.INSTANCE.isWithinSchedule(Applic.app)) {
+            // Claim the slot before speaking, so two readings arriving back to back cannot both
+            // announce - then hand nearly all of it back if the engine refused the utterance.
+            // Charging a failed attempt the full separation interval made the engine-health
+            // check's detection latency scale with a user setting, which is backwards:
+            // SpeakHealth counts announcement *attempts*, and attempts only happen
+            // once per cursep, so a threshold of 2 meant a dead engine went unnoticed
+            // for 2 x cursep - 10 minutes at a 300s separation, 33 minutes at 999s, with every
+            // further failure costing another interval of silence. Retrying on the next reading
+            // instead makes detection ~2 minutes regardless of how the user set the interval.
             nexttime=now+cursep;
-            speak(message);
+            if(!speak(message,getChimeBeforeGlucose(Applic.app))) {
+                nexttime=now+Math.min(cursep,FAILED_SPEAK_RETRY_MS);
+                }
             }
           }
     }
@@ -663,8 +854,8 @@ private static void cleanupConfigOverlay(MainActivity context, View layout) {
     tk.glucodata.help.hidekeyboard(context);
     removeContentView(layout);
     spinner=null;
-    if(Menus.on)
-        Menus.show(context);
+    if(LegacyScreensAccess.getMenusOn())
+        LegacyScreensAccess.get().openMenus(context);
     context.lightBars(!getInvertColors( ));
     }
 
@@ -895,10 +1086,11 @@ private static View makeConfigView(MainActivity context, boolean overlayMode, Ru
             if(talk!=null) {
                 talk.setvalues();
                 talk.setvoice();
-                talk.speak(say);
+                talk.speak(say,getChimeBeforeGlucose(context));
                 return;
                 }
             }
+        playchime=getChimeBeforeGlucose(context);
         playstring=say;
         SuperGattCallback.newtalker(context);
         });

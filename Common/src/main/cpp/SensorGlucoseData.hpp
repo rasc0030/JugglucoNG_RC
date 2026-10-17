@@ -64,7 +64,7 @@ inline int getpagesize(void) {
 #include "maxsendtohost.h"
 #include "settings/settings.hpp"
 #include "timevalues.h"
-inline constexpr const int maxdexcount = 3025;
+#include "dexcom/ScanIdentity.hpp"
 inline constexpr const int youngsensorsecs = 2 * 60 * 60;
 inline constexpr const char rawstream[] = "rawstream.dat";
 #include <string_view>
@@ -77,9 +77,35 @@ extern int getgetsendnr();
 constexpr const int maxcaliNr = 50;
 constexpr int maxdays = 46;
 
-constexpr const int maxdaysDex = 12;
-
 constexpr const int maxdaysAccu = 15;
+constexpr const int maxdaysAir = 16;
+// Sensor kind of CareSens Air: stream libreversion, getSensorgen2() and the UI
+// kind. Upstream Juggluco uses 0x30, which is already AiDex's UI kind here.
+inline constexpr const int careSensAirKind = 0x60;
+
+// CareSens Air keeps two files next to info.dat: the sensor's calibration
+// parameters as read over BLE, and the vendor algorithm's running state.
+inline constexpr const char sensorInfoStr[] = "sensorInfo";
+inline constexpr const char generatedStr[] = "generated";
+
+// The CareSens Air QR payload in the canonical form PhotoScan hands to native:
+// GS 01 <gtin> 17 <expiry> 21 <serial> GS 240 <pin> GS 250 <sensor code>.
+// A code without AI 01 uses zero-filled GTIN storage; it is not sensor identity.
+// The record is stored verbatim in Info::airData; the BLE pairing PIN is read
+// back from it at a fixed offset, so the layout must not change.
+struct careSenseAirScan_t {
+  char start[3];
+  char gtin[14];
+  char tus17[2];
+  char expiry[6];
+  char tus21[2];
+  char serial[12];
+  char start2[4];
+  char pinCode[6];
+  char start3[4];
+  char sensorCode[16];
+};
+static_assert(sizeof(careSenseAirScan_t) == 69);
 
 constexpr const int stdMaxDaysSI = 24;
 constexpr const int maxdaysSI =
@@ -96,6 +122,31 @@ constexpr const int maxSIhours =
 #else
     572;
 #endif
+
+namespace pollstorage {
+template <typename HasTimestamp>
+constexpr size_t recoverCount(uint32_t storedCount, size_t capacity,
+                              HasTimestamp hasTimestamp) {
+  size_t recovered = std::min<size_t>(storedCount, capacity);
+  while (recovered > 0 && !hasTimestamp(recovered - 1))
+    --recovered;
+  return recovered;
+}
+
+constexpr uint16_t recoverStart(uint16_t storedStart, size_t recoveredCount) {
+  return recoveredCount == 0
+             ? 0
+             : static_cast<uint16_t>(
+                   std::min<size_t>(storedStart, recoveredCount - 1));
+}
+
+// Issue #137 persisted 34,816 while the old Sibionics map held 34,320
+// records. A larger replacement map must stop at the last durable record.
+static_assert(recoverCount(34816, maxminutes,
+                           [](size_t index) { return index < 34320; }) == 34320);
+static_assert(recoverStart(40000, 34320) == 34319);
+} // namespace pollstorage
+
 /*constexpr const int maxSIhours=
 #ifndef NOLOG
 maxdaysSI*24
@@ -229,6 +280,10 @@ public:
         uint16_t wearduration2;
         uint8_t warmup2;
       };
+      // Air alone uses askEarlier; its wear/warmup live in the first union.
+      struct { // Do not read wearduration2/warmup2 for an Air sensor.
+        uint16_t askEarlier;
+      };
     };
     union {
       struct { // Libre 2
@@ -271,7 +326,14 @@ public:
     int8_t streamingIsEnabled;
     int8_t patchState;
     uint16_t autoResetDays : 8;
-    uint16_t reserved4 : 3;
+    // Which managed driver family owns this shell: Ottai, Anytime, MQ, iCan...
+    // The native ladder cannot tell those apart -- anything not flagged
+    // Sibionics, Dexcom, Accu-Chek or AiDex is Libre 2 by elimination -- and a
+    // phone receiving the sensor over Clone has no driver record to ask. The
+    // family travels in info.dat with everything else. 0 is unknown, which is
+    // what every shell written before this field existed reads as. Codes are
+    // ManagedSensorUiFamily.nativeCode on the Kotlin side.
+    uint16_t managedFamily : 3;
     uint16_t aidex : 1;
     uint16_t useCustomCalibration : 1;
     uint16_t autoResetAlgorithm : 1;
@@ -282,7 +344,10 @@ public:
     uint8_t customCalIndex; // 0=12H, 1=1D, 2=2D, 3=3D, 4=5D, 5=7D, 6=10D,
                             // 7=14D, 8=18D, 9=MAX
 
-    uint8_t reserved : 2;
+    // Upstream Juggluco keeps its air flag elsewhere; that bit is
+    // autoResetAlgorithm here, so CareSens Air takes a reserved bit.
+    bool air : 1;
+    uint8_t reserved : 1;
     // CLEAN REFACTOR: Use timestamp instead of bool for reset mode.
     // 0 = not in reset mode. Non-zero = timestamp when reset mode started.
     // Auto-expires after 30 min or when gap closes.
@@ -301,6 +366,10 @@ public:
     updatestate update[std::max(maxsendtohost, 8)];
     union {
       uint8_t kAuth[149];
+      struct {
+        careSenseAirScan_t airData;
+        char8_t reservedAir[149 - sizeof(careSenseAirScan_t)];
+      } __attribute__((packed));
       struct {
         uint32_t siIdlen;
         char8_t siId[68];
@@ -557,7 +626,11 @@ private:
     if (isSibionics())
       return 4 * elsize;
     //   if(isDexcom()) return 4*elsize;
-    const auto days = getinfo()->days;
+    // Reserve both supported Dexcom geometries before any pointer is handed to
+    // a driver. A rescan can correct an old 10-day record without remapping it.
+    const auto days = isDexcom()
+                          ? std::max<int>(getinfo()->days, dexcom::maximumStorageDays)
+                          : getinfo()->days;
     if (elsize < 10 || elsize > 20 || days < 10 || days > maxdays) {
       LOGGER("%s: historybytes error elsize=%d days=%d\n",
              shortsensorname()->data(), elsize, days);
@@ -607,6 +680,8 @@ public:
       return 0x10;
     if (isAccuChek())
       return 0x20;
+    if (isAir())
+      return careSensAirKind;
     auto *info = getinfo();
     if (info && info->interval == interval5)
       return 3;
@@ -654,7 +729,7 @@ public:
   }
 
   int streamperhour() const {
-    if (isAccuChek() || isDexcom())
+    if (isAccuChek() || isDexcom() || isAir())
       return 12;
     else
       return 60;
@@ -673,6 +748,51 @@ public:
       days = 15;
     return days * 24 * streamperhour();
   }
+  int32_t pollStorageSize(size_t minimumRecords = 0) const {
+    const auto *info = getinfo();
+    const std::string_view path(sensordir.data(), sensordir.size());
+    const size_t leafOffset = path.find_last_of('/') == std::string_view::npos
+                                  ? 0
+                                  : path.find_last_of('/') + 1;
+    const bool managedSibionics =
+        path.substr(leafOffset).starts_with("SIBI:");
+    // Legacy Sibionics reset cycles keep appending to the same poll store.
+    // Managed Sibionics shells also need to reach their day-22 reset without
+    // changing the native shell's lifecycle metadata.
+    const bool sibionics = (info && info->sibionics) || managedSibionics;
+    const bool dexcomSensor = info && info->dexcom;
+    const size_t defaultRecords =
+        sibionics ? static_cast<size_t>(maxminutes)
+                  : dexcomSensor ? static_cast<size_t>(dexcom::maximumStorageDays * 24 * 12)
+                  : static_cast<size_t>(std::max(maxstreampos(), 0));
+    // A sensor that negotiates a life longer than its shell geometry — Ottai's
+    // 15-day rating extending to 28/30 — outgrows the poll map mid-wear:
+    // maxstreampos() stops at info->days (floor 15), so on day 15 lifeCount
+    // reaches pollStorageCapacity(), validPollIndex() starts refusing, and every
+    // live write is dropped without a trace. setSensorWearDays deliberately
+    // leaves info->days alone because an already-open mapping cannot move, so
+    // take the negotiated duration into account here instead: storage geometry
+    // is only ever recomputed in the constructor, where extending the file is
+    // safe and repairPollMetadata() preserves the records already written.
+    const size_t wearRecords =
+        (!sibionics && !dexcomSensor && info && info->wearduration2)
+            ? (static_cast<size_t>(info->wearduration2) *
+               static_cast<size_t>(std::max(streamperhour(), 1))) /
+                  60u
+            : 0u;
+    return static_cast<int32_t>(
+        std::min(std::max({defaultRecords, wearRecords, minimumRecords}),
+                 static_cast<size_t>(std::numeric_limits<int32_t>::max())));
+  }
+  size_t pollStorageCapacity() const {
+    if (!polls.data() || !rawpolls.data() || !temppolls.data())
+      return 0;
+    return std::min({polls.size(), rawpolls.size(), temppolls.size()});
+  }
+  bool validPollIndex(int64_t index) const {
+    return index >= 0 &&
+           static_cast<uint64_t>(index) < pollStorageCapacity();
+  }
   int streamingIsEnabled() const {
     auto *info = getinfo();
     return info ? info->streamingIsEnabled : 0;
@@ -683,7 +803,7 @@ public:
       info->streamingIsEnabled = val;
   }
   uint32_t getfirsttime() const {
-    if (isLibre()) {
+    if (isLibre() || isAir()) {
       uint32_t locfirstpos = getstarthistory() + 1;
       for (int pos = locfirstpos, end = std::min(getAllendhistory(), maxpos());
            pos < end; pos++) {
@@ -740,7 +860,7 @@ public:
     auto *info = getinfo();
     if (!info)
       return 14 * 24 * 60;
-    const int wear = (isLibre2() || isDexcom() || isAccuChek())
+    const int wear = (isLibre2() || isDexcom() || isAccuChek() || isAir())
                          ? info->wearduration
                          : info->wearduration2;
     if (isAiDex()) {
@@ -756,11 +876,19 @@ public:
   }
   int getweardurationSEC() const { return getweardurationMIN() * 60; }
 
+  int getDexWearMinutes() const {
+    const auto *info = getinfo();
+    return info && info->wearduration == dexcom::wearMinutes(15)
+               ? dexcom::wearMinutes(15) : dexcom::wearMinutes(10);
+  }
+  int getmaxdexcount() const { return dexcom::maximumCount(getDexWearMinutes()); }
+  int getDexMaxSecs() const { return dexcom::maximumSeconds(getDexWearMinutes()); }
+
   int getWarmupMIN() const {
     auto *info = getinfo();
     if (!info)
       return 60;
-    const int warmup = (isLibre2() || isAccuChek() || isDexcom())
+    const int warmup = (isLibre2() || isAccuChek() || isDexcom() || isAir())
                            ? info->warmup
                            : info->warmup2;
     if (warmup)
@@ -783,7 +911,7 @@ public:
       };
       return (maxSIhours * 60 - 19) * 60;
     }
-    if (isLibre3() || isAccuChek())
+    if (isLibre3() || isAccuChek() || isAir())
       return getweardurationSEC();
     return getweardurationSEC() + 12 * 60 * 60;
   }
@@ -804,7 +932,16 @@ public:
         isSibionics1() ? maxSIhours
                        : ((isAccuChek() ? maxdaysAccu : info->days + 1) * 24);
 #endif
-    uint32_t maxtime = hours * 60 * 60 + getstarttime();
+    // info->days is the shell's storage geometry — 14 for a direct-stream
+    // shell seeded before its lifetime was known — while a longer activated
+    // lifetime only ever lands in wearduration2 (setSensorWearDays). Where the
+    // two disagree the longer one is the real end; otherwise checkinfo()
+    // retires a 28-day sensor on day 14 and it silently leaves the watch feed.
+    // Only AiDex, Libre3 and direct-stream shells carry wearduration2, and for
+    // the first two it never exceeds days*24*60, so this is a no-op there.
+    const int minutes =
+        std::max(hours * 60, static_cast<int>(info->wearduration2));
+    uint32_t maxtime = minutes * 60 + getstarttime();
 
     // ARCHITECTURAL FIX: Support Custom Calibration for aged sensors.
     // If user enabled Custom Calibration (index != 0), we allow the sensor to
@@ -1039,8 +1176,8 @@ public:
   void setnobluetooth() { getinfo()->bluestart = bluestartunknown; }
   bool hasbluetooth() const { return getinfo()->bluestart != bluestartunknown; }
   bool canusestreaming() const {
-    return isAccuChek() || isSibionics() || isLibre3() || hasbluetooth() ||
-           isDexcom();
+    return isAccuChek() || isSibionics() || isLibre3() || isAir() ||
+           hasbluetooth() || isDexcom();
     //    return  hasbluetooth();
   }
   const std::string_view othershortsensorname() const {
@@ -1089,6 +1226,8 @@ public:
         return std::string_view(sensordir.data() + sensordir.length() - 9, 9);
       if (isAiDex())
         return sensid();
+      if (isAir())
+        return std::string_view(sensordir.data() + sensordir.length() - 12, 12);
     }
     std::string_view sid = sensid();
     if (sid.length() == 11)
@@ -1234,20 +1373,21 @@ static int getgeneration(const char *info) {
 
   bool isDexcom() const { return getinfo()->dexcom; }
   bool isLibre3() const {
-    return !isAccuChek() && !isSibionics() && !isDexcom() &&
+    return !isAccuChek() && !isSibionics() && !isDexcom() && !isAir() &&
            (getinfo()->interval == interval5);
   }
   bool isLibre2() const {
-    return !(isAccuChek() || isSibionics() || isDexcom() ||
+    return !(isAccuChek() || isSibionics() || isDexcom() || isAir() ||
              getinfo()->interval == interval5);
   }
   bool isLibre() const {
-    return !(isSibionics() || isDexcom() || isAccuChek());
+    return !(isSibionics() || isDexcom() || isAccuChek() || isAir());
   }
   bool isAccuChek() const { return getinfo()->accuChek; }
   bool isAiDex() const { return getinfo()->aidex; }
+  bool isAir() const { return getinfo()->air; }
   int streaminterval() const {
-    const int res = (isDexcom() || isAccuChek()) ? 5 : 1;
+    const int res = (isDexcom() || isAccuChek() || isAir()) ? 5 : 1;
     return res;
   }
   /*
@@ -1391,11 +1531,46 @@ bool libreviewable() const {
 
     return true;
   };
+  static bool mkdatabaseAir(string_view sensordir, const careSenseAirScan_t &scan,
+                            uint32_t now) {
+    LOGGER("mkdatabaseAir %s\n", sensordir.data());
+    mkdir(sensordir.data(), 0700);
+    pathconcat infoname(sensordir, infopdat);
+    if (access(infoname, F_OK) != -1) {
+      Readall<uint8_t> inf(infoname);
+      if (inf.data() && inf.size() >= sizeof(Info)) {
+        const Info *in = reinterpret_cast<const Info *>(inf.data());
+        if (in->pollcount && in->starttime > 1700000000 && in->dupl > 0 &&
+            in->air)
+          return false;
+      }
+    }
+    Info inf{.starttime = now,
+             .lastscantime = now,
+             .starthistory = 0,
+             .endhistory = 0,
+             .scancount = 0,
+             .startid = 0,
+             .interval = interval5,
+             .dupl = 3,
+             .days = maxdaysAir,
+             .warmup = 30,
+             .wearduration = 21600,
+             .lastLifeCountReceived = 1,
+             .pollcount = 0,
+             .lockcount = 0,
+             .air = true};
+    inf.airData = scan;
+    writeall(infoname, &inf, sizeof(inf));
+    return true;
+  }
 
 #ifdef DEXCOM
   static bool mkdatabaseDex(string_view sensordir, string_view sensorgegs,
-                            uint32_t now) {
-    LOGGER("mkdatabaseDex %s,%s\n", sensordir.data(), sensorgegs.data());
+                            uint32_t now, int wearDays = 10) {
+    if ((wearDays != 10 && wearDays != 15) || sensorgegs.size() > sizeof(Info::siId))
+      return false;
+    LOGGER("mkdatabaseDex %s payload length=%zu\n", sensordir.data(), sensorgegs.size());
     mkdir(sensordir.data(), 0700);
     pathconcat infoname(sensordir, infopdat);
     if (access(infoname, F_OK) != -1) {
@@ -1417,9 +1592,9 @@ bool libreviewable() const {
              .interval = interval5,
              .dupl = 3,
              .dexcom = true,
-             .days = maxdaysDex,
+             .days = static_cast<uint8_t>(wearDays + 2),
              .warmup = 30,
-             .wearduration = 14400,
+             .wearduration = static_cast<uint16_t>(dexcom::wearMinutes(wearDays)),
              .lastLifeCountReceived = 1,
              .pollcount = 0};
     inf.siIdlen = sensorgegs.size();
@@ -1544,15 +1719,32 @@ private:
   pathconcat trendspath;
 
   static constexpr const char trendsdat[] = "trends.dat";
+  int initialHistoryBytes() {
+    auto *info = getinfo();
+    if (!info) { haserror = true; return 0; }
+    if (info->dexcom && info->siIdlen <= sizeof(info->siId)) {
+      // Recover 15-day metadata from a barcode stored by an older app. Do this
+      // before constructing history/poll maps, preserving their existing data.
+      const auto scan = dexcom::parseScan(std::string_view(
+          reinterpret_cast<const char *>(info->siId), info->siIdlen));
+      if (scan) {
+        info->wearduration = std::max<uint16_t>(info->wearduration,
+            static_cast<uint16_t>(dexcom::wearMinutes(scan->days)));
+        info->days = std::max<uint8_t>(info->days, scan->days + 2);
+      }
+    }
+    return historybytes(perhour());
+  }
   SensorGlucoseData(string_view sensordir, int spec, string_view baseuit,
-                    int sensorindex)
+                    int sensorindex, size_t minimumPollRecords = 0)
       : sensordir(sensordir), meminfo(sensordir, infopdat, sizeof(struct Info)),
-        historydata(sensordir, "data.dat",
-                    getinfo() ? historybytes(perhour()) : (haserror = true, 0)),
+        historydata(sensordir, "data.dat", initialHistoryBytes()),
         scansize(maxscansize()), scans(sensordir, "current.dat", scansize),
-        polls(sensordir, "polls.dat", maxstreampos()),
-        rawpolls(sensordir, "rawpolls.dat", maxstreampos()),
-        temppolls(sensordir, "temppolls.dat", maxstreampos()),
+        polls(sensordir, "polls.dat", pollStorageSize(minimumPollRecords)),
+        rawpolls(sensordir, "rawpolls.dat",
+                 pollStorageSize(minimumPollRecords)),
+        temppolls(sensordir, "temppolls.dat",
+                  pollStorageSize(minimumPollRecords)),
         trends(sensordir, trendsdat, scansize), specstart(spec),
         polluit(baseuit, "polls.dat"), rawpolluit(baseuit, "rawpolls.dat"),
         temppolluit(baseuit, "temppolls.dat"), infopath(baseuit, infopdat),
@@ -1573,6 +1765,7 @@ private:
              baseuit.data());
       return;
     }
+    repairPollMetadata();
     if (isSibionics2())
       getinfo()->days = 45;
     if (const ScanData *last = lastpoll()) {
@@ -1593,7 +1786,7 @@ private:
         }
       }
     }
-    if (!(isAccuChek() || isSibionics() || isDexcom())) {
+    if (!(isAccuChek() || isSibionics() || isDexcom() || isAir())) {
       LOGGER("getinfo()->lastHistoricLifeCountReceivedPos=%d\n",
              getinfo()->lastHistoricLifeCountReceivedPos);
       if (!getinfo()->lastHistoricLifeCountReceivedPos)
@@ -1669,10 +1862,24 @@ const char * relstatefile() {
             sensin, specin,
             std::string_view(sensin.data() + specin, sensin.size() - specin),
             sensorindex) {}
+  SensorGlucoseData(string_view sensin, int specin, int sensorindex,
+                    size_t minimumPollRecords)
+      : SensorGlucoseData(
+            sensin, specin,
+            std::string_view(sensin.data() + specin, sensin.size() - specin),
+            sensorindex, minimumPollRecords) {}
 
 public:
+  struct DirectStreamCapacity {
+    size_t minimumRecords;
+  };
+
   SensorGlucoseData(string_view sensin, int sensorindex)
       : SensorGlucoseData(sensin, globalbasedir.size() + 1, sensorindex) {}
+  SensorGlucoseData(string_view sensin, int sensorindex,
+                    DirectStreamCapacity capacity)
+      : SensorGlucoseData(sensin, globalbasedir.size() + 1, sensorindex,
+                          capacity.minimumRecords) {}
   void setMirrorRemoteBase(std::string_view baseuit) {
     if (baseuit.empty())
       return;
@@ -1694,10 +1901,46 @@ public:
   // bool haserror=false;
   bool error() const {
     if (!haserror && meminfo.data() && historydata.data() && polls.data() &&
+        rawpolls.data() && temppolls.data() &&
         (!canscan() || (scans.data() && trends.data())))
       return false;
     return true;
   }
+
+private:
+  void repairPollMetadata() {
+    auto *info = getinfo();
+    const size_t capacity = pollStorageCapacity();
+    if (!info || !polls.data() || capacity == 0)
+      return;
+
+    const uint32_t storedCount = info->pollcount;
+    // Extending an old undersized file creates a zero-filled tail. Entries
+    // beyond the former mapping were never durably written, even when the
+    // corrupted count says otherwise, so retain only the last timed record.
+    const size_t recoveredCount = pollstorage::recoverCount(
+        storedCount, capacity,
+        [this](size_t index) { return polls[index].t != 0; });
+
+    const uint16_t storedStart = info->pollstart;
+    const uint16_t recoveredStart =
+        pollstorage::recoverStart(storedStart, recoveredCount);
+    if (storedCount != recoveredCount || storedStart != recoveredStart) {
+      LOGGER("repairPollMetadata count=%u->%zu start=%u->%u capacity=%zu\n",
+             storedCount, recoveredCount, storedStart, recoveredStart,
+             capacity);
+      info->pollcount = static_cast<uint32_t>(recoveredCount);
+      info->pollstart = recoveredStart;
+      for (auto &up : info->update) {
+        up.streamstart =
+            std::min<uint32_t>(up.streamstart, info->pollcount);
+        up.rawstreamstart =
+            std::min<uint32_t>(up.rawstreamstart, info->pollcount);
+      }
+    }
+  }
+
+public:
 
   void prunestream();
   void prunescans();
@@ -1723,7 +1966,9 @@ uint32_t getlastpolltime() const {
     const ScanData *start = polls.data();
     if (!start)
       return 0;
-    for (int i = pollcount() - 1; i >= getinfo()->pollstart; --i) {
+    const int first =
+        std::min<int>(getinfo()->pollstart, std::max(pollcount() - 1, 0));
+    for (int i = pollcount() - 1; i >= first; --i) {
       if (start[i].valid(i))
         return start[i].t;
     }
@@ -1731,13 +1976,22 @@ uint32_t getlastpolltime() const {
   }
   uint32_t firstpolltime() const {
     const ScanData *start = polls.data();
-    for (int i = getinfo()->pollstart; i < pollcount(); i++)
+    if (!start)
+      return UINT32_MAX;
+    const int first = std::min<int>(getinfo()->pollstart, pollcount());
+    for (int i = first; i < pollcount(); i++)
       if (start[i].valid(i))
         return start[i].t;
     return UINT32_MAX;
   }
   int scancount() const { return getinfo()->scancount; }
-  int pollcount() const { return getinfo()->pollcount; }
+  int pollcount() const {
+    const auto *info = getinfo();
+    if (!info)
+      return 0;
+    return static_cast<int>(
+        std::min<size_t>(info->pollcount, pollStorageCapacity()));
+  }
   std::array<uint16_t, 16> &gettrendsbuf(int index) { return trends[index]; }
   const std::array<uint16_t, 16> &gettrendsbuf(int index) const {
     return trends[index];
@@ -1750,15 +2004,15 @@ uint32_t getlastpolltime() const {
   void saveglucose(const nfcdata *nfc, time_t tim, int id, int glu, int trend,
                    float change) {
     savetrend(nfc, gettrendsbuf(scancount()));
-    saveglucosedata(scans, getinfo()->scancount, tim, id, glu, trend, change,
-                    0);
-    setlastscantime(tim);
+    if (saveglucosedata(scans, getinfo()->scancount, tim, id, glu, trend,
+                        change, 0))
+      setlastscantime(tim);
   }
 
   bool savepoll(time_t tim, int id, int glu, int trend, float change,
                 int raw = 0) {
-    if (getinfo()->pollcount) {
-      int count = getinfo()->pollcount - 1;
+    if (pollcount()) {
+      int count = pollcount() - 1;
       int previd = polls[count].id;
       if (previd >= id) {
         LOGGER("GLU: duplicate id: previd=%d id=%d\n", previd, id);
@@ -1779,21 +2033,19 @@ uint32_t getlastpolltime() const {
             weight * getinfo()->pollinterval + (1.0 - weight) * af;
       }
     }
-    saveglucosedata(polls, getinfo()->pollcount, tim, id, glu, trend, change,
-                    raw);
-    return true;
+    return saveglucosedata(polls, getinfo()->pollcount, tim, id, glu, trend,
+                           change, raw);
   }
 
   bool savestreamonly(time_t tim, int id, int glu, int trend, float change,
                       int raw = 0, uint16_t temp = 0) {
-    if (getinfo()->pollcount) {
-      const int prev = getinfo()->pollcount - 1;
+    if (pollcount()) {
+      const int prev = pollcount() - 1;
       if (polls[prev].id >= id)
         return false;
     }
-    saveglucosedata(polls, getinfo()->pollcount, tim, id, glu, trend, change,
-                    raw, temp);
-    return true;
+    return saveglucosedata(polls, getinfo()->pollcount, tim, id, glu, trend,
+                           change, raw, temp);
   }
 
   void savestream(time_t tim, int id, int glu, int trend, float change,
@@ -1810,32 +2062,51 @@ uint32_t getlastpolltime() const {
 
   bool saveStreamAgain(time_t tim, int id, int glu, int trend, float change,
                        int raw = 0, uint16_t temp = 0) {
+    auto *info = getinfo();
+    const size_t capacity = pollStorageCapacity();
+    if (!info || capacity == 0)
+      return true;
     int index = id - 5;
     if (index < 0) {
       return true;
     }
+    if (static_cast<size_t>(index) >= capacity) {
+      LOGGER("saveStreamAgain id=%d index=%d exceeds capacity=%zu\n", id,
+             index, capacity);
+      return true;
+    }
     while (index > 0 && polls[index].id > id)
       --index;
-    auto *info = getinfo();
-    if (!info)
-      return true;
-    while (index < info->pollcount && polls[index].id < id) {
+    const size_t count = std::min<size_t>(info->pollcount, capacity);
+    while (static_cast<size_t>(index) < count && polls[index].id < id) {
       ++index;
+    }
+    if (static_cast<size_t>(index) >= capacity) {
+      LOGGER("saveStreamAgain id=%d resolved index=%d exceeds capacity=%zu\n",
+             id, index, capacity);
+      return true;
     }
     polls[index] = {static_cast<uint32_t>(tim), id, (int32_t)glu, trend,
                     change};
     rawpolls[index] = {(uint16_t)raw};
     temppolls[index] = temp;
-    const int count = index + 1;
-    if (count < info->pollcount) {
+    const int newCount = index + 1;
+    if (newCount < info->pollcount) {
       return true;
     }
-    info->pollcount = count;
+    info->pollcount = newCount;
     return false;
   }
-  void saveglucosedata(Mmap<ScanData> &streamscans, uint32_t &count, time_t tim,
+  bool saveglucosedata(Mmap<ScanData> &streamscans, uint32_t &count, time_t tim,
                        int id, int glu, int trend, float change, int raw = 0,
                        uint16_t temp = 0) {
+    const size_t capacity =
+        &streamscans == &polls ? pollStorageCapacity() : streamscans.size();
+    if (count >= capacity) {
+      LOGGER("saveglucosedata count=%u exceeds capacity=%zu id=%d\n", count,
+             capacity, id);
+      return false;
+    }
     streamscans[count] = {static_cast<uint32_t>(tim), id, (int32_t)glu, trend,
                           change};
     if (&streamscans == &polls) {
@@ -1843,14 +2114,22 @@ uint32_t getlastpolltime() const {
       temppolls[count] = temp;
     }
     count++;
+    return true;
   }
   bool hasStreamID(const int id) const {
+    if (!validPollIndex(id))
+      return false;
     return polls[id].id == id && polls[id].g;
   }
   template <int secs>
   int savepollallIDsonly(time_t tim, const int id, int glu, int trend,
                          float change, int raw = 0, uint16_t temp = 0) {
-    int count = getinfo()->pollcount;
+    const size_t capacity = pollStorageCapacity();
+    if (id < 0 || static_cast<size_t>(id) >= capacity) {
+      LOGGER("savepollallIDsonly id=%d exceeds capacity=%zu\n", id, capacity);
+      return -1;
+    }
+    int count = pollcount();
     if (count < id) {
       LOGGER("savepollallIDsonly count=%d<id=%d\n", count, id);
       const uint32_t startiter = tim - (id - count) * secs;
@@ -1886,7 +2165,10 @@ uint32_t getlastpolltime() const {
   template <int secs>
   int savepollallIDsonlyQuiet(time_t tim, const int id, int glu, int trend,
                               float change, int raw = 0, uint16_t temp = 0) {
-    int count = getinfo()->pollcount;
+    const size_t capacity = pollStorageCapacity();
+    if (id < 0 || static_cast<size_t>(id) >= capacity)
+      return -1;
+    int count = pollcount();
     if (count < id) {
       const uint32_t startiter = tim - (id - count) * secs;
       if constexpr (secs == 60) {
@@ -1918,6 +2200,8 @@ uint32_t getlastpolltime() const {
                       float change, int raw = 0, uint16_t temp = 0) {
     int count =
         savepollallIDsonly<secs>(tim, id, glu, trend, change, raw, temp);
+    if (count < 0)
+      return false;
     if (id == count)
       getinfo()->pollcount = id + 1;
     else {
@@ -1931,6 +2215,8 @@ uint32_t getlastpolltime() const {
                            float change, int raw = 0, uint16_t temp = 0) {
     int count =
         savepollallIDsonlyQuiet<secs>(tim, id, glu, trend, change, raw, temp);
+    if (count < 0)
+      return false;
     if (id == count)
       getinfo()->pollcount = id + 1;
     else {
@@ -1942,7 +2228,7 @@ uint32_t getlastpolltime() const {
 
   void consecutivelifecount() {
     const int pos = getinfo()->lastLifeCountReceived;
-    const int count = getinfo()->pollcount;
+    const int count = pollcount();
     for (int i = pos + 1; i < count; i++) {
       if (!polls[i].g && !isnan(polls[i].ch)) {
         getinfo()->lastLifeCountReceived = i - 1;
@@ -2002,8 +2288,9 @@ uint32_t getlastpolltime() const {
   const ScanData *beginscans() const { return scans.data(); }
   const ScanData *beginpolls() const { return polls.data(); }
   std::span<const ScanData> getPolldata() const {
-    const int start = getinfo()->pollstart;
-    return std::span<const ScanData>(polls.data() + start, pollcount() - start);
+    const int count = pollcount();
+    const int start = std::min<int>(getinfo()->pollstart, count);
+    return std::span<const ScanData>(polls.data() + start, count - start);
   }
 
   const ScanData *lastscan() const {
@@ -2017,7 +2304,7 @@ uint32_t getlastpolltime() const {
   }
   const ScanData *lastpoll() const {
     const auto polc = pollcount();
-    if (polc > 0)
+    if (polls.data() && polc > 0)
       return polls.data() + polc - 1;
     return nullptr;
   }
@@ -2045,7 +2332,7 @@ uint32_t getlastpolltime() const {
     exportscans(file, getinfo()->scancount, scans.data());
   }
   void exportpolls(const char *file) const {
-    exportscans(file, getinfo()->pollcount, polls.data());
+    exportscans(file, pollcount(), polls.data());
   }
   int nextlock() { return getinfo()->lockcount++; }
   void setlock(uint32_t lock) { getinfo()->lockcount = lock; }
@@ -2498,6 +2785,22 @@ void setbackuptime(int ind,uint32_t starttime) {
     if (!info || !starttime)
       return;
 
+    // The Health Connect cursor is a poll index, and direct-stream indices
+    // count minutes from starttime. Left alone it points into the old window:
+    // past pollcount the export stalls, and once pollcount catches up it
+    // resumes there, skipping every reading refilled below it. Carry the
+    // cursor to the same minute in the new window instead; resetting it
+    // would re-send what was already exported, and Health Connect keeps
+    // duplicates. 0 (a window that starts past the cursor) means "from
+    // pollstart", i.e. everything in the new window is still to export.
+    if (const int cursor = info->healthconnectiter; cursor > 0) {
+      const int64_t shiftMinutes =
+          (static_cast<int64_t>(starttime) - info->starttime) / 60;
+      const int64_t moved = cursor - shiftMinutes;
+      info->healthconnectiter = static_cast<uint16_t>(
+          std::clamp<int64_t>(moved, 0, UINT16_MAX));
+    }
+
     info->starttime = starttime;
     info->pollcount = 0;
     info->pollstart = 0;
@@ -2601,7 +2904,8 @@ public:
     constexpr const int len = offsetof(Info, streamingIsEnabled) +
                               sizeof(Info::streamingIsEnabled) - off;
     memcpy(&pollinfo, meminfo.data() + off, len);
-    const int streamend = pollinfo.pollcount; // TODO test earlier?
+    const int streamend =
+        std::min<int>(pollinfo.pollcount, pollStorageCapacity());
     if (streamstart < streamend) {
       const struct ScanData *startstreambuf = polls.data();
       const uint16_t cmd = streamupdatecmd(sensindex);
@@ -2707,7 +3011,10 @@ public:
                offsetof(Info, deviceaddress), deviceaddresslen});
         }
       } else {
-        if (isAccuChek()) {
+        // CareSens Air's sensor start comes from the transmitter, as with
+        // Accu-Chek. Upstream also mirrors the sensorInfo file so a follower
+        // can take over the algorithm; that sync is not ported.
+        if (isAccuChek() || isAir()) {
           if (!getinfo()->update[ind].siStream && pollcount()) {
             updateStarttime = true;
             LOGAR("updateStream send starttime");
@@ -2766,7 +3073,7 @@ public:
       }
       if (sendhiststart)
         getinfo()->update[ind].sendhiststart = false;
-      if (isLibre3() || isDexcom()) {
+      if (isLibre3() || isDexcom() || isAir()) {
         int endhistory = getScanendhistory();
         if (oldsendhistory(pass, connect, ind, sensindex, true, endhistory))
           return 1;
@@ -2830,6 +3137,9 @@ public:
   std::vector<int> viewed;
   int getSiIndex() const { return getinfo()->lockcount; }
   void setSiIndex(int index) { getinfo()->lockcount = index; }
+  // Air alone uses lockcount as its algorithm cursor; never call SI accessors on it.
+  int getLastAir() const { return getinfo()->lockcount; }
+  void setLastAir(int index) { getinfo()->lockcount = index; }
 
   uint32_t receivehistory = 0;
   int retried = 0;
@@ -2918,7 +3228,10 @@ public:
         return false;
     } else {
       if (isDexcom()) {
-        if (pollcount() >= maxdexcount)
+        if (pollcount() >= getmaxdexcount())
+          return false;
+      } else if (isAir()) {
+        if (pollcount() > 4320)
           return false;
       } else {
         /*

@@ -19,12 +19,10 @@ package tk.glucodata;
 import android.os.Looper;
 
 // Bridge to the journal-based insulin/carb snapshot. The journal only exists
-// in the mobile source set, so callers in src/main (JugglucoSend, Notify)
-// resolve it by name — same pattern as OutboundApi. Returns null on variants
-// without the journal (wear/small) and when the journal is unused/disabled.
+// in the mobile source set, so the phone registers its implementation from
+// Specific.registerBridges (plan P1/Q1). Returns null on variants without the
+// journal (wear/small) and when the journal is unused/disabled.
 public class JournalIobAccess {
-    private static java.lang.reflect.Method snapshotMethod;
-    private static boolean snapshotResolved;
 
     // Feeds the current journal IOB/COB to the native webserver so /pebble
     // polls (GlucoDataHandler's Juggluco IOB support) report the journal
@@ -45,21 +43,15 @@ public class JournalIobAccess {
     }
 
     // [classicIob, eiob, cob] in units/grams, NaN marking "no data of that
-    // kind"; null when unavailable.
-    static float[] snapshot(long atMillis) {
-        try {
-            if (!snapshotResolved) {
-                snapshotResolved = true;
-                snapshotMethod = Class.forName("tk.glucodata.OutboundApiJournalSnapshot")
-                        .getMethod("broadcastIobSnapshot", long.class);
-            }
-            if (snapshotMethod == null)
-                return null;
-            return (float[]) snapshotMethod.invoke(null, atMillis);
-        } catch (Throwable e) {
-            snapshotMethod = null;
-            return null;
-        }
+    // kind"; null when unavailable. Public: the PRE_HIGH IOB-coverage check
+    // in tk.glucodata.alerts reads the classic IOB through this bridge.
+    public static float[] snapshot(long atMillis) {
+        return JournalSnapshotAccess.broadcastIobSnapshot(atMillis);
+    }
+
+    /** Local journal-only values for upload; never echoes Clone or follower state. */
+    public static float[] nightscoutUploadSnapshot(long atMillis) {
+        return JournalSnapshotAccess.nightscoutUploadIobSnapshot(atMillis);
     }
 
     private static final float MGDL_PER_MMOLL = 18.016f;
@@ -76,14 +68,14 @@ public class JournalIobAccess {
             return null;
         StringBuilder line = new StringBuilder();
         if (showIob && !Float.isNaN(values[0])) {
-            line.append("IOB ").append(formatUnits(values[0])).append("U");
+            line.append("IOB ").append(Applic.app.getString(R.string.unit_insulin_value, formatUnits(values[0])));
             if (!Float.isNaN(values[1]) && prefs.getBoolean("dashboard_journal_eiob_display_enabled", true))
-                line.append(" · eIOB ").append(formatUnits(values[1])).append("U");
+                line.append(" · eIOB ").append(Applic.app.getString(R.string.unit_insulin_value, formatUnits(values[1])));
         }
         if (showCob && !Float.isNaN(values[2])) {
             if (line.length() > 0)
                 line.append(" · ");
-            line.append("COB ").append(formatUnits(values[2])).append("g");
+            line.append("COB ").append(Applic.app.getString(R.string.unit_carbs_value, formatUnits(values[2])));
         }
         if (line.length() == 0)
             return null;
@@ -99,11 +91,15 @@ public class JournalIobAccess {
         // actually delivering soon counts, with matching carb credit —
         // total IOB with hours of tail must not scream red.
         final float toMgdl = isMmol ? MGDL_PER_MMOLL : 1.0f;
+        final tk.glucodata.data.prediction.PredictionModelParameters profile =
+                tk.glucodata.data.prediction.PredictionModelProfileStore.parametersAt(
+                        prefs,
+                        System.currentTimeMillis());
         final int risk = IobCobRisk.classify(
                 values[3],
                 values[4],
-                prefs.getFloat("dashboard_prediction_carb_ratio_g_per_u", 10f),
-                prefs.getFloat("dashboard_prediction_insulin_sensitivity_mgdl_per_u", 54f),
+                profile.getCarbRatioGramsPerUnit(),
+                profile.getInsulinSensitivityMgDlPerUnit(),
                 displayGlucose * toMgdl,
                 Natives.targetlow() * toMgdl,
                 Natives.alarmverylow() * toMgdl);

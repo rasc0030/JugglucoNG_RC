@@ -47,6 +47,20 @@ object ManagedSensorIdentityRegistry {
         }
     }
 
+    /**
+     * The family whose persisted record owns [sensorId], or null when no
+     * adapter claims it. Reads only the adapters' own records: no driver needs
+     * to be running, and no SensorBluetooth lock is taken, so this is safe on
+     * the reading broadcast path.
+     */
+    @JvmStatic
+    fun resolvePersistedFamily(sensorId: String?): ManagedSensorUiFamily? {
+        val normalized = sensorId?.trim().takeIf { !it.isNullOrEmpty() } ?: return null
+        return all.firstOrNull { adapter ->
+            runCatching { adapter.hasPersistedManagedRecord(normalized) }.getOrDefault(false)
+        }?.uiFamily
+    }
+
     fun persistedSensorIds(context: Context): List<String> =
         all.asSequence()
             .flatMap { it.persistedSensorIds(context).asSequence() }
@@ -107,5 +121,8 @@ object ManagedSensorIdentityRegistry {
         }
         ManagedSensorViewModeStore.clear(context, sensorId)
         SensorIdentity.invalidateCaches()
+        // Removals never propagated to the watch: its handoff-synced record
+        // kept the sensor listed as "Connected" and hijacked current selection.
+        tk.glucodata.WearSync2.pushRemoval(sensorId)
     }
 }

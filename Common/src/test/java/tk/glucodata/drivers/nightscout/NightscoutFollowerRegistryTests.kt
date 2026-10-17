@@ -17,6 +17,14 @@ import java.net.URL
  */
 class NightscoutFollowerRegistryTests {
 
+    @Test
+    fun followerSensorIdentityRecognizesPersistedHistoryRows() {
+        assertTrue(NightscoutFollowerRegistry.isFollowerSensorId("NSF-EXAMPLE123"))
+        assertTrue(NightscoutFollowerRegistry.isFollowerSensorId(" nsf-example123 "))
+        assertFalse(NightscoutFollowerRegistry.isFollowerSensorId("LOCAL-EXAMPLE123"))
+        assertFalse(NightscoutFollowerRegistry.isFollowerSensorId(null))
+    }
+
     private fun applyAuthToMock(secret: String): Map<String, String> {
         val headers = mutableMapOf<String, String>()
         val connection = object : HttpURLConnection(URL("https://example.com")) {
@@ -217,5 +225,48 @@ class NightscoutFollowerRegistryTests {
     @Test
     fun matchesSensorId_mismatch_returnsFalse() {
         assertFalse(NightscoutFollowerRegistry.matchesSensorId("NSF-ABC123", "NSF-DEF456"))
+    }
+
+    // ---------- shared poll alarm ----------
+
+    private class Follower(val serial: String)
+
+    private fun sharesAlarmWith(self: Follower): (Follower) -> Boolean =
+        { other -> NightscoutFollowerRegistry.matchesSensorId(other.serial, self.serial) }
+
+    @Test
+    fun registeredFollowerMayCancelItsAlarm() {
+        val live = Follower("NSF-ABC123")
+        assertTrue(
+            NightscoutFollowerRegistry.mayCancelSharedAlarm(live, listOf(live), sharesAlarmWith(live))
+        )
+    }
+
+    @Test
+    fun discardedDuplicateLeavesTheLiveFollowersAlarmAlone() {
+        // Same serial, same PendingIntent: the duplicate's close() used to cancel the poll the
+        // registered follower was waiting on.
+        val live = Follower("NSF-ABC123")
+        val duplicate = Follower("nsf-abc123")
+        assertFalse(
+            NightscoutFollowerRegistry.mayCancelSharedAlarm(duplicate, listOf(live), sharesAlarmWith(duplicate))
+        )
+    }
+
+    @Test
+    fun followerForAnotherServerDoesNotBlockCancelling() {
+        val closing = Follower("NSF-ABC123")
+        val other = Follower("NSF-DEF456")
+        assertTrue(
+            NightscoutFollowerRegistry.mayCancelSharedAlarm(closing, listOf(closing, other), sharesAlarmWith(closing))
+        )
+    }
+
+    @Test
+    fun followerAlreadyRemovedFromTheRosterMayCancel() {
+        val closing = Follower("NSF-ABC123")
+        assertTrue(
+            NightscoutFollowerRegistry.mayCancelSharedAlarm(closing, emptyList(), sharesAlarmWith(closing))
+        )
     }
 }

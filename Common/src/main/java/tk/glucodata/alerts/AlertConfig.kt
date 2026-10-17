@@ -114,6 +114,25 @@ data class AlertConfig(
     val durationMinutes: Int? = null,       // For persistent high / missed reading alerts
     val forecastMinutes: Int? = null,       // For forecast alerts (how far ahead to predict)
 
+    // Hysteresis: an already-active episode survives until the measured value
+    // recovers past threshold -/+ this margin (display units). null = type
+    // default; 0 opts out and restores the pre-margin behaviour.
+    val rearmMargin: Float? = null,
+    // Forecast only: after a firing, no re-entry for this many minutes,
+    // whatever value and projection do. A value margin only guards against a
+    // given amplitude; the time guard covers any. null/0 = only the built-in
+    // short cooldown.
+    val rearmMinIntervalMinutes: Int? = null,
+    // PRE_HIGH ONLY: suppress the forecast while remaining IOB x sensitivity
+    // covers the projected overshoot x this factor. 0 = off. Never applied to
+    // PRE_LOW - insulin makes a predicted low MORE likely.
+    val iobCoverageFactor: Float? = null,
+    // PERSISTENT_HIGH: suppress while the value falls at least this fast
+    // (mg/dl per minute, magnitude). HIGH uses any positive value only as the
+    // opt-in marker for suppressing while its displayed arrow points down.
+    // 0/null = off.
+    val fallRateSuppress: Float? = null,
+
     // Delta-counter settings (FALLING_FAST / RISING_FAST): GDH-style robust rate-of-change alarm.
     val deltaThreshold: Float? = null,      // Min change per interval (display units) to count as steep
     val deltaCount: Int? = null,            // How many consecutive steep intervals must accumulate
@@ -127,6 +146,7 @@ data class AlertConfig(
     
     // Sound & vibration
     val soundEnabled: Boolean = true,
+    val soundVolumePercent: Int = AlertSoundVolume.DEFAULT_PERCENT,
     val customSoundUri: String? = null,     // null = use default
     val vibrationEnabled: Boolean = true,
     val hapticProfile: HapticProfile = HapticProfile.STRONG,
@@ -218,6 +238,12 @@ data class SnoozeState(
  * Defaults for each alert type following xDrip+ best practices.
  */
 object AlertDefaults {
+    // Quiet period after a trend alert for other alerts of the same direction
+    // (FALLING_FAST/PRE_LOW, RISING_FAST/PRE_HIGH). 0 = every family fires on its own.
+    const val SAME_DIRECTION_SUPPRESSION_MINUTES = 5
+    const val SAME_DIRECTION_SUPPRESSION_MAX_MINUTES = 30
+    const val ACKNOWLEDGED_HIGH_COVERAGE_ENABLED = true
+
     // Default thresholds (mmol/L - converted to mg/dL at runtime if needed)
     const val LOW_THRESHOLD_MMOL = 3.6f
     const val HIGH_THRESHOLD_MMOL = 9.0f
@@ -251,6 +277,34 @@ object AlertDefaults {
     const val PERSISTENT_HIGH_MINUTES = 60
     const val FORECAST_LOOK_AHEAD_MINUTES = 20
 
+    // Forecast rearm hysteresis. The projection moves 30 mg/dL for a
+    // 1 mg/dL/min rate change at a 30-minute horizon; the old 4 mg/dL margin
+    // was no protection at that amplitude. The episode now hangs on the
+    // measured value, and this is how far it must recover to end the episode.
+    const val FORECAST_REARM_MARGIN_MGDL = 20f
+    const val FORECAST_REARM_MARGIN_MMOL = 1.1f
+    // Second guard: no forecast re-entry for this long after a firing.
+    const val FORECAST_REARM_MIN_INTERVAL_MINUTES = 20
+
+    // Hard-threshold hysteresis (LOW/HIGH/VERY_LOW/VERY_HIGH): an active
+    // episode survives until the value recovers this far past the threshold.
+    // One mg/dl of wobble at the line must not consume a dismiss.
+    const val THRESHOLD_REARM_MARGIN_MGDL = 10f
+    const val THRESHOLD_REARM_MARGIN_MMOL = 0.6f
+
+    /**
+     * PERSISTENT_HIGH's adjustable fall threshold. It has already waited out a duration, so a
+     * configurable minimum is useful here; ordinary HIGH instead follows its visible arrow.
+     */
+    const val FALL_RATE_SUPPRESS_MGDL_PER_MIN = 1.0f
+
+    // PRE_HIGH IOB coverage: suppress when remaining insulin effect covers the
+    // projected overshoot x this factor. Off: it silences a safety alert on the
+    // strength of an insulin sensitivity most users never entered, and it has
+    // no control in the UI. The field stays readable so a stored value keeps
+    // meaning what it meant.
+    const val PRE_HIGH_IOB_COVERAGE_FACTOR = 0f
+
     // Delta-counter defaults (FALLING_FAST / RISING_FAST). Tunable; disabled by default.
     // Change over the delta interval that counts as steep (~10 mg/dL / 0.6 mmol per 5 min).
     const val DELTA_THRESHOLD_MGDL = 10f
@@ -275,6 +329,7 @@ object AlertDefaults {
                 type = type,
                 enabled = true,
                 threshold = if (isMmol) LOW_THRESHOLD_MMOL else LOW_THRESHOLD_MGDL,
+                rearmMargin = if (isMmol) THRESHOLD_REARM_MARGIN_MMOL else THRESHOLD_REARM_MARGIN_MGDL,
                 deliveryMode = AlertDeliveryMode.SYSTEM_ALARM,
                 hapticProfile = HapticProfile.STRONG,
                 overrideDND = true,
@@ -284,15 +339,24 @@ object AlertDefaults {
                 type = type,
                 enabled = true,
                 threshold = if (isMmol) HIGH_THRESHOLD_MMOL else HIGH_THRESHOLD_MGDL,
+                rearmMargin = if (isMmol) THRESHOLD_REARM_MARGIN_MMOL else THRESHOLD_REARM_MARGIN_MGDL,
                 deliveryMode = AlertDeliveryMode.SYSTEM_ALARM,
                 hapticProfile = HapticProfile.STEADY,
                 overrideDND = false,
+                // Off unless asked for. The same rule as PERSISTENT_HIGH, but this is the
+                // alarm somebody relies on to hear about a high at all, and it is on by
+                // default: switching it to conditional under everybody who upgrades is not
+                // a decision to make on their behalf. The toggle turns it on; once enabled,
+                // the displayed arrow is the contract, so a flat arrow never silences it and
+                // a downward arrow always does.
+                fallRateSuppress = null,
                 defaultSnoozeMinutes = 30
             )
             AlertType.VERY_LOW -> AlertConfig(
                 type = type,
                 enabled = true,
                 threshold = if (isMmol) VERY_LOW_THRESHOLD_MMOL else VERY_LOW_THRESHOLD_MGDL,
+                rearmMargin = if (isMmol) THRESHOLD_REARM_MARGIN_MMOL else THRESHOLD_REARM_MARGIN_MGDL,
                 deliveryMode = AlertDeliveryMode.SYSTEM_ALARM,  // Critical - use system alarm
                 hapticProfile = HapticProfile.ESCALATING,
                 overrideDND = true,
@@ -303,6 +367,7 @@ object AlertDefaults {
                 type = type,
                 enabled = true,
                 threshold = if (isMmol) VERY_HIGH_THRESHOLD_MMOL else VERY_HIGH_THRESHOLD_MGDL,
+                rearmMargin = if (isMmol) THRESHOLD_REARM_MARGIN_MMOL else THRESHOLD_REARM_MARGIN_MGDL,
                 deliveryMode = AlertDeliveryMode.SYSTEM_ALARM,
                 hapticProfile = HapticProfile.STRONG,
                 overrideDND = true,
@@ -313,6 +378,8 @@ object AlertDefaults {
                 enabled = false,
                 threshold = if (isMmol) FORECAST_LOW_THRESHOLD_MMOL else FORECAST_LOW_THRESHOLD_MGDL,
                 forecastMinutes = FORECAST_LOOK_AHEAD_MINUTES,
+                rearmMargin = if (isMmol) FORECAST_REARM_MARGIN_MMOL else FORECAST_REARM_MARGIN_MGDL,
+                rearmMinIntervalMinutes = FORECAST_REARM_MIN_INTERVAL_MINUTES,
                 deliveryMode = AlertDeliveryMode.SYSTEM_ALARM,
                 hapticProfile = HapticProfile.SOFT,
                 defaultSnoozeMinutes = 20
@@ -322,6 +389,9 @@ object AlertDefaults {
                 enabled = false,
                 threshold = if (isMmol) FORECAST_HIGH_THRESHOLD_MMOL else FORECAST_HIGH_THRESHOLD_MGDL,
                 forecastMinutes = FORECAST_LOOK_AHEAD_MINUTES,
+                rearmMargin = if (isMmol) FORECAST_REARM_MARGIN_MMOL else FORECAST_REARM_MARGIN_MGDL,
+                rearmMinIntervalMinutes = FORECAST_REARM_MIN_INTERVAL_MINUTES,
+                iobCoverageFactor = PRE_HIGH_IOB_COVERAGE_FACTOR,
                 deliveryMode = AlertDeliveryMode.SYSTEM_ALARM,
                 hapticProfile = HapticProfile.SOFT,
                 defaultSnoozeMinutes = 30
@@ -339,6 +409,7 @@ object AlertDefaults {
                 enabled = false,
                 threshold = if (isMmol) PERSISTENT_HIGH_THRESHOLD_MMOL else PERSISTENT_HIGH_THRESHOLD_MGDL,
                 durationMinutes = PERSISTENT_HIGH_MINUTES,
+                fallRateSuppress = FALL_RATE_SUPPRESS_MGDL_PER_MIN,
                 deliveryMode = AlertDeliveryMode.SYSTEM_ALARM,
                 hapticProfile = HapticProfile.STEADY,
                 defaultSnoozeMinutes = 60

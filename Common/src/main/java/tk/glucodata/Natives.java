@@ -64,14 +64,11 @@ public class Natives {
 
         public static native boolean hasBluetooth(byte[] sensorident, byte[] patchinfo);
 
-        // public static native void initopengl(boolean started);
         public static native int openglversion();
 
         // public static native void showlast();
         // public static native void hidescanresults();
-        public static native void resize(int width, int height, int initscreenwidth);
 
-        public static native void initopengl(float small, float menu, float density, float head);
 
         public static native int setfilesdir(String dir, String country, String nativedir);
 
@@ -86,13 +83,9 @@ public class Natives {
 
         public static native int step();
 
-        public static native int badscan(int kind);
 
-        // public static native long lastpoll();
         // public static native void clear();
-        public static native void prevscr();
 
-        public static native void nextscr();
 
         public static native void prevday(int day);
 
@@ -101,15 +94,11 @@ public class Natives {
         // public static native void savestate();
         public static native int translate(float dx, float dy, float yold, float y);
 
-        public static native void flingX(float vol);
 
-        public static native void xscale(float scalex, float midx);
 
-        public static native boolean isbutton(float x, float y);
 
         public static native long tap(float x, float y);
 
-        public static native long longpress(float x, float y);
 
         public static native long getstarttime();
 
@@ -149,6 +138,10 @@ public class Natives {
         public static native String getSensorName(long dataptr);
 
         public static native String resolveFullSensorName(String sensorId);
+
+        public static native int getSensorIndex(String sensorId);
+
+        public static native int getSensorIndexFromDataPtr(long dataptr);
 
         public static native void freedataptr(long dataptr);
 
@@ -192,7 +185,6 @@ public class Natives {
         // index);
         public static native void setmaxsensors(int nr);
 
-        public static native float freey();
 
         public static native long openNums(String base, long ident);
 
@@ -400,6 +392,8 @@ public class Natives {
 
         public static native int backuphostNr();
 
+        public static native int activeBackupHostNr();
+
         public static native String[] getbackupIPs(int pos);
 
         public static native boolean getbackupHasHostname(int pos);
@@ -409,6 +403,8 @@ public class Natives {
         public static native String getbackuppassword(int pos);
 
         public static native boolean isWearOS(int pos);
+
+        public static native boolean isBackupHostPending(int pos);
 
         public static native int changebackuphost(int pos, String[] names, int nr, boolean detect, String port,
                         boolean nums, boolean stream, boolean scans, boolean recover, boolean receive,
@@ -446,6 +442,18 @@ public class Natives {
 
         public static native void wakebackup();
 
+        public static native String probeCloneRecovery(int allindex);
+
+        public static native String startCloneRecovery(int allindex, String modeWire,
+                        boolean includeJournal, boolean recoverFromReceiver);
+
+        public static native String cancelCloneRecovery(int allindex);
+
+        public static native String cloneRecoveryStatus(int allindex);
+
+        /** Called by the durable Java recovery scheduler after preparation or backoff. */
+        public static native boolean wakeCloneRecovery(String iceLabel);
+
         public static native void wakestreamhereonly();
 
         public static native void wakehereonly();
@@ -461,6 +469,8 @@ public class Natives {
         public static native String getreceiveport();
 
         public static native void networkpresent();
+
+        public static native void networkhandover();
 
         public static native void networkabsent();
 
@@ -642,7 +652,6 @@ public class Natives {
 
         public static native void setwaitwithenablestreaming(boolean val);
 
-        public static native void setscreenwidthcm(float val);
 
         public static native boolean nfcsound();
 
@@ -709,6 +718,8 @@ public class Natives {
         public static native void closedynlib();
 
         public static native strGlucose lastglucose();
+        /** Latest valid stream reading for this sensor only; never falls back to a peer. */
+        public static native strGlucose lastglucoseForSensor(String sensorName);
 
         public static native long[] getGlucoseHistory(long starttime);
 
@@ -728,13 +739,36 @@ public class Natives {
 
         public static native void addGlucoseInjection(long time, float glucose, String sensorId);
 
-        public static native void addGlucoseStream(long time, float glucose, String sensorId);
+        public static native boolean addGlucoseStream(long time, float glucose, String sensorId);
 
-        public static native void addGlucoseStreamWithTemp(long time, float glucose, float temperatureC, String sensorId);
+        public static native boolean addGlucoseStreamWithTemp(long time, float glucose, float temperatureC, String sensorId);
 
-        public static native void addGlucoseStreamWithRawTemp(long time, float glucose, float rawGlucose, float temperatureC, String sensorId);
+        public static native int addGlucoseStreamBatchWithTemp(long[] times, float[] glucoses, float[] temperatures, String sensorId);
+
+        public static native boolean addGlucoseStreamWithRawTemp(long time, float glucose, float rawGlucose, float temperatureC, String sensorId);
+
+        /**
+         * Batched sibling of {@link #addGlucoseStreamWithRawTemp}: same
+         * overwrite semantics for raw and temperature, but the shell resolve,
+         * state seeding, stream-cursor rewind and setstreaming happen once for
+         * the whole array instead of once per reading. Use this for any history
+         * mirror; the single-reading form is for live readings only.
+         * Arrays must be equal length; returns the number of samples stored.
+         */
+        public static native int addGlucoseStreamBatchWithRawTemp(long[] times, float[] glucoses, float[] raws, float[] temperatures, String sensorId);
 
         public static native long ensureSensorShell(String sensorId, long startTimeSec);
+
+        public static native long ensureSensorShellWithCapacity(String sensorId, long startTimeSec, int minimumRecords);
+
+        // Set a direct-stream sensor's wear duration (days) by id -> info->wearduration2,
+        // so the main graph's sensor-end reflects the real activated lifetime (Ottai).
+        public static native void setSensorWearDays(String sensorId, int days);
+        /** ManagedSensorUiFamily.nativeCode; 0 clears. Travels in info.dat, so a Clone receiver sees it. */
+        public static native void setSensorManagedFamily(String sensorId, int code);
+        public static native int getSensorManagedFamily(long dataptr);
+
+        public static native boolean hasSensorStreamCapacity(String sensorId, int minimumRecords);
 
         public static native void rebaseDirectStreamWindow(String sensorId, long startTimeSec);
 
@@ -957,12 +991,6 @@ public class Natives {
 
         public static native boolean getlibrelinkused();
 
-        public static native String[] everSenseRecepters();
-
-        public static native boolean geteverSensebroadcast();
-
-        public static native void seteverSenseRecepters(String[] jnames);
-
         public static native String[] xdripRecepters();
 
         public static native void setxdripRecepters(String[] jnames);
@@ -1001,6 +1029,10 @@ public class Natives {
 
         public static native void finishSensor(long dataptr);
 
+        public static native boolean removeSensorById(String sensorId);
+
+        public static native boolean finishSensorById(String sensorId);
+
         public static native void unfinishSensor(long dataptr);
 
         public static native long manualLibreAccountIDnumber();
@@ -1017,6 +1049,16 @@ public class Natives {
 
         public static native int getsslport();
 
+        /**
+         * Port the plain-HTTP web server listens on. The setting was always in the native
+         * settings file and always honoured by the desktop build; both Android start sites
+         * passed the compile-time default instead, so it could not be changed from the
+         * phone. Setting it rebinds a running server on a background thread.
+         */
+        public static native int getxdripport();
+
+        public static native void setxdripport(int val);
+
         public static native void setsaytreatments(boolean val);
 
         public static native boolean getsaytreatments();
@@ -1030,6 +1072,15 @@ public class Natives {
         public static native void setNightUploader(String jurl, String Secret, boolean active, boolean v3);
 
         public static native void wakeuploader();
+
+        /**
+         * A journal entry was written, changed or deleted. Wakes the treatments branch of
+         * the uploader on its own reason, so a dose no longer waits for a calibration or a
+         * backup to come along and wake it by accident.
+         */
+        public static native void waketreatments();
+
+        public static native boolean wakeNightscoutForLiveReading(String source, long timestampMillis);
 
         public static native void resetuploader();
 
@@ -1068,6 +1119,11 @@ public class Natives {
         public static native void setnovopenttimeandtype(long time, int type, String serial);
 
         public static native String mirrorStatus(int allindex);
+        public static native int getCloneConnectionTransport(String connectionIdentity);
+        public static native String getCloneRendezvousHost(int allindex);
+        public static native int getCloneRendezvousPort(int allindex);
+        public static native int getCloneRendezvousCertificateVerification(int allindex);
+        public static native int getCloneSignalingSource(int allindex);
 
         public static native void setWearosdefaults(String jident, boolean galaxy);
 
@@ -1168,6 +1224,7 @@ public class Natives {
         public static native void setpostTreatments(boolean val);
 
         public static native long getSensorStartmsec(long dataptr);
+        public static native int getSensorWarmupMinutes(long dataptr);
 
         public static native long getSensorStartmsecFromSensorptr(long sensorptr);
 
@@ -1215,6 +1272,8 @@ public class Natives {
         public static native boolean gethidefloatinJuggluco();
 
         public static native boolean getHostDeactivated(int pos);
+
+        public static native void prepareHostDeactivation(int pos);
 
         public static native void setHostDeactivated(int pos, boolean val);
 
@@ -1304,8 +1363,6 @@ public class Natives {
         public static native boolean dexCandidate(long dataptr, String deviceName, String address);
 
         public static native void dexEndBackfill(long dataptr);
-
-        public static native void EverSenseClear(long dataptr);
 
         public static native void setdexcomPredict(boolean val);
 
@@ -1506,6 +1563,19 @@ public class Natives {
 
         public static native long accuProcessData(long dataptr, byte[] value, long mmsec);
 
+        // CareSens Air (cpp/air/java.cpp)
+        public static native long airProcessData(long dataptr, byte[] value, long[] msecptr);
+
+        public static native int airGetLast(long dataptr);
+
+        public static native boolean airSaveSensorInfo(long dataptr, byte[] value);
+
+        public static native boolean airSaveSensorInfo2(long dataptr, byte[] value);
+
+        public static native void airSaveStartSensor(long dataptr, float eapp, float vref, int elapsedSecs);
+
+        public static native byte[] airGetPin(long dataptr);
+
         /**
          * Pass as {@code trendByte} when the AiDex frame carried no trend field — the direct F003
          * live frame does not, only the 0x11 broadcast sample does. Native stores NaN for the rate
@@ -1538,6 +1608,10 @@ public class Natives {
         public static native int GlucoseMeterGetIndex(String deviceName);
 
         public static native boolean GlucoseMeterSave(int meterIndex, byte[] value);
+
+        /** Returns timestamp millis, mg/dL tenths, and recent-legacy flag for a newly accepted reading. */
+        public static native long[] GlucoseMeterSaveResult(int meterIndex, byte[] value);
+        public static native long[] GlucoseMeterSaveDecodedResult(int meterIndex, long timestampMillis, int mgdlTenths);
 
         public static native boolean GlucoseMeterProcessContext(int meterIndex, byte[] value);
 
@@ -1596,6 +1670,14 @@ public class Natives {
         public static native void setTurnPassword(int pos, String jpassword);
 
         public static native void setTurnPort(int pos, int port);
+
+        public static native void setTurnServer(int pos, String host, int port, String username, String password);
+
+        public static native void setCloneICEConfig(String rendezvousHost, int rendezvousPort,
+                                                     boolean useTurnForStun,
+                                                     boolean verifyRendezvousCertificate,
+                                                     boolean useLocalDiscovery,
+                                                     boolean preferIPv4);
 
         public static native int TurnServerNR();
 

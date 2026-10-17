@@ -6,6 +6,7 @@ import java.util.concurrent.TimeUnit
 import tk.glucodata.Applic
 import tk.glucodata.CurrentDisplaySource
 import tk.glucodata.GlucoseDelta
+import tk.glucodata.LiveReadingLanes
 import tk.glucodata.Log
 import tk.glucodata.Notify
 import tk.glucodata.R
@@ -31,11 +32,18 @@ object AlertRuntimeManager {
     private var lastDisplaySnapshot: CurrentDisplaySource.Snapshot? = null
     private var persistentHighStartedAtMs: Long = 0L
     private var lastLoggedExpiryEndMs: Long = Long.MIN_VALUE
+    private var warnedForecastRateUntrusted = false
+    private var preLowSuppressionReason: String? = null
+    private var preHighIobSuppressed = false
+    private var preHighCoverageSkipLogged: String? = null
     private val standardEpisodes = AlertEpisodeState<AlertType>()
     private val sensorExpiryState = SensorExpiryAlertState(AlertRepository.sensorExpiryWarnedStore)
     private val fallingDeltaState = DeltaAlarmState(falling = true)
     private val risingDeltaState = DeltaAlarmState(falling = false)
     private val calibrationReadingBarrier = ReadingTimestampBarrier()
+    // Shared by the standard-glucose and the delta evaluation on purpose: the
+    // quiet period must see both families, or one keeps talking over the other.
+    private val sameDirectionSuppression = SameDirectionAlertSuppression()
 
     private val standardGlucoseAlertTypes = listOf(
         AlertType.VERY_LOW,
@@ -98,10 +106,20 @@ object AlertRuntimeManager {
         rate: Float,
         readingTimeMs: Long,
         sensorGen: Int = 0
+    ): AlertRuntimeEvaluation =
+        onNewReading(sensorId, LiveReadingLanes.stock(glucoseValue, Float.NaN), rate, readingTimeMs, sensorGen)
+
+    /** [reading] says whether the value was already calibrated; see [LiveReadingLanes]. */
+    fun onNewReading(
+        sensorId: String?,
+        reading: LiveReadingLanes,
+        rate: Float,
+        readingTimeMs: Long,
+        sensorGen: Int
     ): AlertRuntimeEvaluation {
         val snapshot = try {
             CurrentDisplaySource.resolveIncomingReading(
-                liveNumericValue = glucoseValue,
+                reading = reading,
                 rate = rate,
                 targetTimeMillis = readingTimeMs,
                 preferredSensorId = sensorId,
@@ -113,6 +131,7 @@ object AlertRuntimeManager {
         }
         synchronized(lock) {
             lastReadingTimeMs = maxOf(lastReadingTimeMs, readingTimeMs)
+            SensorHandoverRuntime.onReading(sensorId)
             if (snapshot != null && snapshot.primaryValue.isFinite()) {
                 lastGlucoseValue = snapshot.primaryValue
                 lastRate = snapshot.rate
@@ -151,6 +170,13 @@ object AlertRuntimeManager {
         syncCurrentReadingLocked()
 
         val glucoseAlertsBlocked = calibrationReadingBarrier.blocks(lastReadingTimeMs)
+        if (!glucoseAlertsBlocked && currentGlucoseValueLocked() != null) {
+            sameDirectionSuppression.observeTrend(
+                readingTimeMs = lastDisplaySnapshot?.timeMillis ?: 0L,
+                rate = currentRateLocked(),
+                trendTrusted = tk.glucodata.TrendAccess.hasProvider()
+            )
+        }
         val standardAlertEvaluation = if (glucoseAlertsBlocked) {
             AlertRuntimeEvaluation()
         } else {
@@ -162,6 +188,7 @@ object AlertRuntimeManager {
             evaluateDeltaAlarmsLocked()
         }
         evaluateSensorExpiryLocked(nowMs)
+        SensorHandoverRuntime.evaluate(nowMs)
         return standardAlertEvaluation
     }
 
@@ -194,7 +221,7 @@ object AlertRuntimeManager {
         try {
             SuperGattCallback.processExternalCurrentReading(
                 latest.sensorId,
-                latest.primaryValue,
+                tk.glucodata.LiveReadingLanes.resolved(latest.primaryValue),
                 latest.rate,
                 latest.timeMillis,
                 latest.sensorGen
@@ -209,17 +236,41 @@ object AlertRuntimeManager {
         val glucoseValue = currentGlucoseValueLocked() ?: return AlertRuntimeEvaluation()
         val rate = currentRateLocked()
         val configs = standardGlucoseAlertTypes.associateWith { AlertRepository.loadConfig(it) }
-        val activeConditions = resolveActiveStandardGlucoseAlerts(glucoseValue, rate, configs)
+        val activeConditions = suppressPreLow(
+            suppressIobCoveredPreHigh(
+                resolveActiveStandardGlucoseAlerts(glucoseValue, rate, configs),
+                configs
+            ),
+            rate
+        )
         val activeTypes = activeConditions.keys
         val transition = standardEpisodes.update(activeTypes)
 
         transition.cleared.forEach { type ->
-            clearRuntimeAlert(type, "standard-condition-cleared")
+            clearRuntimeAlert(type, standardClearReason(type, configs[type], glucoseValue, rate))
         }
 
         val type = standardGlucoseAlertTypes.firstOrNull { it in activeTypes }
             ?: return AlertRuntimeEvaluation()
         val condition = activeConditions[type] ?: return AlertRuntimeEvaluation()
+        Notify.refreshRetryReading(type.id, condition.glucoseValue, rate,
+            buildStandardAlertMessage(type, condition, configs[type]),
+            lastDisplaySnapshot?.timeMillis ?: lastReadingTimeMs)
+
+        // The opted-in alert would be shown beside a downward arrow, contradicting its own
+        // sentence. It waits rather than resolves: the episode stays open, so a dismissal and
+        // whatever was queued on it survive, and the moment the fall stops it can speak
+        // without waiting out a fresh episode. Anything already repeating stops now.
+        if (type == AlertType.HIGH &&
+            FallSuppressionPolicy.highFallingSuppresses(rate, configs[type]?.fallRateSuppress)
+        ) {
+            Notify.cancelRetrySession(type.id, "high-falling")
+            // A queued first delivery can have been invalidated before it fired.
+            // Keep the condition eligible once the fall ends; the tracker still
+            // suppresses an episode that really did fire before the fall.
+            standardEpisodes.markPendingDelivery(type)
+            return AlertRuntimeEvaluation(standardGlucoseAlertHandled = true)
+        }
 
         if (!transition.shouldTryFire(type)) {
             return AlertRuntimeEvaluation(standardGlucoseAlertHandled = true)
@@ -230,6 +281,14 @@ object AlertRuntimeManager {
         if (SnoozeManager.isSnoozed(type)) {
             standardEpisodes.markPendingDelivery(type)
             return AlertRuntimeEvaluation()
+        }
+
+        if (suppressedBySameDirectionAlertLocked(type)) {
+            // Dropped, not deferred: the episode keeps no pending delivery for it.
+            // LOW, VERY_LOW and VERY_HIGH never arrive here, and nothing does
+            // unless the alert that covers it was dismissed or snoozed.
+            standardEpisodes.clearPending(type)
+            return AlertRuntimeEvaluation(standardGlucoseAlertHandled = true)
         }
 
         val message = buildStandardAlertMessage(type, condition, configs[type])
@@ -254,14 +313,178 @@ object AlertRuntimeManager {
         rate: Float,
         configs: Map<AlertType, AlertConfig>
     ): Map<AlertType, StandardGlucoseAlertCondition> {
+        val forecastRateTrusted = tk.glucodata.TrendAccess.hasProvider()
+        if (!forecastRateTrusted && !warnedForecastRateUntrusted) {
+            // TrendAccess already logs each fallback use; this line records the
+            // consequence once per gap: forecasts are withheld, not guessed.
+            Log.e(LOG_ID, "No TrendVelocityProvider registered - forecast alerts suppressed")
+            warnedForecastRateUntrusted = true
+        } else if (forecastRateTrusted) {
+            warnedForecastRateUntrusted = false
+        }
         return StandardGlucoseAlertEvaluator.resolveActive(
             glucoseValue = glucoseValue,
             rate = rate,
             configs = configs,
             alertTypes = standardGlucoseAlertTypes,
             isMmol = Applic.unit == 1,
-            wasConditionActive = standardEpisodes::isActive
+            wasConditionActive = standardEpisodes::isActive,
+            forecastRateTrusted = forecastRateTrusted
         )
+    }
+
+    private fun suppressPreLow(
+        conditions: Map<AlertType, StandardGlucoseAlertCondition>,
+        rate: Float
+    ): Map<AlertType, StandardGlucoseAlertCondition> {
+        preLowSuppressionReason = null
+        val condition = conditions[AlertType.PRE_LOW] ?: return conditions
+        if (!ForecastLowSuppression.hasDownwardArrow(rate)) {
+            preLowSuppressionReason = "forecast-low-not-falling"
+            return conditions - AlertType.PRE_LOW
+        }
+        val covered = try {
+            val nowMs = System.currentTimeMillis()
+            val cobGrams = tk.glucodata.JournalIobAccess.snapshot(nowMs)?.getOrNull(2) ?: Float.NaN
+            val prefs = Applic.app.getSharedPreferences(
+                "tk.glucodata_preferences", android.content.Context.MODE_PRIVATE
+            )
+            val profile = tk.glucodata.data.prediction.PredictionModelProfileStore.parametersAt(prefs, nowMs)
+            ForecastLowSuppression.cobCoversLow(
+                condition.evaluatedValue, condition.threshold, Applic.unit == 1,
+                cobGrams, profile.carbRatioGramsPerUnit, profile.insulinSensitivityMgDlPerUnit
+            )
+        } catch (t: Throwable) {
+            Log.stack(LOG_ID, "suppressPreLow", t)
+            false
+        }
+        if (covered) {
+            preLowSuppressionReason = "forecast-cob-covered"
+            return conditions - AlertType.PRE_LOW
+        }
+        return conditions
+    }
+
+    /**
+     * PRE_HIGH ONLY: drop the condition while the remaining insulin on board
+     * covers the projected overshoot - what the alert would announce is
+     * already treated. Never applied to PRE_LOW, where insulin makes the
+     * predicted low MORE likely (see [ForecastIobCoverage]).
+     *
+     * The sensitivity comes from PredictionModelProfileStore.parametersAt,
+     * which returns exactly the values the model profile screen displays,
+     * saved or default. The screen is sliders only, with no save button, so
+     * requiring a saved profile (the previous guard) meant the coverage
+     * silently never ran for anyone happy with the defaults. What is at
+     * stake is a suppressed high-side pre-warning; the HIGH alarm itself is
+     * independent of this check. When the check cannot run because an input
+     * is missing (no journal IOB, no usable sensitivity), that is logged
+     * once per state change instead of failing silently - a setting that
+     * visibly reads 100% and quietly does nothing is the bug class this
+     * whole change set is about.
+     */
+    private fun suppressIobCoveredPreHigh(
+        conditions: Map<AlertType, StandardGlucoseAlertCondition>,
+        configs: Map<AlertType, AlertConfig>
+    ): Map<AlertType, StandardGlucoseAlertCondition> {
+        val condition = conditions[AlertType.PRE_HIGH] ?: run {
+            preHighIobSuppressed = false
+            preHighCoverageSkipLogged = null
+            return conditions
+        }
+        val config = configs[AlertType.PRE_HIGH]
+        val factor = config?.iobCoverageFactor ?: AlertDefaults.PRE_HIGH_IOB_COVERAGE_FACTOR
+        var skipReason: String? = null
+        val covered = factor > 0f && try {
+            val prefs = Applic.app.getSharedPreferences(
+                "tk.glucodata_preferences",
+                android.content.Context.MODE_PRIVATE
+            )
+            val store = tk.glucodata.data.prediction.PredictionModelProfileStore
+            val nowMs = System.currentTimeMillis()
+            val iobUnits = tk.glucodata.JournalIobAccess.snapshot(nowMs)?.getOrNull(0) ?: Float.NaN
+            val sensitivity = store.parametersAt(prefs, nowMs).insulinSensitivityMgDlPerUnit
+            val result = ForecastIobCoverage.covered(
+                projectedValue = condition.evaluatedValue,
+                threshold = condition.threshold,
+                isMmol = Applic.unit == 1,
+                iobUnits = iobUnits,
+                insulinSensitivityMgdlPerUnit = sensitivity,
+                coverageFactor = factor
+            )
+            if (!result) {
+                // Missing input = skipped check, worth a log line. An
+                // uncovered overshoot with usable inputs is a normal
+                // "fire the alert" outcome, not a skip.
+                skipReason = when {
+                    !iobUnits.isFinite() -> "iob-unavailable"
+                    iobUnits <= 0f -> "no-iob"
+                    !sensitivity.isFinite() || sensitivity <= 0f -> "no-sensitivity"
+                    else -> null
+                }
+            }
+            result
+        } catch (t: Throwable) {
+            Log.stack(LOG_ID, "suppressIobCoveredPreHigh", t)
+            skipReason = "error"
+            false
+        }
+        if (skipReason != null && skipReason != preHighCoverageSkipLogged) {
+            Log.i(LOG_ID, "PRE_HIGH IOB coverage skipped: $skipReason (factor=$factor)")
+        }
+        preHighCoverageSkipLogged = skipReason
+        if (covered && !preHighIobSuppressed) {
+            Log.i(
+                LOG_ID,
+                "PRE_HIGH suppressed: remaining IOB covers projected overshoot " +
+                    "(projected=${condition.evaluatedValue} threshold=${condition.threshold} factor=$factor)"
+            )
+        }
+        preHighIobSuppressed = covered
+        return if (covered) conditions - AlertType.PRE_HIGH else conditions
+    }
+
+    /**
+     * Names WHY a forecast episode ended: "forecast-falsified" when the
+     * prediction was refuted (direction flipped, projection clear of the
+     * threshold), "forecast-iob-covered" when the remaining insulin took over,
+     * so the log distinguishes them from ordinary recovery. Same retry-cancel
+     * path either way.
+     */
+    private fun standardClearReason(
+        type: AlertType,
+        config: AlertConfig?,
+        glucoseValue: Float,
+        rate: Float
+    ): String {
+        if (type != AlertType.PRE_LOW && type != AlertType.PRE_HIGH) {
+            return "standard-condition-cleared"
+        }
+        if (type == AlertType.PRE_LOW) {
+            preLowSuppressionReason?.let { return it }
+        }
+        if (type == AlertType.PRE_HIGH && preHighIobSuppressed) {
+            return "forecast-iob-covered"
+        }
+        val threshold = config?.threshold ?: return "standard-condition-cleared"
+        val isMmol = Applic.unit == 1
+        val margin = config.rearmMargin ?: ForecastThresholdPolicy.defaultRearmMargin(isMmol)
+        if (margin <= 0f) {
+            return "standard-condition-cleared"
+        }
+        val projected = AlertGlucoseMath.projectedDisplayValue(
+            glucoseValue = glucoseValue,
+            rateMgdlPerMinute = rate,
+            forecastMinutes = config.forecastMinutes,
+            isMmol = isMmol
+        )
+        return if (
+            ForecastThresholdPolicy.isFalsified(type, projected, threshold, rate, margin, isMmol, config.forecastMinutes)
+        ) {
+            "forecast-falsified"
+        } else {
+            "standard-condition-cleared"
+        }
     }
 
     private fun buildStandardAlertMessage(
@@ -311,6 +534,12 @@ object AlertRuntimeManager {
         if (SnoozeManager.isSnoozed(type)) {
             return
         }
+        if (SensorHandoverRuntime.missedReadingSuppressed(nowMs)) {
+            // Post-handover window: the successor is still warming up; a short
+            // data gap during the switch must not alarm as an outage.
+            clearRuntimeAlert(type, "sensor-handover-window")
+            return
+        }
 
         val missed = nowMs - lastReadingTimeMs >= durationMs
         if (!missed) {
@@ -353,6 +582,16 @@ object AlertRuntimeManager {
             clearRuntimeAlert(type, "persistent-high-time-inactive")
             return
         }
+
+        // A steep fall is proof the correction works - suppress, cancel any
+        // running retries, but do NOT reset the timer: if the value stagnates
+        // above the threshold again, the high phase was continuous and the
+        // alarm must not wait out a fresh full duration.
+        if (FallSuppressionPolicy.fallingSuppresses(currentRateLocked(), config.fallRateSuppress)) {
+            clearRuntimeAlert(type, "persistent-high-falling")
+            return
+        }
+
         if (SnoozeManager.isSnoozed(type)) {
             return
         }
@@ -416,10 +655,22 @@ object AlertRuntimeManager {
             return
         }
 
-        val glucoseValue = currentGlucoseValueLocked() ?: return
-        val message = sensorExpiryMessage(triggered.first())
+        // The sensor ages whether or not a reading is available, and readings
+        // often stop exactly when it is about to expire. Without a value the
+        // alarm goes out message-only rather than waiting for a reading that may
+        // never come (#98); should even that fail, the threshold stays pending
+        // and is offered again on the next tick instead of counting as warned.
+        val glucoseValue = currentGlucoseValueLocked()
+        val message = SensorHandoverRuntime.decorateExpiryMessage(sensorExpiryMessage(triggered.first()), nowMs)
 
-        triggerAlert(type, glucoseValue, currentRateLocked(), message)
+        val delivered = if (glucoseValue != null) {
+            triggerAlert(type, glucoseValue, currentRateLocked(), message)
+        } else {
+            triggerMessageAlert(type, message)
+        }
+        if (delivered) {
+            sensorExpiryState.confirmDelivered(triggered.first())
+        }
     }
 
     private fun evaluateDeltaAlarmsLocked() {
@@ -484,9 +735,57 @@ object AlertRuntimeManager {
             return
         }
 
+        if (suppressedBySameDirectionAlertLocked(type)) {
+            // Dropped, not deferred: the latch stays consumed, so this run does
+            // not offer the alarm again. A new run after the window fires as usual.
+            return
+        }
+
         val label = Applic.app.getString(type.nameResId)
         val message = "$label ${Notify.glucosestr(glucoseValue)}"
-        triggerAlert(type, glucoseValue, currentRateLocked(), message)
+        if (!triggerAlert(type, glucoseValue, currentRateLocked(), message)) {
+            // The latch disarmed on the offer; a failed delivery must not consume
+            // the alarm. Re-armed, it fires again while the run stands and dies
+            // with it if the run breaks.
+            state.rearmAfterFailedDelivery()
+        }
+    }
+
+    /**
+     * Cross-family quiet period: true when another alert of [type]'s direction
+     * fired within the configured window *and was dismissed or snoozed*, so
+     * [type] may stay quiet. An unacknowledged first alert - or one a quiet
+     * window silenced - covers nothing. HIGH may optionally join the rising
+     * group. LOW, VERY_LOW and VERY_HIGH always fire. Every
+     * suppression is logged with the alert that caused it, so a missing
+     * notification stays explainable.
+     */
+    private fun suppressedBySameDirectionAlertLocked(type: AlertType): Boolean {
+        val windowMs = try {
+            AlertRepository.loadSameDirectionSuppressionMinutes() * 60_000L
+        } catch (t: Throwable) {
+            AlertDefaults.SAME_DIRECTION_SUPPRESSION_MINUTES * 60_000L
+        }
+        val acknowledgedHighCoverage = try {
+            AlertRepository.loadAcknowledgedHighCoverageEnabled()
+        } catch (t: Throwable) {
+            AlertDefaults.ACKNOWLEDGED_HIGH_COVERAGE_ENABLED
+        }
+        val nowMs = System.currentTimeMillis()
+        val blocker = sameDirectionSuppression.blockedBy(
+            type = type,
+            nowMs = nowMs,
+            windowMs = windowMs,
+            acknowledgedHighCoverage = acknowledgedHighCoverage,
+            isAcknowledged = AlertStateTracker::wasLastFiringAcknowledged
+        ) ?: return false
+        val agoSeconds = ((nowMs - blocker.firedAtMs) / 1000L).coerceAtLeast(0L)
+        Log.i(
+            LOG_ID,
+            "Suppressed ${type.name}: ${blocker.type.name} fired ${agoSeconds}s ago in the same direction " +
+                "(quiet period ${windowMs / 60_000L} min)"
+        )
+        return true
     }
 
     /** Notification text naming the threshold that fired ("... in 3 days" / "... in 6 hours"). */
@@ -508,10 +807,33 @@ object AlertRuntimeManager {
             val triggered = Notify.triggerSupplementalGlucoseAlert(type.id, glucoseValue, rate, message)
             if (triggered) {
                 Log.i(LOG_ID, "Triggered ${type.name}: $message")
+                val acknowledgedHighCoverage = try {
+                    AlertRepository.loadAcknowledgedHighCoverageEnabled()
+                } catch (t: Throwable) {
+                    AlertDefaults.ACKNOWLEDGED_HIGH_COVERAGE_ENABLED
+                }
+                sameDirectionSuppression.onFired(
+                    type,
+                    System.currentTimeMillis(),
+                    acknowledgedHighCoverage
+                )
             }
             return triggered
         } catch (t: Throwable) {
             Log.stack(LOG_ID, "triggerAlert ${type.name}", t)
+            return false
+        }
+    }
+
+    private fun triggerMessageAlert(type: AlertType, message: String): Boolean {
+        try {
+            val triggered = Notify.triggerSupplementalMessageAlert(type.id, message)
+            if (triggered) {
+                Log.i(LOG_ID, "Triggered ${type.name} without reading: $message")
+            }
+            return triggered
+        } catch (t: Throwable) {
+            Log.stack(LOG_ID, "triggerMessageAlert ${type.name}", t)
             return false
         }
     }

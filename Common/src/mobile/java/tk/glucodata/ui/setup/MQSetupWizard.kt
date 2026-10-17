@@ -5,6 +5,8 @@
 
 package tk.glucodata.ui.setup
 
+import androidx.compose.material3.LinearWavyProgressIndicator
+import androidx.compose.material3.ButtonDefaults
 import android.bluetooth.BluetoothAdapter
 import android.content.Intent
 import android.os.Build
@@ -27,7 +29,6 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Bluetooth
 import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material3.AlertDialog
@@ -37,8 +38,6 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -66,6 +65,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import tk.glucodata.ui.components.AppTopBar
 import tk.glucodata.Log
 import tk.glucodata.R
 import tk.glucodata.drivers.mq.MQBootstrapClient
@@ -155,13 +155,10 @@ fun MQSetupWizard(
 
     Scaffold(
         topBar = {
-            TopAppBar(
-                title = { Text(stringResource(R.string.mq_setup_title)) },
-                navigationIcon = {
-                    IconButton(onClick = onDismiss) {
-                        Icon(Icons.Default.ArrowBack, contentDescription = stringResource(R.string.cancel))
-                    }
-                }
+            AppTopBar(
+                title = stringResource(R.string.mq_setup_title),
+                onNavigateBack = onDismiss,
+                navigationContentDescription = stringResource(R.string.cancel),
             )
         }
     ) { padding ->
@@ -190,18 +187,21 @@ fun MQSetupWizard(
                                     normalizedQr != null ||
                                         accountState.hasToken ||
                                         accountState.hasCredentials
-                                val bootstrapConfig = if (shouldAttemptVendorRestore) {
+                                val bootstrapResult = if (shouldAttemptVendorRestore) {
                                     withContext(Dispatchers.IO) {
                                         runCatching {
                                             val result = MQBootstrapClient.fetchBestEffort(
                                                 context = context,
-                                                bleId = addressCanonical,
+                                                bleId = tk.glucodata.drivers.mq.MQVendorIdentity.bleId(candidate.displayName),
                                                 qrCode = normalizedQr,
                                                 authToken = accountState.authToken,
                                                 credentials = accountState.credentials,
+                                                allowContinueWearRestore = !MQRegistry.loadLocalResetPending(
+                                                    context, MQConstants.canonicalSensorId(addressCanonical),
+                                                ),
                                             )
                                             result.refreshedToken?.let { MQRegistry.saveAuthToken(context, it) }
-                                            result.config
+                                            result
                                         }.onFailure {
                                             Log.w(tag, "MQ bootstrap prefetch failed: ${it.message}")
                                         }.getOrNull()
@@ -215,7 +215,7 @@ fun MQSetupWizard(
                                     address = addressCanonical,
                                     qrCodeContent = normalizedQr,
                                     connectNow = false,
-                                    bootstrapConfig = bootstrapConfig,
+                                    bootstrapConfig = bootstrapResult?.config,
                                 )
                                 if (sensorId == null) {
                                     Toast.makeText(
@@ -225,6 +225,9 @@ fun MQSetupWizard(
                                     ).show()
                                     currentStep = MQSetupStep.SCAN
                                     return@launch
+                                }
+                                withContext(Dispatchers.IO) {
+                                    tk.glucodata.drivers.mq.MQBootstrapHistory.import(sensorId, bootstrapResult?.history.orEmpty())
                                 }
                                 MQRegistry.connectSensor(context, sensorId)
                                 delay(2000)
@@ -374,7 +377,7 @@ private fun MQScanStep(
     }
 
     Column(modifier = Modifier.fillMaxSize()) {
-        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+        LinearWavyProgressIndicator(modifier = Modifier.fillMaxWidth())
         LazyColumn(
             modifier = Modifier.fillMaxSize(),
             contentPadding = androidx.compose.foundation.layout.PaddingValues(
@@ -398,7 +401,7 @@ private fun MQScanStep(
                         modifier = Modifier.weight(1f),
                         style = MaterialTheme.typography.titleMedium,
                     )
-                    TextButton(onClick = { showAllDevices = !showAllDevices }) {
+                    TextButton(onClick = { showAllDevices = !showAllDevices }, shapes = ButtonDefaults.shapes(), contentPadding = ButtonDefaults.TextButtonContentPadding) {
                         Text(
                             if (showAllDevices) stringResource(R.string.show_sensors_only)
                             else stringResource(R.string.see_all_devices)
@@ -440,7 +443,10 @@ private fun MQScanStep(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .height(220.dp),
-                            onScanResult = onQrCodeChanged,
+                            onScanResult = { raw ->
+                                onQrCodeChanged(raw)
+                                true
+                            },
                         )
                         Spacer(Modifier.height(8.dp))
                         if (qrCodeContent.isNotBlank()) {
@@ -454,7 +460,9 @@ private fun MQScanStep(
                         }
                         OutlinedButton(
                             onClick = onShowManualQrEntry,
-                            modifier = Modifier.fillMaxWidth()
+                            modifier = Modifier.fillMaxWidth(),
+                            shapes = ButtonDefaults.shapes(),
+                            contentPadding = ButtonDefaults.ContentPadding
                         ) {
                             Text(stringResource(R.string.enter_code_manually))
                         }
@@ -468,7 +476,6 @@ private fun MQScanStep(
                         SettingsItem(
                             title = stringResource(R.string.mq_account_title),
                             subtitle = accountSubtitle,
-                            showArrow = true,
                             icon = Icons.Default.Cloud,
                             iconTint = MaterialTheme.colorScheme.primary,
                             position = CardPosition.SINGLE,
@@ -519,7 +526,9 @@ private fun MQScanStep(
                                         }
                                     }
                                 },
-                                modifier = Modifier.height(ui.buttonHeight)
+                                modifier = Modifier.height(ui.buttonHeight),
+                                shapes = ButtonDefaults.shapes(),
+                                contentPadding = ButtonDefaults.ContentPadding
                             ) {
                                 Text(stringResource(buttonRes))
                             }
@@ -571,12 +580,12 @@ private fun MQManualQrEntryDialog(
             )
         },
         confirmButton = {
-            TextButton(onClick = { onConfirm(normalized) }, enabled = isValid) {
+            TextButton(onClick = { onConfirm(normalized) }, enabled = isValid, shapes = ButtonDefaults.shapes(), contentPadding = ButtonDefaults.TextButtonContentPadding) {
                 Text(stringResource(R.string.confirm))
             }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) {
+            TextButton(onClick = onDismiss, shapes = ButtonDefaults.shapes(), contentPadding = ButtonDefaults.TextButtonContentPadding) {
                 Text(stringResource(R.string.cancel))
             }
         },

@@ -11,8 +11,29 @@ package tk.glucodata.drivers.icanhealth
 
 import java.util.UUID
 import java.util.Locale
+import kotlin.math.abs
+
+/** One decoded glucose field, keeping the wire parts so they can be logged. */
+data class ICanHealthGlucoseField(
+    /** High nibble of the field. Purpose unknown; constant per sensor. Not part of the value. */
+    val nibble: Int,
+    /** Unsigned 12-bit value exactly as it came off the wire, in hundredths of mmol/L. */
+    val mantissa: Int,
+    val glucoseMmolL: Float,
+    val glucoseMgdl: Float,
+)
 
 object ICanHealthConstants {
+    // Precompiled once. These were built inline on every call, and because
+    // SensorIdentity.matches -> managedMatches asks every driver adapter to
+    // canonicalise both ids, a single identity comparison compiled a fresh
+    // java.util.regex.Pattern (ICU native) per adapter per side. A stuck-main-thread
+    // stack dump landed in Pattern.compile beneath canonicalSensorId, and that path
+    // runs per reading, per sensor, per UI snapshot and per notification build.
+    private val SERIAL_P_FORM: Regex = Regex("^P\\d{9}[A-Z]{3}$", RegexOption.IGNORE_CASE)
+    private val SERIAL_LT_FORM: Regex = Regex("^LT\\d{6,}[A-Z]{2,3}$", RegexOption.IGNORE_CASE)
+    private val SERIAL_ALNUM_12_32: Regex = Regex("^[0-9A-Z]{12,32}$", RegexOption.IGNORE_CASE)
+    private val SERIAL_ALNUM_16_32: Regex = Regex("^[0-9A-Z]{16,32}$", RegexOption.IGNORE_CASE)
     private val FULL_CANONICAL_HEX_SENSOR_ID_REGEX = Regex("^[0-9A-Z]{16}$", RegexOption.IGNORE_CASE)
 
     const val TAG = "ICanHealth"
@@ -51,6 +72,18 @@ object ICanHealthConstants {
 
     /** CGM Status (Read) — time offset from session start */
     val CGM_STATUS: UUID = UUID.fromString("00002aa9-0000-1000-8000-00805f9b34fb")
+
+    /**
+     * CGM Feature (Read) — 3-byte feature bitfield, a type/sample-location byte, then the
+     * characteristic's own E2E-CRC (0xFFFF when that feature is absent).
+     *
+     * Bit 0 is Calibration Supported, bit 12 E2E-CRC Supported, bit 14 Multiple Sessions.
+     * iCGM-t6 answers 0x004001 with 0xFFFF: calibration yes, CRC no.
+     */
+    val CGM_FEATURE: UUID = UUID.fromString("00002aa8-0000-1000-8000-00805f9b34fb")
+
+    /** CGM Session Run Time (Read) — hours the sensor intends to run, from session start. */
+    val CGM_SESSION_RUN_TIME: UUID = UUID.fromString("00002aab-0000-1000-8000-00805f9b34fb")
 
     /** CGM Session Start Time (Read) — sensor activation time */
     val CGM_SESSION_START_TIME: UUID = UUID.fromString("00002aaa-0000-1000-8000-00805f9b34fb")
@@ -98,6 +131,44 @@ object ICanHealthConstants {
     // Keep iCan aligned with the native stream validator (<552 mg/dL). Values
     // above the normal display maximum still render as HI instead of no data.
     const val MAX_VALID_GLUCOSE_MGDL = 551f
+
+    // ---- Glucose field ----
+
+    /**
+     * Decode the 16-bit glucose field of a CGM measurement.
+     *
+     * The field splits into a 4-bit high nibble and a 12-bit value. The 12 bits are hundredths of
+     * mmol/L, verified against the vendor app's own database. What the nibble carries is not
+     * known: captures show it constant for the life of a sensor and different between sensors
+     * (0x1 on one i6, 0x0 on another), so it is neither an IEEE-11073 exponent nor a per-reading
+     * state. It is decoded out and reported for diagnosis, and deliberately not used for
+     * anything.
+     *
+     * Three call sites — the live frame, the SN history batch, and the encrypted history record —
+     * previously carried byte-identical copies of this arithmetic.
+     */
+    @JvmStatic
+    fun decodeGlucoseField(
+        low: Int,
+        high: Int,
+        directGlucoseEncoding: Boolean,
+    ): ICanHealthGlucoseField {
+        val lowByte = low and 0xFF
+        val highByte = high and 0xFF
+        val nibble = if (directGlucoseEncoding) 0 else (highByte ushr 4) and 0x0F
+        val mantissa = if (directGlucoseEncoding) {
+            lowByte or (highByte shl 8)
+        } else {
+            lowByte or ((highByte and 0x0F) shl 8)
+        }
+        val glucoseMmolL = mantissa / 100.0f
+        return ICanHealthGlucoseField(
+            nibble = nibble,
+            mantissa = mantissa,
+            glucoseMmolL = glucoseMmolL,
+            glucoseMgdl = glucoseMmolL * MMOL_TO_MGDL,
+        )
+    }
 
     private enum class BundledKeyFamily {
         OLD,
@@ -335,6 +406,113 @@ object ICanHealthConstants {
         return tailTimestampMs >= endTimestampMs - toleranceMs.coerceAtLeast(0L)
     }
 
+    /**
+     * Reconstructs the wall-clock time of [currentSequenceNumber] from a persisted covered edge
+     * `(persistedCoveredSequence, persistedCoveredTimestampMs)`, extrapolating by one minute per
+     * sequence step. This is the anchor the whole relative-timestamp path hangs off.
+     */
+    internal fun persistedCoveredAnchorMs(
+        persistedCoveredSequence: Int,
+        persistedCoveredTimestampMs: Long,
+        currentSequenceNumber: Int,
+        sequenceUnitMs: Long,
+    ): Long = persistedCoveredTimestampMs +
+        (currentSequenceNumber - persistedCoveredSequence).toLong() * sequenceUnitMs
+
+    /**
+     * Whether an anchor reconstructed by [persistedCoveredAnchorMs] may be used. The plausibility
+     * window is hours wide, so an edge that is merely an hour off passes it and then re-seeds
+     * itself with every reading. The counter read is a fresh wall-clock fix for the current
+     * sequence; the edge must agree with it as well.
+     */
+    internal fun isPersistedCoveredAnchorUsable(
+        anchorMs: Long,
+        sequenceObservedAtMs: Long,
+        divergenceToleranceMs: Long,
+        plausibleRange: LongRange,
+    ): Boolean {
+        if (anchorMs <= 0L || anchorMs !in plausibleRange) {
+            return false
+        }
+        return !isAnchorDivergentFromObservedSequence(anchorMs, sequenceObservedAtMs, divergenceToleranceMs)
+    }
+
+    /**
+     * True when an edge-derived time for the sensor's current sequence disagrees with the moment
+     * that sequence was actually read. No observation yet means nothing to compare against.
+     */
+    internal fun isAnchorDivergentFromObservedSequence(
+        anchorMs: Long,
+        sequenceObservedAtMs: Long,
+        toleranceMs: Long,
+    ): Boolean {
+        if (sequenceObservedAtMs <= 0L) {
+            return false
+        }
+        return abs(anchorMs - sequenceObservedAtMs) > toleranceMs.coerceAtLeast(0L)
+    }
+
+    /**
+     * True when a measurement that has just arrived resolved to a time far behind the wall clock.
+     * Only the newest sequence qualifies: a lower one may be a legitimately delayed record.
+     */
+    internal fun isStaleLiveTimestamp(
+        sequenceNumber: Int,
+        currentSequenceNumber: Int,
+        resolvedMs: Long,
+        nowMs: Long,
+        maxLagMs: Long,
+    ): Boolean {
+        val isNewestSequence = currentSequenceNumber < 0 || sequenceNumber >= currentSequenceNumber
+        return isNewestSequence && nowMs - resolvedMs > maxLagMs
+    }
+
+    /**
+     * True while a parsed session start still explains the sensor's own sequence counter.
+     *
+     * The counter ticks once a minute from session start, so `sessionStart + sequence` must land
+     * on the moment the counter was read. A session start that is off by a whole UTC offset stays
+     * internally consistent and so survives every per-candidate bounds check; only this
+     * cross-check against the sensor's own counter catches it.
+     *
+     * Deliberately symmetric — a negative UTC offset drags the session start into the past.
+     */
+    internal fun sessionTimelineMatchesSequenceCounter(
+        sessionStartEpochMs: Long,
+        sequenceNumber: Int,
+        sequenceObservedAtMs: Long,
+        sequenceUnitMs: Long,
+        toleranceMs: Long,
+    ): Boolean {
+        if (sessionStartEpochMs <= 0L || sequenceObservedAtMs <= 0L) {
+            return false
+        }
+        if (sequenceNumber < 0) {
+            // Nothing to cross-check against yet.
+            return true
+        }
+        val impliedObservedAtMs = sessionStartEpochMs + sequenceNumber.toLong() * sequenceUnitMs
+        return abs(impliedObservedAtMs - sequenceObservedAtMs) <= toleranceMs.coerceAtLeast(0L)
+    }
+
+    /**
+     * How many readings the sensor produced between two live sequence numbers but never delivered.
+     *
+     * The sequence counter advances one unit per minute regardless of model, so a sensor on a
+     * three-minute cadence steps by three. Returns 0 when the two are consecutive readings, and
+     * 0 for any non-advancing or unusable input.
+     */
+    internal fun missedReadingsBetween(
+        previousSequence: Int,
+        currentSequence: Int,
+        readingIntervalMinutes: Int,
+    ): Int {
+        if (previousSequence < 0 || currentSequence <= previousSequence || readingIntervalMinutes <= 0) {
+            return 0
+        }
+        return ((currentSequence - previousSequence) / readingIntervalMinutes - 1).coerceAtLeast(0)
+    }
+
     const val RACP_RESULT_SUCCESS = 0x01
     const val RACP_RESULT_NOT_SUPPORTED = 0x02
     const val RACP_RESULT_NO_DATA = 0x06
@@ -466,6 +644,31 @@ object ICanHealthConstants {
         return isLikelyPersistedSensorName(trimmed)
     }
 
+    // ---- Onboarding candidate verification ----
+
+    /** Generic Access and Generic Attribute: every BLE peripheral has them, so they say nothing. */
+    private val GENERIC_GATT_SERVICES: Set<UUID> = setOf(
+        UUID.fromString("00001800-0000-1000-8000-00805f9b34fb"),
+        UUID.fromString("00001801-0000-1000-8000-00805f9b34fb"),
+    )
+
+    /**
+     * Consecutive connections that must show [isConclusivelyNotCgm] before onboarding drops an
+     * address it found by name. One is not enough: a stale or partial discovery on a real sensor
+     * looks the same once, and a rejected address stays hidden until the onboarding SN changes.
+     */
+    const val NON_CGM_CANDIDATE_REJECT_STRIKES = 2
+
+    /**
+     * True when a discovered GATT table is populated beyond the generic services and still has no
+     * CGM service, i.e. the peripheral answered and it is not a CGM. Name matching stays broad on
+     * purpose (rebrands and unknown naming schemes); this is what lets onboarding move past a
+     * non-CGM it picked by name instead of reconnecting to it forever.
+     */
+    @JvmStatic
+    fun isConclusivelyNotCgm(serviceUuids: Collection<UUID>): Boolean =
+        CGM_SERVICE !in serviceUuids && serviceUuids.any { it !in GENERIC_GATT_SERVICES }
+
     @JvmStatic
     fun isLikelyPersistedSensorName(name: String?): Boolean {
         if (name == null) return false
@@ -473,9 +676,9 @@ object ICanHealthConstants {
         if (trimmed.isEmpty()) return false
         if (isProvisionalSensorId(trimmed)) return true
         return when {
-            Regex("^P\\d{9}[A-Z]{3}$", RegexOption.IGNORE_CASE).matches(trimmed) -> true
-            Regex("^LT\\d{6,}[A-Z]{2,3}$", RegexOption.IGNORE_CASE).matches(trimmed) -> true
-            Regex("^[0-9A-Z]{12,32}$", RegexOption.IGNORE_CASE).matches(trimmed) -> true
+            SERIAL_P_FORM.matches(trimmed) -> true
+            SERIAL_LT_FORM.matches(trimmed) -> true
+            SERIAL_ALNUM_12_32.matches(trimmed) -> true
             else -> false
         }
     }
@@ -484,7 +687,7 @@ object ICanHealthConstants {
     fun canonicalSensorId(sensorId: String?): String {
         val trimmed = sensorId?.trim().orEmpty()
         if (trimmed.isEmpty()) return ""
-        return if (Regex("^[0-9A-Z]{16,32}$", RegexOption.IGNORE_CASE).matches(trimmed)) {
+        return if (SERIAL_ALNUM_16_32.matches(trimmed)) {
             trimmed.uppercase().take(MAX_NATIVE_SENSOR_ID_CHARS)
         } else {
             trimmed
@@ -635,4 +838,17 @@ object ICanHealthConstants {
 
     /** Preference key prefix for the timestamp of the latest materialized iCan sequence edge */
     const val PREF_HISTORY_EDGE_TIMESTAMP_PREFIX = "icanhealth_history_edge_timestamp_"
+
+    /**
+     * Repair generation for history written against a timezone-skewed session start.
+     *
+     * Builds before this generation parsed the 0x2AAA session start as UTC even when the sensor
+     * had sent a local wall clock, so any backfilled record older than the device's UTC offset was
+     * stored one whole offset late — a ghost copy of the curve interleaved with the real one.
+     * Bump this to schedule another one-time repull-and-replace for every iCan sensor.
+     */
+    const val HISTORY_TIMEZONE_REPAIR_GENERATION = 1
+
+    /** Preference key prefix for the repair generation already applied to a given iCan sensor */
+    const val PREF_HISTORY_TZ_REPAIR_PREFIX = "icanhealth_history_tz_repair_"
 }

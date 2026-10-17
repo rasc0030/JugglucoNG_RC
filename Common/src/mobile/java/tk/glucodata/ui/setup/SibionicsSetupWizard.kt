@@ -15,7 +15,6 @@ import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Bluetooth
 import androidx.compose.material.icons.filled.BluetoothSearching
 import androidx.compose.material.icons.filled.Check
@@ -23,6 +22,7 @@ import androidx.compose.material.icons.filled.QrCodeScanner
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material3.*
+import tk.glucodata.ui.components.AppTopBar
 import tk.glucodata.ui.components.StyledSwitch
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -33,7 +33,6 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -67,6 +66,19 @@ enum class SibionicsType(val displayNameRes: Int, val subtype: Int, val setupVis
 private fun SibionicsType.toManagedVariant(): SibionicsConstants.Variant =
     SibionicsConstants.Variant.fromLegacySubtype(subtype)
 
+/**
+ * Sibionics 2 split labels carry the probe identifier in AI (21) (e.g. EU2VCZUQPSHD5Q), not the
+ * printed P... serial, so the generation cannot be read off the code. For that type any
+ * structurally valid Sibionics label is accepted and the user's type choice stands; BLE discovery
+ * still only offers Sibionics 2 transmitters. The other types keep the generation check.
+ */
+internal fun SibionicsType.acceptsSetupQr(raw: String?): Boolean =
+    if (this == SibionicsType.SIBIONICS2) {
+        SibionicsRegistry.isSupportedQrPayload(raw)
+    } else {
+        SibionicsRegistry.isSupportedQrPayload(raw, toManagedVariant())
+    }
+
 internal fun SibionicsType.acceptsBleSetupDevice(name: String?): Boolean =
     when (this) {
         SibionicsType.SIBIONICS2 -> SibionicsConstants.isSibionics2TransmitterName(name)
@@ -77,7 +89,6 @@ internal fun SibionicsType.acceptsBleSetupDevice(name: String?): Boolean =
 enum class SibionicsSetupStep {
     SELECT_TYPE,
     SCAN_SENSOR,
-    SCAN_TRANSMITTER,
     CONNECTING
 }
 
@@ -160,7 +171,6 @@ fun ManualSensorEntryDialog(
     var batch by remember { mutableStateOf("") }
     var serial by remember { mutableStateOf("") }
     var batchValid by remember { mutableStateOf(false) }
-    var serialValid by remember { mutableStateOf(false) }
 
     // Set examples based on sensor type
     val (batchExample, serialExample) = if (type == SibionicsType.SIBIONICS2) {
@@ -168,6 +178,11 @@ fun ManualSensorEntryDialog(
     } else {
         "LT41250946H" to "250946432T452CBZ43"
     }
+
+    // The QR path refuses a code whose serial form belongs to another sensor type; typing the
+    // code by hand must not be the way around that check.
+    val serialValid = SibionicsRegistry.isManualSerialForVariant(serial, type.toManagedVariant())
+    val serialTypeMismatch = serial.length in 10..20 && !serialValid
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -198,11 +213,21 @@ fun ManualSensorEntryDialog(
                     value = serial,
                     onValueChange = {
                         serial = it.uppercase().filter { c -> c.isLetterOrDigit() }
-                        serialValid = serial.length in 10..20
                     },
                     label = { Text(stringResource(R.string.serial_number_label)) },
                     placeholder = { Text(serialExample, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)) },
-                    supportingText = { Text(stringResource(R.string.serial_number_supporting, serialExample)) },
+                    supportingText = {
+                        if (serialTypeMismatch) {
+                            Text(
+                                stringResource(
+                                    R.string.sibionics_serial_wrong_type,
+                                    stringResource(type.displayNameRes),
+                                ),
+                            )
+                        } else {
+                            Text(stringResource(R.string.serial_number_supporting, serialExample))
+                        }
+                    },
                     singleLine = true,
                     isError = serial.isNotEmpty() && !serialValid,
                     modifier = Modifier.fillMaxWidth()
@@ -212,13 +237,15 @@ fun ManualSensorEntryDialog(
         confirmButton = {
             TextButton(
                 onClick = { onConfirm(batch + serial) },
-                enabled = batchValid && serialValid
+                enabled = batchValid && serialValid,
+                shapes = ButtonDefaults.shapes(),
+                contentPadding = ButtonDefaults.TextButtonContentPadding
             ) {
                 Text(stringResource(R.string.confirm))
             }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) {
+            TextButton(onClick = onDismiss, shapes = ButtonDefaults.shapes(), contentPadding = ButtonDefaults.TextButtonContentPadding) {
                 Text(stringResource(R.string.cancel))
             }
         }
@@ -252,6 +279,7 @@ fun ManualTransmitterEntryDialog(
                     value = code,
                     onValueChange = { code = it.uppercase().filter { c -> c.isLetterOrDigit() } },
                     label = { Text(stringResource(R.string.transmitter_id_label)) },
+                    // ui-guardrails: allow text_literal - an example transmitter ID
                     placeholder = { Text("TW6CCWHS9L7D", color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)) },
                     supportingText = { Text(stringResource(R.string.transmitter_id_supporting)) },
                     singleLine = true,
@@ -263,13 +291,15 @@ fun ManualTransmitterEntryDialog(
         confirmButton = {
             TextButton(
                 onClick = { onConfirm(code) },
-                enabled = isValid
+                enabled = isValid,
+                shapes = ButtonDefaults.shapes(),
+                contentPadding = ButtonDefaults.TextButtonContentPadding
             ) {
                 Text(stringResource(R.string.confirm))
             }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) {
+            TextButton(onClick = onDismiss, shapes = ButtonDefaults.shapes(), contentPadding = ButtonDefaults.TextButtonContentPadding) {
                 Text(stringResource(R.string.cancel))
             }
         }
@@ -394,101 +424,19 @@ fun SibionicsSetupWizard(
     val context = LocalContext.current
     var currentStep by remember { mutableStateOf(SibionicsSetupStep.SELECT_TYPE) }
     var selectedType by remember { mutableStateOf(SibionicsType.EU) }
-    var useLegacyDriver by remember { mutableStateOf(false) }
-    val useManagedDriver = !useLegacyDriver
-    var sensorPtr by remember { mutableStateOf(0L) }
     var sensorName by remember { mutableStateOf("") }
-    var resetTransmitter by remember { mutableStateOf(false) } // Default false as requested
-    var pendingLegacyTransmitterName by remember { mutableStateOf<String?>(null) }
     var scannerTouchActive by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
-    val handleDismiss: () -> Unit = {
-        tk.glucodata.MainActivity.onSensorScanResult = null
-        tk.glucodata.MainActivity.onTransmitterScanResult = null
-        onDismiss()
-    }
+    val handleDismiss: () -> Unit = onDismiss
     val handleBack: () -> Unit = {
         when (currentStep) {
             SibionicsSetupStep.SELECT_TYPE -> handleDismiss()
             SibionicsSetupStep.SCAN_SENSOR -> currentStep = SibionicsSetupStep.SELECT_TYPE
-            SibionicsSetupStep.SCAN_TRANSMITTER -> currentStep = SibionicsSetupStep.SCAN_SENSOR
             SibionicsSetupStep.CONNECTING -> handleDismiss()
         }
     }
 
     BackHandler(onBack = handleBack)
-
-    // Register callbacks with MainActivity
-    DisposableEffect(Unit) {
-        val sensorCallback = object : tk.glucodata.MainActivity.SensorScanCallback {
-            override fun onResult(name: String?, ptr: Long, libreType: Int) {
-                if (name == null || ptr == 0L) {
-                    tk.glucodata.Applic.Toaster(tk.glucodata.Applic.app.getString(R.string.sensor_init_failed))
-                    return
-                }
-
-                sensorName = name
-                sensorPtr = ptr
-
-                Natives.setSensorptrSiSubtype(ptr, selectedType.subtype)
-
-                val pendingTransmitter = pendingLegacyTransmitterName
-                pendingLegacyTransmitterName = null
-                if (selectedType == SibionicsType.SIBIONICS2 && pendingTransmitter != null) {
-                    val transmitterPayload = constructFakeSibionicsQr(pendingTransmitter, targetLength = 59)
-                    val paired = transmitterPayload != null &&
-                        Natives.siSensorptrTransmitterScan(ptr, transmitterPayload)
-                    if (paired) {
-                        currentStep = SibionicsSetupStep.CONNECTING
-                        finishSetup(ptr, resetTransmitter)
-                        scope.launch {
-                            kotlinx.coroutines.delay(4000)
-                            onComplete()
-                        }
-                    } else {
-                        currentStep = SibionicsSetupStep.SCAN_TRANSMITTER
-                        tk.glucodata.Applic.Toaster(
-                            tk.glucodata.Applic.app.getString(R.string.failed_to_connect) + pendingTransmitter
-                        )
-                    }
-                } else {
-                    currentStep = if (selectedType == SibionicsType.SIBIONICS2) {
-                        SibionicsSetupStep.SCAN_TRANSMITTER
-                    } else {
-                        SibionicsSetupStep.CONNECTING
-                    }
-                    if (selectedType != SibionicsType.SIBIONICS2) {
-                        finishSetup(ptr, reset = false)
-                        scope.launch {
-                            kotlinx.coroutines.delay(1500)
-                            onComplete()
-                        }
-                    }
-                }
-            }
-        }
-
-        val transmitterCallback = object : tk.glucodata.MainActivity.TransmitterScanCallback {
-            override fun onResult(success: Boolean) {
-                if (success) {
-                    currentStep = SibionicsSetupStep.CONNECTING
-                    finishSetup(sensorPtr, resetTransmitter)
-                    scope.launch {
-                        kotlinx.coroutines.delay(4000)
-                        onComplete()
-                    }
-                }
-            }
-        }
-
-        tk.glucodata.MainActivity.onSensorScanResult = sensorCallback
-        tk.glucodata.MainActivity.onTransmitterScanResult = transmitterCallback
-
-        onDispose {
-            tk.glucodata.MainActivity.onSensorScanResult = null
-            tk.glucodata.MainActivity.onTransmitterScanResult = null
-        }
-    }
 
     val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
     val scaffoldModifier = if (scannerTouchActive) Modifier else Modifier.nestedScroll(scrollBehavior.nestedScrollConnection)
@@ -496,15 +444,11 @@ fun SibionicsSetupWizard(
     Scaffold(
         modifier = scaffoldModifier,
         topBar = {
-            TopAppBar(
-                title = { Text(stringResource(R.string.sibionics_setup_title)) },
-                windowInsets = TopAppBarDefaults.windowInsets, // Ensure status bar padding
-                navigationIcon = {
-                    IconButton(onClick = handleBack) {
-                        Icon(Icons.Default.ArrowBack, contentDescription = stringResource(R.string.cancel))
-                    }
-                },
-                scrollBehavior = scrollBehavior
+            AppTopBar(
+                title = stringResource(R.string.sibionics_setup_title),
+                onNavigateBack = handleBack,
+                navigationContentDescription = stringResource(R.string.cancel),
+                scrollBehavior = scrollBehavior,
             )
         }
     ) { padding ->
@@ -527,17 +471,11 @@ fun SibionicsSetupWizard(
                 SibionicsSetupStep.SELECT_TYPE -> SelectTypeStep(
                     compact = ui.compact,
                     selectedType = selectedType,
-                    useLegacyDriver = useLegacyDriver,
                     onNavigateToReadiness = onNavigateToReadiness,
                     onTypeSelected = { type ->
                         selectedType = type
                     },
-                    onLegacyDriverChanged = { enabled ->
-                        useLegacyDriver = enabled
-                    },
                     onNext = {
-                        // Always go to SCAN_SENSOR to ensure sensor structure is created.
-                        // Subtype will be applied in SCAN_SENSOR callback.
                         currentStep = SibionicsSetupStep.SCAN_SENSOR
                     },
                     onBack = {
@@ -548,29 +486,6 @@ fun SibionicsSetupWizard(
                 SibionicsSetupStep.SCAN_SENSOR -> ScanSensorStep(
                     compact = ui.compact,
                     selectedType = selectedType,
-                    useManagedDriver = useManagedDriver,
-                    onInlineScanResult = { raw ->
-                        tk.glucodata.MainActivity.handleInlineQrScan(
-                            raw,
-                            tk.glucodata.MainActivity.REQUEST_BARCODE
-                        )
-                    },
-                    onManualEntry = { code ->
-                        val fakeQr = constructFakeSibionicsQr(code, targetLength = 70)
-                        if (fakeQr == null) {
-                            tk.glucodata.Applic.Toaster(tk.glucodata.Applic.app.getString(R.string.invalid_code_format))
-                            return@ScanSensorStep
-                        }
-
-                        tk.glucodata.MainActivity.thisone?.runOnUiThread {
-                            tk.glucodata.PhotoScan.connectSensor(
-                                fakeQr,
-                                tk.glucodata.MainActivity.thisone,
-                                tk.glucodata.MainActivity.REQUEST_BARCODE,
-                                0L
-                            )
-                        }
-                    },
                     onManagedEntry = { raw, device ->
                         val record = SibionicsRegistry.addSensorAndStart(
                             context = context.applicationContext,
@@ -591,122 +506,26 @@ fun SibionicsSetupWizard(
                         }
                     },
                     onBleDeviceEntry = { device ->
-                        if (useManagedDriver) {
-                            val record = SibionicsRegistry.addSensorAndStart(
-                                context = context.applicationContext,
-                                rawInput = device.name,
-                                address = device.address,
-                                displayName = device.name,
-                                variant = selectedType.toManagedVariant(),
-                                bleName = device.name,
-                            )
-                            sensorName = record.displayName
-                            currentStep = SibionicsSetupStep.CONNECTING
-                            tk.glucodata.Applic.Toaster(
-                                tk.glucodata.Applic.app.getString(R.string.sibionics_managed_sensor_added, record.displayName)
-                            )
-                            scope.launch {
-                                kotlinx.coroutines.delay(1500)
-                                onComplete()
-                            }
-                        } else {
-                            val fakeQr = constructBleOnlySibionicsQr(device.name)
-                            if (fakeQr == null) {
-                                tk.glucodata.Applic.Toaster(
-                                    tk.glucodata.Applic.app.getString(R.string.invalid_device_name) + device.name
-                                )
-                                return@ScanSensorStep
-                            }
-                            pendingLegacyTransmitterName = device.name.takeIf {
-                                selectedType == SibionicsType.SIBIONICS2
-                            }
-                            tk.glucodata.MainActivity.thisone?.runOnUiThread {
-                                tk.glucodata.PhotoScan.connectSensor(
-                                    fakeQr,
-                                    tk.glucodata.MainActivity.thisone,
-                                    tk.glucodata.MainActivity.REQUEST_BARCODE,
-                                    0L,
-                                )
-                            }
+                        val record = SibionicsRegistry.addSensorAndStart(
+                            context = context.applicationContext,
+                            rawInput = device.name,
+                            address = device.address,
+                            displayName = device.name,
+                            variant = selectedType.toManagedVariant(),
+                            bleName = device.name,
+                        )
+                        sensorName = record.displayName
+                        currentStep = SibionicsSetupStep.CONNECTING
+                        tk.glucodata.Applic.Toaster(
+                            tk.glucodata.Applic.app.getString(R.string.sibionics_managed_sensor_added, record.displayName)
+                        )
+                        scope.launch {
+                            kotlinx.coroutines.delay(1500)
+                            onComplete()
                         }
                     },
                     onScannerTouchInteractionChanged = { active ->
                         scannerTouchActive = active
-                    }
-                )
-
-                SibionicsSetupStep.SCAN_TRANSMITTER -> ScanTransmitterStep(
-                    compact = ui.compact,
-                    resetEnabled = resetTransmitter,
-                    onResetChanged = { resetTransmitter = it },
-                    onScanClick = {
-                        if (sensorPtr == 0L) {
-                            tk.glucodata.Applic.Toaster(tk.glucodata.Applic.app.getString(R.string.sensor_not_init))
-                            currentStep = SibionicsSetupStep.SCAN_SENSOR
-                            return@ScanTransmitterStep
-                        }
-                        
-                        // Apply reset setting before scan
-                        Natives.setSensorptrResetSibionics2(sensorPtr, resetTransmitter)
-
-                        tk.glucodata.PhotoScan.scanner(
-                            tk.glucodata.MainActivity.thisone,
-                            tk.glucodata.MainActivity.REQUEST_BARCODE_SIB2,
-                            sensorPtr
-                        )
-                    },
-                    onBack = { currentStep = SibionicsSetupStep.SELECT_TYPE },
-                    onDeviceFound = { name ->
-                        if (sensorPtr == 0L) {
-                             tk.glucodata.Applic.Toaster(tk.glucodata.Applic.app.getString(R.string.sensor_lost_restart))
-                             currentStep = SibionicsSetupStep.SCAN_SENSOR
-                             return@ScanTransmitterStep
-                        }
-                        
-                        val fakeQr = constructFakeSibionicsQr(name, targetLength = 59)
-                        if (fakeQr == null) {
-                            tk.glucodata.Applic.Toaster(tk.glucodata.Applic.app.getString(R.string.invalid_device_name) + name)
-                            return@ScanTransmitterStep
-                        }
-
-                        Natives.setSensorptrResetSibionics2(sensorPtr, resetTransmitter)
-                        val success = Natives.siSensorptrTransmitterScan(sensorPtr, fakeQr)
-                        if (success) {
-                            currentStep = SibionicsSetupStep.CONNECTING
-                            finishSetup(sensorPtr, resetTransmitter)
-                            scope.launch {
-                                kotlinx.coroutines.delay(4000)
-                                onComplete()
-                            }
-                        } else {
-                            tk.glucodata.Applic.Toaster(tk.glucodata.Applic.app.getString(R.string.failed_to_connect) + name)
-                        }
-                    },
-                    onManualEntry = { code ->
-                        if (sensorPtr == 0L) {
-                             tk.glucodata.Applic.Toaster(tk.glucodata.Applic.app.getString(R.string.sensor_not_init))
-                             currentStep = SibionicsSetupStep.SCAN_SENSOR
-                             return@ScanTransmitterStep
-                        }
-                        
-                        val fakeQr = constructFakeSibionicsQr(code, targetLength = 59)
-                        if (fakeQr == null) {
-                            tk.glucodata.Applic.Toaster(tk.glucodata.Applic.app.getString(R.string.invalid_code_format))
-                            return@ScanTransmitterStep
-                        }
-
-                        Natives.setSensorptrResetSibionics2(sensorPtr, resetTransmitter)
-                        val success = Natives.siSensorptrTransmitterScan(sensorPtr, fakeQr)
-                        if (success) {
-                            currentStep = SibionicsSetupStep.CONNECTING
-                            finishSetup(sensorPtr, resetTransmitter)
-                            scope.launch {
-                                kotlinx.coroutines.delay(4000)
-                                onComplete()
-                            }
-                        } else {
-                            tk.glucodata.Applic.Toaster(tk.glucodata.Applic.app.getString(R.string.failed_to_connect) + code)
-                        }
                     }
                 )
 
@@ -723,18 +542,16 @@ fun SibionicsSetupWizard(
 fun ScanSensorStep(
     compact: Boolean,
     selectedType: SibionicsType,
-    useManagedDriver: Boolean,
-    onInlineScanResult: (String) -> Unit,
-    onManualEntry: (String) -> Unit,
     onManagedEntry: (String, BleDeviceScanner.SibionicsBleDevice?) -> Unit,
     onBleDeviceEntry: (BleDeviceScanner.SibionicsBleDevice) -> Unit,
     onScannerTouchInteractionChanged: (Boolean) -> Unit
 ) {
     val contentPadding = if (compact) 12.dp else 16.dp
     val sectionGap = if (compact) 8.dp else 12.dp
-    val buttonHeight = if (compact) 46.dp else 48.dp
+    val buttonHeight = 48.dp
     var showManualEntry by remember { mutableStateOf(false) }
     var handledScan by remember { mutableStateOf(false) }
+    var scanRejection by remember { mutableStateOf<String?>(null) }
     var scannerTouchActive by remember { mutableStateOf(false) }
     var bleProbeScanning by remember { mutableStateOf(true) }
     var bleProbeDevices by remember { mutableStateOf(listOf<BleDeviceScanner.SibionicsBleDevice>()) }
@@ -748,17 +565,32 @@ fun ScanSensorStep(
     val selectedBleDevice = remember(matchingBleDevices, selectedBleAddress) {
         matchingBleDevices.firstOrNull { it.address == selectedBleAddress }
     }
+    val sibionics2Label = stringResource(SibionicsType.SIBIONICS2.displayNameRes)
+    val selectedTypeLabel = stringResource(selectedType.displayNameRes)
+    val submitManagedQr: (String) -> Boolean = { raw ->
+        if (selectedType.acceptsSetupQr(raw)) {
+            scanRejection = null
+            onManagedEntry(raw, selectedBleDevice)
+            true
+        } else {
+            // Rendered in place of the instruction line, not toasted: a toast is not guaranteed
+            // to be seen (or shown at all) and this is the only feedback a rejected scan has.
+            val isSibionics2Code = SibionicsRegistry.qrPayloadIsV120Identity(raw)
+            scanRejection = when (isSibionics2Code) {
+                null -> context.getString(R.string.invalid_code_format)
+                true -> context.getString(R.string.sibionics_code_wrong_type, sibionics2Label)
+                false -> context.getString(R.string.sibionics_code_not_for_type, selectedTypeLabel)
+            }
+            tk.glucodata.Log.i("SibionicsSetup", "rejected scan for ${selectedType.name}: $scanRejection")
+            false
+        }
+    }
     val launchFullscreenScan = rememberUnifiedQrScanLauncher(
         requestCode = tk.glucodata.MainActivity.REQUEST_BARCODE,
         title = stringResource(R.string.sibionics_setup_title),
         onScanResult = { raw ->
             if (!handledScan) {
-                handledScan = true
-                if (useManagedDriver) {
-                    onManagedEntry(raw, selectedBleDevice)
-                } else {
-                    onInlineScanResult(raw)
-                }
+                handledScan = submitManagedQr(raw)
             }
         }
     )
@@ -800,11 +632,7 @@ fun ScanSensorStep(
                 try {
                     val decoded = decodeBitmapQr(context, uri)
                     if (decoded != null) {
-                        if (useManagedDriver) {
-                            onManagedEntry(decoded, selectedBleDevice)
-                        } else {
-                            onManualEntry(decoded)
-                        }
+                        submitManagedQr(decoded)
                     } else {
                         tk.glucodata.Applic.Toaster(tk.glucodata.Applic.app.getString(R.string.no_qr_found))
                     }
@@ -823,11 +651,7 @@ fun ScanSensorStep(
             onDismiss = { showManualEntry = false },
             onConfirm = { code ->
                 showManualEntry = false
-                if (useManagedDriver) {
-                    onManagedEntry(code, selectedBleDevice)
-                } else {
-                    onManualEntry(code)
-                }
+                onManagedEntry(code, selectedBleDevice)
             }
         )
     }
@@ -847,14 +671,7 @@ fun ScanSensorStep(
                     .height(if (compact) 320.dp else 380.dp),
                 scannerEnabled = !galleryDecodeInProgress,
                 onScanResult = { raw ->
-                    if (!handledScan) {
-                        handledScan = true
-                        if (useManagedDriver) {
-                            onManagedEntry(raw, selectedBleDevice)
-                        } else {
-                            onInlineScanResult(raw)
-                        }
-                    }
+                    if (handledScan) true else submitManagedQr(raw).also { handledScan = it }
                 },
                 onManualFallback = launchFullscreenScan,
                 manualFallbackLabel = stringResource(R.string.scan_qr_button),
@@ -864,16 +681,27 @@ fun ScanSensorStep(
                 }
             )
             Text(
-                text = stringResource(R.string.scan_sensor_instruction),
+                text = scanRejection
+                    // The split generation needs the transmitter connection code; the generic
+                    // text sends the user to the sensor box, whose code is then rejected.
+                    ?: if (selectedType == SibionicsType.SIBIONICS2) {
+                        stringResource(R.string.scan_sensor_instruction_sibionics2)
+                    } else {
+                        stringResource(R.string.scan_sensor_instruction)
+                    },
                 style = MaterialTheme.typography.bodyMedium,
                 textAlign = TextAlign.Center,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(top = if (compact) 10.dp else 12.dp, bottom = if (compact) 16.dp else 20.dp)
+                color = if (scanRejection != null) {
+                    MaterialTheme.colorScheme.error
+                } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                },
+                modifier = Modifier.padding(top = if (compact) 8.dp else 12.dp, bottom = if (compact) 16.dp else 20.dp)
             )
 
             Column(
                 modifier = Modifier.fillMaxWidth(),
-                verticalArrangement = Arrangement.spacedBy(if (compact) 8.dp else 10.dp),
+                verticalArrangement = Arrangement.spacedBy(if (compact) 8.dp else 8.dp),
             ) {
                 OutlinedButton(
                     onClick = {
@@ -883,7 +711,9 @@ fun ScanSensorStep(
                     },
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(buttonHeight)
+                        .height(buttonHeight),
+                    shapes = ButtonDefaults.shapes(),
+                    contentPadding = ButtonDefaults.ContentPadding
                 ) {
                     if (bleProbeScanning) {
                         CircularProgressIndicator(
@@ -935,7 +765,7 @@ fun ScanSensorStep(
                         ),
                         modifier = Modifier
                             .fillMaxWidth()
-                            .clip(RoundedCornerShape(if (compact) 14.dp else 16.dp))
+                            .clip(RoundedCornerShape(if (compact) 12.dp else 16.dp))
                             .clickable {
                                 selectedBleAddress = if (selected) null else item.address
                             },
@@ -948,6 +778,8 @@ fun ScanSensorStep(
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(buttonHeight),
+                        shapes = ButtonDefaults.shapes(),
+                        contentPadding = ButtonDefaults.ContentPadding,
                     ) {
                         Icon(Icons.Default.Bluetooth, contentDescription = null)
                         Spacer(Modifier.width(8.dp))
@@ -970,7 +802,9 @@ fun ScanSensorStep(
                         PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
                     ) 
                 },
-                modifier = Modifier.fillMaxWidth().height(buttonHeight)
+                modifier = Modifier.fillMaxWidth().height(buttonHeight),
+                shapes = ButtonDefaults.shapes(),
+                contentPadding = ButtonDefaults.ContentPadding
             ) {
                 Icon(Icons.Default.Image, contentDescription = null)
                 Spacer(Modifier.width(8.dp))
@@ -981,7 +815,9 @@ fun ScanSensorStep(
 
             TextButton(
                 onClick = { showManualEntry = true },
-                        modifier = Modifier.fillMaxWidth().height(buttonHeight)
+                        modifier = Modifier.fillMaxWidth().height(buttonHeight),
+                shapes = ButtonDefaults.shapes(),
+                contentPadding = ButtonDefaults.TextButtonContentPadding
 
             ) {
                 Text(stringResource(R.string.enter_code_manually))
@@ -996,10 +832,8 @@ fun ScanSensorStep(
 fun SelectTypeStep(
     compact: Boolean,
     selectedType: SibionicsType,
-    useLegacyDriver: Boolean,
     onNavigateToReadiness: () -> Unit,
     onTypeSelected: (SibionicsType) -> Unit,
-    onLegacyDriverChanged: (Boolean) -> Unit,
     onNext: () -> Unit,
     onBack: () -> Unit
 ) {
@@ -1007,17 +841,16 @@ fun SelectTypeStep(
     val verticalPadding = if (compact) 12.dp else 16.dp
     val listGap = if (compact) 12.dp else 16.dp
     val cardPadding = if (compact) 16.dp else 20.dp
-    val buttonHeight = if (compact) 46.dp else 48.dp
+    val buttonHeight = 48.dp
     Column(
         modifier = Modifier
             .fillMaxSize()
             .padding(horizontal = horizontalPadding, vertical = verticalPadding)
     ) {
-        Spacer(modifier = Modifier.height(if (compact) 12.dp else 18.dp))
+        Spacer(modifier = Modifier.height(if (compact) 12.dp else 16.dp))
         Text(
             text = stringResource(R.string.select_sibionics_type),
-            style = MaterialTheme.typography.headlineSmall,
-            fontWeight = FontWeight.SemiBold,
+            style = MaterialTheme.typography.headlineSmallEmphasized,
         )
         Spacer(modifier = Modifier.height(4.dp))
         Text(
@@ -1025,7 +858,7 @@ fun SelectTypeStep(
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
-        Spacer(modifier = Modifier.height(if (compact) 10.dp else 12.dp))
+        Spacer(modifier = Modifier.height(if (compact) 8.dp else 12.dp))
         tk.glucodata.ui.CgmReadinessSetupBanner(onOpenReadiness = onNavigateToReadiness)
         Spacer(modifier = Modifier.height(if (compact) 12.dp else 16.dp))
 
@@ -1066,7 +899,7 @@ fun SelectTypeStep(
                         animationSpec = androidx.compose.animation.core.tween(180),
                         label = "checkAlpha"
                     )
-                    val cardShape = RoundedCornerShape(if (compact) 18.dp else 20.dp)
+                    val cardShape = RoundedCornerShape(if (compact) 16.dp else 20.dp)
                 
                     Surface(
                         modifier = Modifier.fillMaxWidth(),
@@ -1084,8 +917,7 @@ fun SelectTypeStep(
                         ) {
                             Text(
                                 text = stringResource(type.displayNameRes),
-                                style = MaterialTheme.typography.titleMedium,
-                                fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium,
+                                style = if (isSelected) MaterialTheme.typography.titleMediumEmphasized else MaterialTheme.typography.titleMedium,
                                 color = if (isSelected)
                                     MaterialTheme.colorScheme.onPrimaryContainer
                                 else
@@ -1109,27 +941,6 @@ fun SelectTypeStep(
                 }
             }
 
-            ListItem(
-                headlineContent = { Text(stringResource(R.string.sibionics_legacy_driver_title)) },
-                supportingContent = {
-                    Text(
-                        text = stringResource(R.string.sibionics_legacy_driver_desc),
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                },
-                trailingContent = {
-                    StyledSwitch(
-                        checked = useLegacyDriver,
-                        onCheckedChange = onLegacyDriverChanged,
-                    )
-                },
-                colors = ListItemDefaults.colors(containerColor = Color.Transparent),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(if (compact) 16.dp else 18.dp))
-                    .clickable { onLegacyDriverChanged(!useLegacyDriver) },
-            )
-            Spacer(modifier = Modifier.height(2.dp))
         }
 
         Spacer(modifier = Modifier.height(if (compact) 12.dp else 16.dp))
@@ -1140,7 +951,8 @@ fun SelectTypeStep(
             modifier = Modifier
                 .fillMaxWidth()
                 .height(buttonHeight),
-            shape = MaterialTheme.shapes.large
+            shapes = ButtonDefaults.shapes(),
+            contentPadding = ButtonDefaults.ContentPadding,
         ) {
             Text(
                 text = stringResource(R.string.continue_action),
@@ -1154,6 +966,8 @@ fun SelectTypeStep(
         TextButton(
             onClick = onBack,
             modifier = Modifier.fillMaxWidth().height(buttonHeight),
+            shapes = ButtonDefaults.shapes(),
+            contentPadding = ButtonDefaults.TextButtonContentPadding,
 
             ) {
             Text(stringResource(R.string.cancel))
@@ -1175,7 +989,7 @@ fun ScanTransmitterStep(
     var foundDevices by remember { mutableStateOf(setOf<String>()) }
     var showManualEntry by remember { mutableStateOf(false) }
     val contentPadding = if (compact) 12.dp else 16.dp
-    val buttonHeight = if (compact) 46.dp else 48.dp
+    val buttonHeight = 48.dp
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
 
@@ -1240,12 +1054,14 @@ fun ScanTransmitterStep(
                 style = MaterialTheme.typography.bodyMedium,
                  textAlign = TextAlign.Center,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(bottom = if (compact) 14.dp else 18.dp)
+                modifier = Modifier.padding(bottom = if (compact) 12.dp else 16.dp)
             )
 
             OutlinedButton(
                 onClick = { isScanning = !isScanning },
-                modifier = Modifier.fillMaxWidth().height(buttonHeight)
+                modifier = Modifier.fillMaxWidth().height(buttonHeight),
+                shapes = ButtonDefaults.shapes(),
+                contentPadding = ButtonDefaults.ContentPadding
             ) {
                 if (isScanning) {
                     CircularProgressIndicator(
@@ -1340,14 +1156,16 @@ fun ScanTransmitterStep(
     
             Button(
                 onClick = onScanClick,
-                modifier = Modifier.fillMaxWidth().height(buttonHeight)
+                modifier = Modifier.fillMaxWidth().height(buttonHeight),
+                shapes = ButtonDefaults.shapes(),
+                contentPadding = ButtonDefaults.ContentPadding
             ) {
                 Icon(Icons.Default.QrCodeScanner, contentDescription = null)
                 Spacer(Modifier.width(8.dp))
                 Text(stringResource(R.string.scan_transmitter_button))
             }
             
-            Spacer(Modifier.height(if (compact) 6.dp else 8.dp))
+            Spacer(Modifier.height(if (compact) 8.dp else 8.dp))
 
             // Add Gallery Button (Transmitter)
             OutlinedButton(
@@ -1356,18 +1174,22 @@ fun ScanTransmitterStep(
                         PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
                     ) 
                 },
-                modifier = Modifier.fillMaxWidth().height(buttonHeight)
+                modifier = Modifier.fillMaxWidth().height(buttonHeight),
+                shapes = ButtonDefaults.shapes(),
+                contentPadding = ButtonDefaults.ContentPadding
             ) {
                 Icon(Icons.Default.Image, contentDescription = null)
                 Spacer(Modifier.width(8.dp))
                 Text(stringResource(R.string.select_gallery_button))
             }
 
-            Spacer(Modifier.height(if (compact) 6.dp else 8.dp))
+            Spacer(Modifier.height(if (compact) 8.dp else 8.dp))
             
             TextButton(
                 onClick = { showManualEntry = true },
-                modifier = Modifier.fillMaxWidth().height(buttonHeight)
+                modifier = Modifier.fillMaxWidth().height(buttonHeight),
+                shapes = ButtonDefaults.shapes(),
+                contentPadding = ButtonDefaults.TextButtonContentPadding
             ) {
                  Text(stringResource(R.string.enter_code_manually))
             }

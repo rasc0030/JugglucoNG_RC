@@ -15,7 +15,6 @@
 #include <memory>
 #include <string_view>
 // #include "sibionics/AlgorithmContext.hpp"
-#include "EverSense.hpp"
 #include "datbackup.hpp"
 #include "inout.hpp"
 #include "jnidef.h"
@@ -788,9 +787,8 @@ jlong SiContext::processData2(SensorGlucoseData *sens, time_t nowsecs,
             sens->exitResetMode();
           }
           sens->sensorerror = false;
-          if (sensor->finished) {
-            sensor->finished = 0;
-            LOGGER("SIprocess finished=%d\n", sensor->finished);
+          if (sensor->finished && sensor->reactivateFromData()) {
+            LOGSTRING("SIprocess finished becomes 0\n");
             backup->resensordata(sensorindex);
           }
 
@@ -806,10 +804,6 @@ jlong SiContext::processData2(SensorGlucoseData *sens, time_t nowsecs,
           backup->wakebackup(Backup::wakestream);
           extern void wakewithcurrent();
           wakewithcurrent();
-
-#ifdef OLDEVERSENSE
-          sendEverSenseold(sens, 5);
-#endif
           return res;
         } else {
           /*                   if(!(index%500)) {

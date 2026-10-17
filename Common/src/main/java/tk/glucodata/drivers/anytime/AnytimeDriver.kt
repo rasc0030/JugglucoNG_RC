@@ -57,6 +57,12 @@ interface AnytimeDriver : ManagedBluetoothSensorDriver, ManagedSensorMaintenance
     /** Schedule an unbind-then-disconnect. */
     fun requestUnbind(): Boolean
 
+    /** Manual self-test (CT2 only). Not part of the automatic connect sequence. */
+    fun requestSelfTest(): Boolean = false
+
+    /** Whether [requestSelfTest] can do anything for this family (CT2 only today). */
+    fun supportsSelfTest(): Boolean = false
+
     /**
      * Walk the transmitter's record buffer from `lastGlucoseId+1` upward until
      * it returns no more data, populating Juggluco's history with everything
@@ -124,6 +130,7 @@ interface AnytimeDriver : ManagedBluetoothSensorDriver, ManagedSensorMaintenance
             supportsManualCalibration = supportsManualCalibration(),
             supportsHardwareReset = supportsResetAction(),
             supportsClearCalibration = supportsClearCalibrationAction() && referenceCalibrations.isNotEmpty(),
+            supportsSelfTest = runCatching { supportsSelfTest() }.getOrDefault(false),
             sensorDetailTelemetry = runCatching { getSensorDetailTelemetry() }.getOrDefault(""),
             vendorCalibrations = referenceCalibrations.map { record ->
                 ManagedSensorCalibrationRecord(

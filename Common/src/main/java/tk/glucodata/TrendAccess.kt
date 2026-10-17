@@ -31,6 +31,19 @@ object TrendAccess {
         this.provider = provider
     }
 
+    /** Registration-completeness check (plan §6 Q1). */
+    @JvmStatic
+    fun isRegistered(): Boolean = provider != null
+
+    /**
+     * Whether the real estimator is available. Forecast alerts check this: a
+     * two-point fallback slope is tolerable for an arrow, but scaled over a
+     * 30-minute horizon it fabricates projections (a reboot-window -3 mg/dl/min
+     * turned 125 mg/dl into a projected 33 and fired PRE_LOW).
+     */
+    @JvmStatic
+    fun hasProvider(): Boolean = provider != null
+
     internal data class Resolution(val velocity: Float, val usedFallback: Boolean)
 
     /**

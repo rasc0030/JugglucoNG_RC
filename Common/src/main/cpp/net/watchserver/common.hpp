@@ -50,6 +50,9 @@ inline std::string_view fixedsensorview(const sensorname_t *sensorname) {
 	return {name,len};
 	}
 
+// Defined in common.cpp; the name a Nightscout entry is known by, for every writer.
+int mksgvidentifier(char *outiter,const std::string_view &sensorid,const uint32_t timsec);
+
 inline void copyfixedsensorname(char *out,size_t outsize,const sensorname_t *sensorname) {
 	if(!outsize)
 		return;
@@ -209,8 +212,11 @@ inline void addjsonstring(char *&outptr,std::string_view value) {
 
 int resolveExportedMgdl(const SensorGlucoseData *sens, const ScanData *val,
                         const sensorname_t *sensorname);
+int resolveExportedMgdlAt(const SensorGlucoseData *sens, const sensorname_t *sensorname,
+                          const uint32_t tim, const int storedMgdl, const int rawCurrent);
 const ScanData *makeExportedScan(const SensorGlucoseData *sens,
                                  const ScanData *val,
                                  const sensorname_t *sensorname,
                                  ScanData &storage);
 int getExchangeOutputIntervalSeconds();
+int getExchangeSmoothingSeconds();

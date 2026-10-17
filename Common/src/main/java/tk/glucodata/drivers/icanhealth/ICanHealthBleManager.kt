@@ -29,18 +29,23 @@ import java.util.ArrayDeque
 import java.util.LinkedHashMap
 import java.util.Locale
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArraySet
 import kotlin.math.abs
 import kotlin.math.round
 import tk.glucodata.Applic
 import tk.glucodata.HistorySyncAccess
 import tk.glucodata.Log
+import tk.glucodata.logd
+import tk.glucodata.logi
 import tk.glucodata.Natives
+import tk.glucodata.NightscoutUploadWake
 import tk.glucodata.Notify
 import tk.glucodata.SensorBluetooth
 import tk.glucodata.SensorIdentity
 import tk.glucodata.SuperGattCallback
 import tk.glucodata.UiRefreshBus
+import tk.glucodata.drivers.ManagedSensorUiFamily
 
 @SuppressLint("MissingPermission")
 class ICanHealthBleManager(
@@ -74,9 +79,19 @@ class ICanHealthBleManager(
         private const val LIVE_SEQUENCE_LAG_ALLOWANCE = 3
         private const val MAX_SESSION_TIMESTAMP_PAST_DRIFT_MS = 6 * 60 * 60 * 1000L
         private const val MAX_SESSION_TIMESTAMP_FUTURE_DRIFT_MS = 2 * 60 * 1000L
+        // Generous enough for sensor-vs-phone clock drift over a full wear period, far tighter
+        // than the smallest real UTC offset (15 minutes granularity, one hour in practice).
+        private const val MAX_SESSION_TIMELINE_SEQUENCE_DRIFT_MS = 30 * 60 * 1000L
+        // Live timestamps are allowed to sit a hair ahead of the clock we compare them against;
+        // the anchor is sampled a few milliseconds after `now` on a busy handler thread.
+        private const val MAX_LIVE_TIMESTAMP_FUTURE_SKEW_MS = 5_000L
+        private const val MAX_LIVE_TIMESTAMP_LAG_MS = 10 * 60 * 1000L
         private const val RECENT_GLUCOSE_WINDOW_SIZE = 24
         private const val NATIVE_MIRROR_STREAM_WINDOW_SEC = 15L * 24L * 60L * 60L
         private const val HISTORY_SYNC_STATUS_STEP = 500
+        private const val LIVE_GAP_BACKFILL_MIN_INTERVAL_MS = 10 * 60 * 1000L
+        private const val MIN_TZ_REPAIR_BATCH_RECORDS = 20
+        private const val MIN_TZ_REPAIR_BATCH_SPAN_MS = 60 * 60 * 1000L
     }
 
     enum class Phase {
@@ -152,6 +167,7 @@ class ICanHealthBleManager(
     @Volatile private var historyBackfillAttemptedThisConnection = false
     @Volatile private var shouldRequestAuthenticatedHistoryBackfill = true
     @Volatile private var suppressAutomaticHistoryBackfill = false
+    @Volatile private var nativeLifetimeDeclaredFor: String? = null
     @Volatile private var sawUnsupportedSnHistoryBatch = false
     @Volatile private var awaitingFreshStatusForHistoryBackfill = false
     @Volatile private var historyBackfillPhase = HistoryBackfillPhase.NONE
@@ -170,6 +186,7 @@ class ICanHealthBleManager(
     @Volatile private var receivedGlucoseThisConnection = false
     @Volatile private var lastGlucoseReceiptRealtimeMs = 0L
     @Volatile private var sessionStartEpochMs = 0L
+    @Volatile private var loggedSessionTimelineDriftMs = 0L
     @Volatile private var currentSequenceNumber = -1
     @Volatile private var currentSequenceObservedAtMs = 0L
     @Volatile private var launcherState = -1
@@ -182,6 +199,10 @@ class ICanHealthBleManager(
     @Volatile private var authRetryCount = 0
     @Volatile private var lastHandledLiveSequence = -1
     @Volatile private var lastHandledLiveTimestampMs = 0L
+    @Volatile private var lastLiveGapBackfillAtMs = 0L
+    @Volatile private var pendingLiveHistoryGap: ICanHealthSequenceGap? = null
+    @Volatile private var historyTzRepairLoadedSensorId: String? = null
+    @Volatile private var historyTzRepairPending = false
     @Volatile private var persistedHistoryTailTimestampMs = 0L
     @Volatile private var persistedCoveredSequence = -1
     @Volatile private var persistedCoveredTimestampMs = 0L
@@ -209,6 +230,10 @@ class ICanHealthBleManager(
     private val pendingHistoryBatch = LinkedHashMap<Int, PendingHistoryReading>()
     private val recentLiveGlucoseMgdl = ArrayDeque<Float>(RECENT_GLUCOSE_WINDOW_SIZE)
     private val rejectedOnboardingAddresses = CopyOnWriteArraySet<String>()
+    // The address the onboarding scan picked by name or advert, as opposed to one the user or the
+    // registry supplied. Only a guess like that may be dropped for not being a CGM.
+    @Volatile private var onboardingScanPickedAddress: String? = null
+    private val nonCgmCandidateStrikes = ConcurrentHashMap<String, Int>()
 
     private var provisionalSensorIdForAdoption: String? =
         serial.takeIf { ICanHealthConstants.isProvisionalSensorId(it) }
@@ -388,6 +413,10 @@ class ICanHealthBleManager(
     }
 
     override fun canConnectWithoutDataptr(): Boolean = true
+
+    // No dataptr is kept (ensureNativeDataptr frees it), so the base lookup would find no record
+    // and Health Connect would never see an iCan reading.
+    override fun nativeSensorPtr(): Long = resolveNativeSensorPtr(SerialNumber)
 
     override fun shouldShowSearchingStatusWhenIdle(): Boolean = true
 
@@ -955,16 +984,15 @@ class ICanHealthBleManager(
 
     private fun shouldSkipHistoryOverlap(sequenceNumber: Int, sampleTimeMs: Long): Boolean {
         loadPersistedCoveredEdge()
-        if (!canUseHistoryPastEndedStatusCap()) {
-            val coveredSequence = maxOf(lastHandledLiveSequence, persistedCoveredSequence)
-            if (coveredSequence >= 0 && sequenceNumber >= 0 && sequenceNumber <= coveredSequence) {
-                return true
-            }
-        }
         val coveredTimestampMs = maxOf(persistedHistoryTailTimestampMs, persistedCoveredTimestampMs)
-        return coveredTimestampMs > 0L &&
-            sampleTimeMs > 0L &&
-            sampleTimeMs <= coveredTimestampMs
+        return ICanHealthHistoryPolicy.shouldSkipHistoryOverlap(
+            sequenceNumber = sequenceNumber,
+            sampleTimeMs = sampleTimeMs,
+            coveredSequence = maxOf(lastHandledLiveSequence, persistedCoveredSequence),
+            coveredTimestampMs = coveredTimestampMs,
+            pendingLiveGap = pendingLiveHistoryGap,
+            ignoreCoveredSequence = canUseHistoryPastEndedStatusCap(),
+        )
     }
 
     private fun legacyAuthBypassPrefKeys(sensorId: String = SerialNumber): LinkedHashSet<String> {
@@ -1096,6 +1124,9 @@ class ICanHealthBleManager(
     override fun getService(): UUID? =
         if (mActiveDeviceAddress.isNullOrBlank()) null else ICanHealthConstants.CGM_SERVICE
 
+    override fun mygetDeviceName(): String =
+        serialFromDevice?.takeIf { it.isNotBlank() } ?: super.mygetDeviceName()
+
     override fun matchDeviceName(deviceName: String?, address: String?): Boolean {
         val trimmedName = deviceName?.trim()?.takeIf { it.isNotEmpty() } ?: return false
         val candidateAddress = address?.trim()?.uppercase(Locale.US)
@@ -1106,6 +1137,10 @@ class ICanHealthBleManager(
         if (knownAddress != null) {
             return address != null && address.equals(knownAddress, ignoreCase = true)
         }
+        return notePickedByOnboardingScan(candidateAddress, matchesUnaddressedName(trimmedName))
+    }
+
+    private fun matchesUnaddressedName(trimmedName: String): Boolean {
         val expectedDisplayName = mygetDeviceName().trim().takeIf { it.isNotEmpty() }
         if (expectedDisplayName != null && trimmedName.equals(expectedDisplayName, ignoreCase = true)) {
             return true
@@ -1118,6 +1153,13 @@ class ICanHealthBleManager(
             return true
         }
         return ICanHealthConstants.isICanHealthDevice(trimmedName)
+    }
+
+    private fun notePickedByOnboardingScan(address: String?, matched: Boolean): Boolean {
+        if (matched && address != null) {
+            onboardingScanPickedAddress = address
+        }
+        return matched
     }
 
     override fun matchScanResult(result: ScanResult): Boolean {
@@ -1135,7 +1177,7 @@ class ICanHealthBleManager(
         val carriesCgmServiceData = record.serviceData
             ?.keys
             ?.any { it.uuid == ICanHealthConstants.CGM_SERVICE } == true
-        return advertisesCgmService || carriesCgmServiceData
+        return notePickedByOnboardingScan(address, advertisesCgmService || carriesCgmServiceData)
     }
 
     override fun reconnect(now: Long): Boolean {
@@ -1158,6 +1200,8 @@ class ICanHealthBleManager(
     }
 
     override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+        noteFirstGattCallback("onConnectionStateChange", gatt)
+        super.onConnectionStateChange(gatt, status, newState)
         if (stop) return
         val stateAddress = gatt.device?.address?.trim()?.uppercase(Locale.US)
         if (stateAddress != null && stateAddress in rejectedOnboardingAddresses) {
@@ -1330,12 +1374,17 @@ class ICanHealthBleManager(
             "Services discovered measurement=${charMeasurement != null} status=${charStatus != null} " +
                 "sessionStart=${charSessionStart != null} racp=${charRacp != null} specificOps=${charSpecificOps != null}"
         )
+        dumpGattSurface(gatt)
 
         if (charMeasurement == null) {
             Log.e(TAG, "CGM measurement characteristic missing")
+            if (rejectNonCgmOnboardingCandidate(gatt)) {
+                return
+            }
             gatt.disconnect()
             return
         }
+        gatt.device?.address?.trim()?.uppercase(Locale.US)?.let { nonCgmCandidateStrikes.remove(it) }
 
         setUiStatus(UiStatusKind.PREPARING)
         if (charSpecificOps != null) {
@@ -1353,12 +1402,45 @@ class ICanHealthBleManager(
     @Deprecated("Deprecated in Java")
     override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
         val data = characteristic.value ?: return
+        Log.i(TAG, "WIRE rx notify ${shortUuid(characteristic.uuid)} ${data.toHexString()}")
         when (characteristic.uuid) {
             ICanHealthConstants.CGM_MEASUREMENT -> handleGlucoseNotification(data)
             ICanHealthConstants.CGM_SPECIFIC_OPS -> handleVendorAuthResponse(data)
             ICanHealthConstants.RACP -> handleRacpResponse(data)
-            else -> Log.d(TAG, "Unhandled notify ${characteristic.uuid}: ${data.toHexString()}")
+            // Lazy: hex-encodes the whole payload, and this fires per unhandled notification.
+            else -> logd(TAG) { "Unhandled notify ${characteristic.uuid}: ${data.toHexString()}" }
         }
+    }
+
+    /** Last four hex digits of a 128-bit BLE UUID: enough to identify it, short enough to scan. */
+    private fun shortUuid(uuid: java.util.UUID): String =
+        uuid.toString().substring(4, 8).uppercase()
+
+    /**
+     * Dump the whole GATT surface once per connection.
+     *
+     * This driver was reverse-engineered from one vendor app against one sensor family, so any
+     * characteristic nobody looked at is somewhere a divergence can hide. Reading the map costs
+     * one log line per characteristic and has already turned up readable characteristics the
+     * driver never touched.
+     */
+    private fun dumpGattSurface(gatt: BluetoothGatt) {
+        runCatching {
+            gatt.services.forEach { service ->
+                Log.i(TAG, "WIRE service ${service.uuid}")
+                service.characteristics.forEach { ch ->
+                    val props = ch.properties
+                    val flags = buildString {
+                        if (props and BluetoothGattCharacteristic.PROPERTY_READ != 0) append("R")
+                        if (props and BluetoothGattCharacteristic.PROPERTY_WRITE != 0) append("W")
+                        if (props and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0) append("w")
+                        if (props and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0) append("N")
+                        if (props and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0) append("I")
+                    }
+                    Log.i(TAG, "WIRE   char ${ch.uuid} props=$flags")
+                }
+            }
+        }.onFailure { Log.stack(TAG, "dumpGattSurface", it) }
     }
 
     @Deprecated("Deprecated in Java")
@@ -1377,7 +1459,39 @@ class ICanHealthBleManager(
         }
 
         val data = characteristic.value ?: byteArrayOf()
+        Log.i(TAG, "WIRE rx read ${shortUuid(characteristic.uuid)} ${data.toHexString()}")
         when (characteristic.uuid) {
+            ICanHealthConstants.CGM_FEATURE -> {
+                if (data.size >= 4) {
+                    val features = (data[0].toInt() and 0xFF) or
+                        ((data[1].toInt() and 0xFF) shl 8) or
+                        ((data[2].toInt() and 0xFF) shl 16)
+                    val typeSample = data[3].toInt() and 0xFF
+                    val crcField = if (data.size >= 6) {
+                        (data[4].toInt() and 0xFF) or ((data[5].toInt() and 0xFF) shl 8)
+                    } else {
+                        -1
+                    }
+                    Log.i(
+                        TAG,
+                        "cgmFeature=0x${"%06X".format(features)} " +
+                            "e2eCrcSupported=${(features and (1 shl 12)) != 0} " +
+                            "crcField=0x${"%04X".format(crcField)} " +
+                            "calibrationSupported=${(features and 1) != 0} " +
+                            "multiSession=${(features and (1 shl 14)) != 0} " +
+                            "type=0x${"%X".format(typeSample and 0x0F)} " +
+                            "sampleLocation=0x${"%X".format((typeSample ushr 4) and 0x0F)}"
+                    )
+                }
+            }
+
+            ICanHealthConstants.CGM_SESSION_RUN_TIME -> {
+                if (data.size >= 2) {
+                    val hours = (data[0].toInt() and 0xFF) or ((data[1].toInt() and 0xFF) shl 8)
+                    Log.i(TAG, "cgmSessionRunTime=${hours}h (${hours / 24}d ${hours % 24}h)")
+                }
+            }
+
             ICanHealthConstants.MODEL_NUMBER -> {
                 val model = parseDeviceInfoString(data)
                 if (model.isNotEmpty()) {
@@ -1466,15 +1580,48 @@ class ICanHealthBleManager(
         finishGattOp()
     }
 
+    private fun isAwaitingOnboardingIdentity(): Boolean =
+        provisionalSensorIdForAdoption != null || ICanHealthConstants.isProvisionalSensorId(SerialNumber)
+
+    /**
+     * Onboarding found this peripheral by name or advert, and its GATT table says it is not a CGM
+     * (the Anytime `SN91…` serial-shaped name passes the loose iCan name check). Without this the
+     * driver reconnected to it every 8 s forever and never looked at another candidate. Only an
+     * address the onboarding scan picked qualifies, and only after
+     * [ICanHealthConstants.NON_CGM_CANDIDATE_REJECT_STRIKES] consecutive conclusive discoveries.
+     */
+    private fun rejectNonCgmOnboardingCandidate(gatt: BluetoothGatt): Boolean {
+        if (!isAwaitingOnboardingIdentity()) {
+            return false
+        }
+        val address = gatt.device?.address?.trim()?.uppercase(Locale.US) ?: return false
+        if (!address.equals(onboardingScanPickedAddress, ignoreCase = true)) {
+            return false
+        }
+        val services = runCatching { gatt.services.map { it.uuid } }.getOrDefault(emptyList())
+        if (!ICanHealthConstants.isConclusivelyNotCgm(services)) {
+            nonCgmCandidateStrikes.remove(address)
+            return false
+        }
+        val strikes = (nonCgmCandidateStrikes[address] ?: 0) + 1
+        if (strikes < ICanHealthConstants.NON_CGM_CANDIDATE_REJECT_STRIKES) {
+            nonCgmCandidateStrikes[address] = strikes
+            Log.w(TAG, "iCan candidate address=$address has no CGM service ($strikes/${ICanHealthConstants.NON_CGM_CANDIDATE_REJECT_STRIKES}); checking once more")
+            return false
+        }
+        nonCgmCandidateStrikes.remove(address)
+        Log.w(TAG, "Rejected iCan candidate address=$address: no CGM service on ${services.size} services")
+        dropOnboardingCandidate(address)
+        return true
+    }
+
     private fun rejectMismatchedOnboardingCandidate(
         gatt: BluetoothGatt,
         rawSerial: String,
         resolvedSerial: String,
     ): Boolean {
         val expectedOnboardingSn = onboardingDeviceSn ?: return false
-        val isAwaitingIdentity = provisionalSensorIdForAdoption != null ||
-            ICanHealthConstants.isProvisionalSensorId(SerialNumber)
-        if (!isAwaitingIdentity) {
+        if (!isAwaitingOnboardingIdentity()) {
             return false
         }
         val identityMatches =
@@ -1486,16 +1633,22 @@ class ICanHealthBleManager(
         }
 
         val address = gatt.device?.address?.trim()?.uppercase(Locale.US)
-        if (address != null) {
-            rejectedOnboardingAddresses.add(address)
-        }
         Log.w(
             TAG,
             "Rejected iCan candidate address=${address ?: "unknown"}: " +
                 "onboarding=${ICanHealthConstants.onboardingIdentityPrefix(expectedOnboardingSn)} " +
                 "device=$resolvedSerial"
         )
+        dropOnboardingCandidate(address)
+        return true
+    }
 
+    /** Forget a wrong onboarding candidate and go back to scanning for the next one. */
+    private fun dropOnboardingCandidate(address: String?) {
+        if (address != null) {
+            rejectedOnboardingAddresses.add(address)
+        }
+        onboardingScanPickedAddress = null
         rawSerialFromDevice = null
         serialFromDevice = null
         close()
@@ -1508,7 +1661,6 @@ class ICanHealthBleManager(
                 SensorBluetooth.startscan()
             }
         }, 250L)
-        return true
     }
 
     override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
@@ -1542,13 +1694,15 @@ class ICanHealthBleManager(
         if (previousId != canonicalSerial) {
             clearLegacyAuthBypassState(previousId)
             promoteNativeSensorIdentity(previousId, canonicalSerial)
-            promotePersistedSensorIdentity(previousId, canonicalSerial)
             if (Applic.app != null) {
                 loadAesKeyFromPrefs(Applic.app, canonicalSerial)
                 loadRecoveredUserIdFromPrefs(Applic.app, canonicalSerial)
                 clearLegacyAuthBypassState(Applic.app, canonicalSerial)
             }
         }
+        // Replace the onboarding placeholder for both newly promoted and restored
+        // callbacks once DIS has supplied the canonical sensor identity.
+        promotePersistedSensorIdentity(previousId, canonicalSerial)
         loadPersistedCoveredEdge(force = true)
         applyViewModeToNative()
     }
@@ -1575,7 +1729,7 @@ class ICanHealthBleManager(
             oldSensorId = previousId,
             newSensorId = resolvedSerial,
             address = mActiveDeviceAddress,
-            displayName = mygetDeviceName()
+            displayName = resolvedSerial
         )
     }
 
@@ -1658,10 +1812,9 @@ class ICanHealthBleManager(
                 currentSequenceObservedAtMs = nowMs
             }
             if (historyBackfillRequested && historyBackfillPhase == HistoryBackfillPhase.GLUCOSE) {
-                Log.d(
-                    TAG,
+                logd(TAG) {
                     "Delivering live seq=${reading.sequenceNumber} while iCan history backfill continues"
-                )
+                }
             }
             val historyCoveredLiveEdge = historySampleTimeMs?.let {
                 shouldSkipHistoryOverlap(reading.sequenceNumber, it)
@@ -1686,12 +1839,14 @@ class ICanHealthBleManager(
             setUiStatus(UiStatusKind.CONNECTED)
             val packed = packGlucoseResult(reading.glucoseMgdl)
             handleGlucoseResult(packed, sampleTimeMs, resolveRawLaneValue(reading.currentValue, reading.glucoseMgdl))
+            val previousLiveSequence = lastHandledLiveSequence
             lastHandledLiveSequence = reading.sequenceNumber
             lastHandledLiveTimestampMs = sampleTimeMs
             rememberRecentGlucose(reading.glucoseMgdl)
             updatePersistedHistoryTailTimestamp(sampleTimeMs)
             rememberCoveredEdge(reading.sequenceNumber, sampleTimeMs)
             scheduleForegroundNotificationRefresh()
+            rearmHistoryBackfillForLiveGap(previousLiveSequence, reading.sequenceNumber, nowMs)
             if (isAuthenticated && shouldRequestAuthenticatedHistoryBackfill && !historyBackfillRequested) {
                 requestHistoryBackfill()
             }
@@ -1894,12 +2049,16 @@ class ICanHealthBleManager(
             // Native addGlucoseStream() multiplies its float input by 10 before
             // storing the internal mg/dL value. Feed mg/dL / 10 here so native
             // stream storage matches the driver-decoded glucose value.
-            Natives.addGlucoseStreamWithTemp(
+            val stored = Natives.addGlucoseStreamWithTemp(
                 sampleTimeSec,
                 nativeStreamValue,
                 latestTemperatureC,
                 nativeWriteName
             )
+            if (stored) {
+                NightscoutUploadWake.afterLiveNativeWrite("ican", sampleTimeMs)
+                markLocalReadingAccepted(sampleTimeMs)
+            }
             applyNativeSensorMetadata()
             val sensorPtr = resolveNativeSensorPtr(SerialNumber)
             if (sensorPtr != 0L || nativeWriteName.isNotBlank()) {
@@ -1922,7 +2081,31 @@ class ICanHealthBleManager(
         )
         if (resolved != null) {
             if (resolved <= fallbackNowMs) {
+                if (ICanHealthConstants.isStaleLiveTimestamp(
+                        sequenceNumber = sequenceNumber,
+                        currentSequenceNumber = currentSequenceNumber,
+                        resolvedMs = resolved,
+                        nowMs = fallbackNowMs,
+                        maxLagMs = MAX_LIVE_TIMESTAMP_LAG_MS,
+                    )) {
+                    // A live measurement was taken moments ago. A candidate far behind the wall
+                    // clock means the persisted covered edge is skewed, and every later reading
+                    // would be extrapolated from it and stored just as late.
+                    Log.w(
+                        TAG,
+                        "Live seq=$sequenceNumber resolved to $resolved, ${(fallbackNowMs - resolved) / 60000L}min " +
+                            "behind now=$fallbackNowMs; stamping it now and dropping the persisted covered edge"
+                    )
+                    invalidatePersistedCoveredEdge("live timestamp lags the wall clock")
+                    return fallbackNowMs
+                }
                 return resolved
+            }
+            // The anchor is read a moment after `now`, so a candidate can land a few milliseconds
+            // ahead of it without being wrong. Clamp that away instead of throwing a perfectly
+            // good anchored timestamp back to the wall clock.
+            if (resolved - fallbackNowMs <= MAX_LIVE_TIMESTAMP_FUTURE_SKEW_MS) {
+                return fallbackNowMs
             }
             Log.w(
                 TAG,
@@ -2146,7 +2329,18 @@ class ICanHealthBleManager(
             !mActiveDeviceAddress.isNullOrBlank() -> mActiveDeviceAddress?.replace(":", "")
             else -> null
         }
-        return ICanHealthConstants.normalizeStandaloneUserId(source)
+        val resolved = ICanHealthConstants.normalizeStandaloneUserId(source)
+        // The head of that fallback chain is cleared by a remove-and-re-add, so the app can
+        // authenticate under a different identity than last time with nothing in the log saying
+        // so. Record what was chosen and everything it was chosen from.
+        Log.i(
+            TAG,
+            "WIRE authUserId=$resolved from source=$source " +
+                "(recovered=$recoveredAuthUserId configured=$configuredAuthUserId " +
+                "onboarding=$onboardingDeviceSn rawSerial=$rawSerialFromDevice " +
+                "serial=$serialFromDevice sensorId=$SerialNumber addr=$mActiveDeviceAddress)"
+        )
+        return resolved
     }
 
     private fun enqueuePreAuthReads() {
@@ -2159,6 +2353,15 @@ class ICanHealthBleManager(
             disService?.getCharacteristic(ICanHealthConstants.SOFTWARE_REVISION)?.let {
                 enqueueOp(GattOp.Read(ICanHealthConstants.SOFTWARE_REVISION, ICanHealthConstants.DEVICE_INFO_SERVICE))
             }
+        }
+        // Both are readable on every unit seen so far and neither has ever been read. CGM Feature
+        // states which optional CGM behaviours the sensor implements; Session Run Time is the
+        // sensor's own statement of how long it means to last, which beats inferring it.
+        cgmService?.getCharacteristic(ICanHealthConstants.CGM_FEATURE)?.let {
+            enqueueOp(GattOp.Read(ICanHealthConstants.CGM_FEATURE, ICanHealthConstants.CGM_SERVICE))
+        }
+        cgmService?.getCharacteristic(ICanHealthConstants.CGM_SESSION_RUN_TIME)?.let {
+            enqueueOp(GattOp.Read(ICanHealthConstants.CGM_SESSION_RUN_TIME, ICanHealthConstants.CGM_SERVICE))
         }
     }
 
@@ -2233,25 +2436,40 @@ class ICanHealthBleManager(
         val nowMs = System.currentTimeMillis()
         val readingInterval = readingIntervalMinutes()
         if (canUseHistoryPastEndedStatusCap()) {
+            // Ended sessions keep their own capped windowing; the repair is not worth
+            // second-guessing a sequence cap on a sensor that has stopped producing data.
             return resolveCappedEndedHistoryStartSequence(nowMs, readingInterval)
+        }
+        if (historyTimezoneRepairPending()) {
+            // Ask for the whole session: the stored tail cannot be trusted to mark real coverage
+            // while skew-era records are still mixed into it.
+            Log.i(TAG, "Requesting full iCan glucose history from first slot for timezone repair")
+            return readingInterval
         }
         val anchorTimeMs = resolveSequenceAnchorTimeMs(nowMs)
         val persistedTailSequence = estimatePersistedTailSequence(anchorTimeMs)
         val latestKnownSequence = maxOf(lastHandledLiveSequence, persistedTailSequence ?: -1)
-        if (latestKnownSequence >= readingInterval) {
-            val nextMissingSequence = latestKnownSequence + readingInterval
-            if (currentSequenceNumber >= nextMissingSequence) {
-                return nextMissingSequence
-            }
+        val startSequence = ICanHealthHistoryPolicy.automaticGlucoseHistoryStartSequence(
+            readingIntervalMinutes = readingInterval,
+            currentSequence = currentSequenceNumber,
+            latestKnownSequence = latestKnownSequence,
+            pendingLiveGap = pendingLiveHistoryGap,
+        )
+        if (startSequence == null) {
             Log.i(
                 TAG,
                 "Skipping glucose-history read; persisted/local tail already covers current end index (tailSeq=$latestKnownSequence current=$currentSequenceNumber)"
             )
             return null
         }
-        // Cold start / no in-memory tail: mirror the vendor fallback and ask
-        // from the first valid glucose-history slot.
-        return readingInterval
+        pendingLiveHistoryGap?.takeIf { it.startSequence == startSequence }?.let { gap ->
+            Log.i(
+                TAG,
+                "Requesting iCan history to repair live gap ${gap.startSequence}..<${gap.endSequenceExclusive} " +
+                    "(${gap.readingCount} reading(s))"
+            )
+        }
+        return startSequence
     }
 
     private fun resolveCappedEndedHistoryStartSequence(nowMs: Long, readingInterval: Int): Int? {
@@ -2394,8 +2612,9 @@ class ICanHealthBleManager(
         sawUnsupportedSnHistoryBatch = false
         if (importedGlucoseHistory > 0) {
             val cappedHistoryPolling = canUseHistoryPastEndedStatusCap()
+            val liveGapStillPending = pendingLiveHistoryGap != null
             suppressAutomaticHistoryBackfill = false
-            shouldRequestAuthenticatedHistoryBackfill = cappedHistoryPolling
+            shouldRequestAuthenticatedHistoryBackfill = cappedHistoryPolling || liveGapStillPending
             receivedGlucoseThisConnection = true
             lastGlucoseReceiptRealtimeMs = System.currentTimeMillis()
             phase = Phase.STREAMING
@@ -2405,7 +2624,11 @@ class ICanHealthBleManager(
             Log.i(
                 TAG,
                 "Authenticated glucose-history cycle completed with $importedGlucoseHistory imported records" +
-                    if (cappedHistoryPolling) "; capped history polling remains enabled" else ""
+                    when {
+                        liveGapStillPending -> "; live-gap repair remains pending"
+                        cappedHistoryPolling -> "; capped history polling remains enabled"
+                        else -> ""
+                    }
             )
         } else if (unsupportedBatch) {
             suppressAutomaticHistoryBackfill = true
@@ -2593,6 +2816,54 @@ class ICanHealthBleManager(
         }
     }
 
+    /**
+     * Re-arm the RACP backfill when the live sequence shows readings were missed mid-session.
+     *
+     * Backfill is otherwise a connection-setup-only affair: [requestHistoryBackfill] latches
+     * `historyBackfillAttemptedThisConnection` after its single run, so a gap opened while the
+     * link stayed up sat unfilled until the user forced a reconnect. Only the gap itself re-arms
+     * it, and only once per [LIVE_GAP_BACKFILL_MIN_INTERVAL_MS], so a sensor that drops readings
+     * constantly cannot turn this into an RACP loop.
+     */
+    private fun rearmHistoryBackfillForLiveGap(
+        previousSequence: Int,
+        currentSequence: Int,
+        nowMs: Long,
+    ) {
+        if (previousSequence < 0 || currentSequence <= previousSequence) {
+            return
+        }
+        if (!isAuthenticated || charRacp == null) {
+            return
+        }
+        if (suppressAutomaticHistoryBackfill || historyBackfillRequested) {
+            return
+        }
+        val detectedGap = ICanHealthHistoryPolicy.liveGapBetween(
+            previousSequence = previousSequence,
+            currentSequence = currentSequence,
+            readingIntervalMinutes = readingIntervalMinutes(),
+        ) ?: return
+        val missedReadings = detectedGap.readingCount
+        val sinceLastMs = nowMs - lastLiveGapBackfillAtMs
+        if (lastLiveGapBackfillAtMs > 0L && sinceLastMs < LIVE_GAP_BACKFILL_MIN_INTERVAL_MS) {
+            logd(TAG) {
+                "Live gap of $missedReadings reading(s) at seq=$currentSequence; " +
+                    "backfill re-arm throttled for another ${(LIVE_GAP_BACKFILL_MIN_INTERVAL_MS - sinceLastMs) / 1000L}s"
+            }
+            return
+        }
+        lastLiveGapBackfillAtMs = nowMs
+        pendingLiveHistoryGap = pendingLiveHistoryGap?.mergedWith(detectedGap) ?: detectedGap
+        historyBackfillAttemptedThisConnection = false
+        shouldRequestAuthenticatedHistoryBackfill = true
+        Log.i(
+            TAG,
+            "Live sequence jumped $previousSequence->$currentSequence ($missedReadings reading(s) missed); " +
+                "re-arming history backfill without waiting for a reconnect"
+        )
+    }
+
     private fun requestHistoryBackfill() {
         if (!isAuthenticated) {
             Log.i(TAG, "Skipping RACP history fetch without vendor auth")
@@ -2726,15 +2997,37 @@ class ICanHealthBleManager(
         Log.i(TAG, "Persisting ${timestamps.size} direct RACP history readings to Room")
         val stored = HistorySyncAccess.storeSensorHistoryBatchBlocking(SerialNumber, timestamps, values, rawValues)
         if (stored) {
+            // Only now, with the corrected records demonstrably written, is it safe to drop the
+            // skewed ones. Deleting first would risk clearing history for a store that then
+            // failed — the batch goes back in immediately afterwards.
+            val repairing = historyTimezoneRepairPending() && purgeHistoryForTimezoneRepair(ordered)
+            if (repairing) {
+                HistorySyncAccess.storeSensorHistoryBatchBlocking(SerialNumber, timestamps, values, rawValues)
+            }
             updatePersistedHistoryTailTimestamp(timestamps.last())
             val lastRecord = ordered.last()
             rememberCoveredEdge(lastRecord.sequenceNumber, lastRecord.timestampMs)
-            mirrorHistoryBatchIntoNative(ordered)
+            mirrorHistoryBatchIntoNative(ordered, repairing)
+            val liveGap = pendingLiveHistoryGap
+            if (liveGap != null && liveGap.isFullyCoveredBy(ordered.mapTo(HashSet<Int>()) { it.sequenceNumber })) {
+                pendingLiveHistoryGap = null
+                Log.i(
+                    TAG,
+                    "Filled iCan live gap ${liveGap.startSequence}..<${liveGap.endSequenceExclusive} " +
+                        "(${liveGap.readingCount} reading(s))"
+                )
+            }
+            if (repairing) {
+                markHistoryTimezoneRepairApplied()
+            }
         }
         return stored
     }
 
-    private fun mirrorHistoryBatchIntoNative(ordered: List<PendingHistoryReading>) {
+    private fun mirrorHistoryBatchIntoNative(
+        ordered: List<PendingHistoryReading>,
+        repairing: Boolean = false,
+    ) {
         if (ordered.isEmpty() || SerialNumber.isBlank()) {
             return
         }
@@ -2744,7 +3037,17 @@ class ICanHealthBleManager(
             val nativeWriteName = resolveExistingNativeSensorName(SerialNumber)
                 ?: nativeCreationSensorName(SerialNumber)
             val newestTimestampSec = ordered.last().timestampMs / 1000L
-            val windowStartSec = prepareNativeMirrorWindow(nativeWriteName, newestTimestampSec)
+            val windowStartSec = if (repairing) {
+                // The native stream holds mirrored ghosts at skewed timestamps that no corrected
+                // record will overwrite, so restart the window at the batch's first record. This
+                // zeroes the sensor's poll array; every record below is then replayed into it.
+                val repairStartSec = ordered.first().timestampMs / 1000L
+                Log.i(TAG, "Timezone repair: rebasing native mirror window for $nativeWriteName to $repairStartSec")
+                Natives.rebaseDirectStreamWindow(nativeWriteName, repairStartSec)
+                repairStartSec
+            } else {
+                prepareNativeMirrorWindow(nativeWriteName, newestTimestampSec)
+            }
             val replayable = if (windowStartSec > 0L) {
                 ordered.filter { (it.timestampMs / 1000L) >= windowStartSec }
             } else {
@@ -2780,7 +3083,12 @@ class ICanHealthBleManager(
             return null
         }
         val anchorTimeMs = resolveSequenceAnchorTimeMs(fallbackNowMs)
-        val useSessionTimeline = when {
+        // The session timeline is only usable while it still agrees with the sensor's own
+        // sequence counter. A session start that is off by a whole UTC offset stays internally
+        // consistent, so the per-candidate bounds below cannot catch it on their own: recent
+        // records get rejected for landing in the future while records older than the offset
+        // sail through and get stored one offset late. That is what drew the ghost curve.
+        val useSessionTimeline = sessionTimelineMatchesSequenceCounter(fallbackNowMs) && when {
             requireRecentCandidate -> canUseSessionTimeline(anchorTimeMs)
             canUseHistoryPastEndedStatusCap() && hasRecentOperationalData(fallbackNowMs) -> false
             else -> sessionStartEpochMs > 0L
@@ -2868,6 +3176,85 @@ class ICanHealthBleManager(
         return tailTimeMs >= earliestAllowed
     }
 
+    /**
+     * True while this sensor still holds history written against a timezone-skewed session start.
+     *
+     * See [ICanHealthConstants.HISTORY_TIMEZONE_REPAIR_GENERATION]. The flag is cleared only once a
+     * replacement batch has actually been stored, so a sensor whose RACP transfer fails keeps the
+     * history it has rather than losing it to a repair that never delivered.
+     */
+    private fun historyTimezoneRepairPending(): Boolean {
+        val sensorId = SerialNumber.takeIf {
+            it.isNotBlank() && !ICanHealthConstants.isProvisionalSensorId(it)
+        } ?: return false
+        if (suppressAutomaticHistoryBackfill) {
+            // RACP is not going to answer on this sensor, so a repair pull would only cost
+            // connections without ever delivering the replacement records.
+            return false
+        }
+        if (historyTzRepairLoadedSensorId == sensorId) {
+            return historyTzRepairPending
+        }
+        val context = Applic.app ?: return false
+        val applied = context.getSharedPreferences("tk.glucodata_preferences", Context.MODE_PRIVATE)
+            .getInt("${ICanHealthConstants.PREF_HISTORY_TZ_REPAIR_PREFIX}$sensorId", 0)
+        historyTzRepairLoadedSensorId = sensorId
+        historyTzRepairPending = applied < ICanHealthConstants.HISTORY_TIMEZONE_REPAIR_GENERATION
+        if (historyTzRepairPending) {
+            Log.i(
+                TAG,
+                "iCan history for $sensorId predates timezone repair generation " +
+                    "${ICanHealthConstants.HISTORY_TIMEZONE_REPAIR_GENERATION} (applied=$applied); " +
+                    "scheduling a full re-pull to replace it"
+            )
+        }
+        return historyTzRepairPending
+    }
+
+    private fun markHistoryTimezoneRepairApplied() {
+        val sensorId = SerialNumber.takeIf {
+            it.isNotBlank() && !ICanHealthConstants.isProvisionalSensorId(it)
+        } ?: return
+        historyTzRepairLoadedSensorId = sensorId
+        historyTzRepairPending = false
+        val context = Applic.app ?: return
+        context.getSharedPreferences("tk.glucodata_preferences", Context.MODE_PRIVATE)
+            .edit()
+            .putInt(
+                "${ICanHealthConstants.PREF_HISTORY_TZ_REPAIR_PREFIX}$sensorId",
+                ICanHealthConstants.HISTORY_TIMEZONE_REPAIR_GENERATION
+            )
+            .commit()
+        Log.i(TAG, "Timezone repair complete for $sensorId")
+    }
+
+    /**
+     * Drop stored readings that the corrected batch is about to replace.
+     *
+     * Only the window the batch actually covers is cleared, and only once the replacement records
+     * are already in hand, so this can never leave a hole it does not immediately refill. Batches
+     * too small to be a session re-pull are left alone and the repair waits for a better one.
+     */
+    private fun purgeHistoryForTimezoneRepair(ordered: List<PendingHistoryReading>): Boolean {
+        val earliestMs = ordered.first().timestampMs
+        val latestMs = ordered.last().timestampMs
+        if (ordered.size < MIN_TZ_REPAIR_BATCH_RECORDS || latestMs - earliestMs < MIN_TZ_REPAIR_BATCH_SPAN_MS) {
+            Log.i(
+                TAG,
+                "Deferring timezone repair; batch of ${ordered.size} record(s) spanning " +
+                    "${(latestMs - earliestMs) / 60000L}min is too small to replace stored history"
+            )
+            return false
+        }
+        val removed = HistorySyncAccess.deleteReadingsForSensorAfter(SerialNumber, earliestMs - 1)
+        Log.i(
+            TAG,
+            "Timezone repair: dropped $removed stored reading(s) from $earliestMs onward, " +
+                "replacing them with ${ordered.size} re-pulled record(s)"
+        )
+        return true
+    }
+
     private fun invalidatePersistedCoveredEdge(reason: String) {
         val sensorId = SerialNumber.takeIf {
             it.isNotBlank() && !ICanHealthConstants.isProvisionalSensorId(it)
@@ -2901,14 +3288,25 @@ class ICanHealthBleManager(
             persistedCoveredSequence >= 0 &&
             persistedCoveredTimestampMs > 0L &&
             currentSequenceNumber >= persistedCoveredSequence) {
-            val deltaMinutes = currentSequenceNumber - persistedCoveredSequence
-            val persistedAnchorTimeMs = persistedCoveredTimestampMs + deltaMinutes.toLong() * SEQUENCE_UNIT_MS
-            if (isPlausibleHistoryAnchor(persistedAnchorTimeMs, fallbackNowMs)) {
+            val persistedAnchorTimeMs = ICanHealthConstants.persistedCoveredAnchorMs(
+                persistedCoveredSequence = persistedCoveredSequence,
+                persistedCoveredTimestampMs = persistedCoveredTimestampMs,
+                currentSequenceNumber = currentSequenceNumber,
+                sequenceUnitMs = SEQUENCE_UNIT_MS,
+            )
+            if (ICanHealthConstants.isPersistedCoveredAnchorUsable(
+                    anchorMs = persistedAnchorTimeMs,
+                    sequenceObservedAtMs = currentSequenceObservedAtMs,
+                    divergenceToleranceMs = MAX_LIVE_TIMESTAMP_LAG_MS,
+                    plausibleRange = earliestObservedHistoryTimeMs(fallbackNowMs)..
+                        latestObservedHistoryTimeMs(fallbackNowMs),
+                )) {
                 return persistedAnchorTimeMs
             }
             invalidatePersistedCoveredEdge(
                 "persisted seq=$persistedCoveredSequence time=$persistedCoveredTimestampMs " +
-                    "reconstructed anchor=$persistedAnchorTimeMs current=$currentSequenceNumber now=$fallbackNowMs"
+                    "reconstructed anchor=$persistedAnchorTimeMs current=$currentSequenceNumber now=$fallbackNowMs " +
+                    "counterObservedAt=$currentSequenceObservedAtMs"
             )
         }
         return when {
@@ -3013,6 +3411,7 @@ class ICanHealthBleManager(
         if (!shouldUpdate) {
             return
         }
+        logd(TAG) { "Covered edge seq=$sequenceNumber time=$timestampMs (was seq=$persistedCoveredSequence time=$persistedCoveredTimestampMs)" }
         persistedCoveredSequence = sequenceNumber
         persistedCoveredTimestampMs = timestampMs
         persistedCoveredEdgeLoaded = true
@@ -3062,6 +3461,56 @@ class ICanHealthBleManager(
         val deltaIntervals = round(deltaMs.toDouble() / readingIntervalMs().toDouble()).toInt()
         val estimatedSequence = currentSequenceNumber - deltaIntervals * readingInterval
         return estimatedSequence.takeIf { it >= readingInterval }
+    }
+
+    /**
+     * True while the parsed session start still explains the sensor's own sequence counter.
+     *
+     * The counter ticks once a minute from session start, so `sessionStart + sequence` should
+     * land on the moment the counter was read. When the two disagree by more than
+     * [MAX_SESSION_TIMELINE_SEQUENCE_DRIFT_MS] the session start is wrong — most often by a whole
+     * UTC offset — and every timestamp derived from it would be wrong by the same amount. The
+     * driver then falls back to anchoring off the live sequence, which is what it already does
+     * for sensors that never report a session start at all.
+     *
+     * Deliberately symmetric: a negative UTC offset pushes the session start into the past, and
+     * the asymmetric window in [canUseSessionTimeline] would wave that through.
+     */
+    private fun sessionTimelineMatchesSequenceCounter(fallbackNowMs: Long): Boolean {
+        if (sessionStartEpochMs <= 0L) {
+            return false
+        }
+        if (currentSequenceNumber < 0) {
+            // Nothing to cross-check against yet; the per-candidate bounds still apply.
+            return true
+        }
+        val observedAtMs = currentSequenceObservedAtMs.takeIf { it > 0L } ?: fallbackNowMs
+        val expectedObservedAtMs = sessionStartEpochMs + currentSequenceNumber.toLong() * SEQUENCE_UNIT_MS
+        val driftMs = abs(expectedObservedAtMs - observedAtMs)
+        if (ICanHealthConstants.sessionTimelineMatchesSequenceCounter(
+                sessionStartEpochMs = sessionStartEpochMs,
+                sequenceNumber = currentSequenceNumber,
+                sequenceObservedAtMs = observedAtMs,
+                sequenceUnitMs = SEQUENCE_UNIT_MS,
+                toleranceMs = MAX_SESSION_TIMELINE_SEQUENCE_DRIFT_MS,
+            )
+        ) {
+            if (loggedSessionTimelineDriftMs != 0L) {
+                Log.i(TAG, "Session timeline agrees with sequence counter again; resuming session-derived timestamps")
+                loggedSessionTimelineDriftMs = 0L
+            }
+            return true
+        }
+        if (loggedSessionTimelineDriftMs != driftMs) {
+            loggedSessionTimelineDriftMs = driftMs
+            Log.w(
+                TAG,
+                "Distrusting session timeline: start=$sessionStartEpochMs seq=$currentSequenceNumber " +
+                    "implies $expectedObservedAtMs but the counter was read at $observedAtMs " +
+                    "(drift=${driftMs / 60000L}min); anchoring off the live sequence instead"
+            )
+        }
+        return false
     }
 
     private fun canUseSessionTimeline(anchorTimeMs: Long): Boolean {
@@ -3271,18 +3720,63 @@ class ICanHealthBleManager(
                 .onFailure { Log.stack(TAG, "ensureNativeDataptr(freedataptr)", it) }
             dataptr = 0L
         }
-        runCatching {
-            Natives.ensureSensorShell(
-                nativeCreationSensorName(canonicalSensorId),
-                resolveNativeShellStartTimeSec()
-            )
-        }.onFailure {
-            Log.stack(TAG, "ensureNativeDataptr(ensureSensorShell)", it)
-        }
+        declareNativeLifetime(
+            nativeCreationSensorName(canonicalSensorId),
+            resolveNativeShellStartTimeSec()
+        )
         val nativeName = resolveExistingNativeSensorName(canonicalSensorId)
             ?: nativeCreationSensorName(canonicalSensorId)
         adoptNativeSensorIfAppropriate(canonicalSensorId, nativeName)
         applyNativeSensorMetadata()
+    }
+
+    /**
+     * Create the native shell already sized for how long an iCan sensor actually runs.
+     *
+     * Poll geometry comes from `info->days` with a 15-day floor, so a sensor rated 15 that keeps
+     * going — which iCan hardware does, out to the 28-day status cap this driver already assumes
+     * everywhere else — walks off the end of its own poll map on day 15: `validPollIndex()` starts
+     * refusing and every live write is dropped, with nothing user-visible to say why.
+     * `pollStorageSize()` documents that failure against Ottai's rating extending to 28/30, and
+     * both Ottai and Anytime declare their duration through `setSensorWearDays` to avoid it. iCan
+     * never did, so every iCan sensor was capped at its rated life while the card promised 28
+     * days.
+     *
+     * Geometry is only recomputed when a shell is constructed, so the capacity has to be
+     * requested here, at creation — an already-open mapping cannot grow.
+     */
+    private fun declareNativeLifetime(name: String, startSec: Long) {
+        val days = resolvedProfile().advisoryExpectedDays
+        if (days <= 0) {
+            runCatching { Natives.ensureSensorShell(name, startSec) }
+                .onFailure { Log.stack(TAG, "ensureNativeDataptr(ensureSensorShell)", it) }
+            runCatching { Natives.setSensorManagedFamily(name, ManagedSensorUiFamily.ICAN.nativeCode) }
+                .onFailure { Log.stack(TAG, "ensureNativeDataptr(setSensorManagedFamily)", it) }
+            return
+        }
+        val key = "$name:$days"
+        val alreadyDeclared = nativeLifetimeDeclaredFor == key
+        val minimumRecords = days * 24 * 60
+        runCatching {
+            if (Natives.ensureSensorShellWithCapacity(name, startSec, minimumRecords) == 0L) {
+                Natives.ensureSensorShell(name, startSec)
+            }
+            Natives.setSensorManagedFamily(name, ManagedSensorUiFamily.ICAN.nativeCode)
+            if (alreadyDeclared) {
+                return@runCatching
+            }
+            Natives.setSensorWearDays(name, days)
+            if (!Natives.hasSensorStreamCapacity(name, minimumRecords)) {
+                Log.e(
+                    TAG,
+                    "native poll capacity below $minimumRecords for $name; readings past day " +
+                        "${minimumRecords / (24 * 60)} will be dropped instead of stored"
+                )
+            } else {
+                Log.i(TAG, "Declared $days-day native lifetime for $name ($minimumRecords records)")
+            }
+            nativeLifetimeDeclaredFor = key
+        }.onFailure { Log.stack(TAG, "declareNativeLifetime", it) }
     }
 
     private fun nativeCreationSensorName(sensorId: String): String =
@@ -3531,6 +4025,7 @@ class ICanHealthBleManager(
                     drainGattQueue()
                     return
                 }
+                Log.i(TAG, "WIRE tx write ${shortUuid(op.charUuid)} ${op.data.toHexString()}")
                 char.value = op.data
                 char.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
                 if (!gatt.writeCharacteristic(char)) {

@@ -2,7 +2,10 @@
 
 package tk.glucodata.ui.journal
 
+import tk.glucodata.ui.components.IconButtonTooltip
+import androidx.compose.material3.IconButtonDefaults
 import android.view.HapticFeedbackConstants
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -32,6 +35,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
@@ -44,23 +48,32 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import tk.glucodata.ui.FontScaleCap
 import tk.glucodata.R
+import tk.glucodata.RemoteIobSnapshot
+import tk.glucodata.UiRefreshBus
 import kotlinx.coroutines.delay
 import tk.glucodata.data.journal.JournalEntry
 import tk.glucodata.data.journal.JournalEntryType
 import tk.glucodata.data.journal.JournalFood
 import tk.glucodata.data.journal.JournalInsulinPreset
+import tk.glucodata.data.journal.JournalActiveInsulinSummary
 import tk.glucodata.data.journal.JournalIobCalculator
 import tk.glucodata.ui.ChartViewportSnapshot
 import tk.glucodata.ui.DashboardChartSection
 import tk.glucodata.ui.GlucosePoint
 import tk.glucodata.ui.JournalTimelineRow
 import tk.glucodata.ui.ReadingRow
+import tk.glucodata.ui.ChartDataBounds
 import tk.glucodata.ui.TimeRange
+import tk.glucodata.data.TimelineExtents
+import tk.glucodata.ui.viewmodel.JournalGlucoseAnchor
+import tk.glucodata.ui.ascendingByTimestamp
+import tk.glucodata.ui.rowTrendHistory
+import tk.glucodata.ui.uniqueRowKeys
 import tk.glucodata.ui.util.ConnectedButtonGroup
 import java.text.SimpleDateFormat
 import java.time.Instant
@@ -72,13 +85,17 @@ import java.util.Locale
 private data class JournalLedgerItem(
     val timestamp: Long,
     val entries: List<JournalEntry>,
-    val point: GlucosePoint?
+    val point: GlucosePoint?,
+    /** What the row's arrow regresses over; see [rowTrendHistory]. Empty without a reading. */
+    val trendHistory: List<GlucosePoint> = emptyList()
 )
 
 private data class JournalDateSection(
     val date: LocalDate,
     val label: String,
-    val items: List<JournalLedgerItem>
+    val items: List<JournalLedgerItem>,
+    /** One stable LazyColumn key per item; see [uniqueRowKeys]. */
+    val keys: List<String>
 )
 
 @Composable
@@ -109,10 +126,20 @@ fun JournalScreen(
     bottomContentPadding: Dp = 104.dp,
     showEiob: Boolean = true,
     chartRangeColors: Boolean = false,
-    quickAddAlwaysNow: Boolean = false
+    quickAddAlwaysNow: Boolean = false,
+    /**
+     * The reading each entry sits on, keyed by entry timestamp — see
+     * [JournalGlucoseAnchors]. [glucoseHistory] is only the stretch loaded
+     * around the chart, so the ledger cannot find its readings there; null
+     * falls back to searching it, for callers that still pass the whole list.
+     */
+    glucoseAnchors: Map<Long, JournalGlucoseAnchor>? = null,
+    /** The whole store's ends; see HistoryBrowseScreen. */
+    timelineExtents: TimelineExtents? = null,
+    onVisibleRangeChanged: ((startMs: Long, endMs: Long) -> Unit)? = null
 ) {
     val view = LocalView.current
-    val sortedHistory = remember(glucoseHistory) { glucoseHistory.sortedBy { it.timestamp } }
+    val sortedHistory = remember(glucoseHistory) { glucoseHistory.ascendingByTimestamp() }
     val presetsById = remember(journalInsulinPresets) { journalInsulinPresets.associateBy { it.id } }
     val foodsById = remember(journalFoods) { journalFoods.associateBy { it.id } }
     var selectedChartRange by rememberSaveable { mutableStateOf(TimeRange.H3) }
@@ -121,9 +148,12 @@ fun JournalScreen(
         mutableStateOf(JournalEntryType.entries.map { it.name })
     }
     var chartActionTimestamp by rememberSaveable { mutableStateOf<Long?>(null) }
+    // Where the chart draws the tapped time's dot, for the journal menu to grow from.
+    val chartActionAnchor = remember { tk.glucodata.ui.ChartActionAnchor() }
     var chartActionDisplayValue by remember { mutableStateOf<Float?>(null) }
     var chartActionAmountFraction by remember { mutableStateOf<Float?>(null) }
-    var fabExpanded by rememberSaveable { mutableStateOf(false) }
+    // Not saveable: leaving the screen by any route closes the menu, as it did the popup.
+    var fabExpanded by remember { mutableStateOf(false) }
 
     val selectedTypes = remember(selectedTypeFilters) {
         selectedTypeFilters.mapNotNull { name ->
@@ -133,9 +163,13 @@ fun JournalScreen(
     val filteredEntries = remember(journalEntries, selectedTypes) {
         journalEntries.filter { it.type in selectedTypes }
     }
-    val sections = remember(filteredEntries, sortedHistory) { buildJournalSections(filteredEntries, sortedHistory) }
-    val markers = remember(filteredEntries, presetsById, foodsById, unit, sortedHistory) {
-        buildJournalChartMarkers(filteredEntries, presetsById, unit, sortedHistory, foodsById)
+    val sections = remember(filteredEntries, sortedHistory, glucoseAnchors) {
+        buildJournalSections(filteredEntries, sortedHistory, glucoseAnchors)
+    }
+    // Not keyed on the history: the markers do not depend on it, and keying on
+    // it rebuilt them — and so recomposed the chart — on every new reading.
+    val markers = remember(filteredEntries, presetsById, foodsById, unit) {
+        buildJournalChartMarkers(filteredEntries, presetsById, unit, foodsById)
     }
     val entriesById = remember(filteredEntries) { filteredEntries.associateBy { it.id } }
     val selectedPointTimestamp = viewportSnapshot?.selectedPoint?.timestamp
@@ -187,75 +221,74 @@ fun JournalScreen(
                             .fillMaxWidth()
                             .height(if (showTitle) 324.dp else 348.dp)
                     ) {
-                        DashboardChartSection(
-                            modifier = Modifier.matchParentSize(),
-                            appChartRangeColors = chartRangeColors,
-                            glucoseHistory = sortedHistory,
-                            journalMarkers = markers,
-                            graphSmoothingMinutes = graphSmoothingMinutes,
-                            collapseSmoothedData = collapseSmoothedData,
-                            previewWindowMode = previewWindowMode,
-                            graphLow = graphLow,
-                            graphHigh = graphHigh,
-                            targetLow = targetLow,
-                            targetHigh = targetHigh,
-                            unit = unit,
-                            viewMode = viewMode,
-                            calibrations = calibrations,
-                            onTimeRangeSelected = { selectedChartRange = it },
-                            selectedTimeRange = selectedChartRange,
-                            isExpanded = false,
-                            expandedProgress = 0f,
-                            onToggleExpanded = null,
-                            onPointClick = {
-                                clearChartAction()
-                                onPointClick?.invoke(it)
-                            },
-                            onCalibrationClick = null,
-                            onTimelineTap = { suggestion ->
-                                if (chartActionTimestamp != null && !suggestion.forceMenu) {
-                                    clearChartAction()
-                                    view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
-                                } else {
-                                    chartActionTimestamp = suggestion.timestamp
-                                    chartActionDisplayValue = suggestion.suggestedDisplayGlucose
-                                    chartActionAmountFraction = suggestion.normalizedYFraction
-                                    view.performHapticFeedback(
-                                        if (suggestion.forceMenu) HapticFeedbackConstants.LONG_PRESS
-                                        else HapticFeedbackConstants.CLOCK_TICK
-                                    )
-                                }
-                            },
-                            journalActionTimestamp = chartActionTimestamp,
-                            journalActionDisplayValue = chartActionDisplayValue,
-                            onDismissJournalAction = { clearChartAction() },
-                            onJournalMarkerClick = { entryId ->
-                                entriesById[entryId]?.let { onJournalEntryClick?.invoke(it) }
-                            },
-                            onViewportSnapshotChanged = { viewportSnapshot = it }
-                        )
-
-                        chartActionTimestamp?.let { actionTimestamp ->
-                            JournalFloatingActionMenu(
-                                visible = true,
-                                selectedTimestamp = actionTimestamp,
-                                viewportSnapshot = viewportSnapshot,
-                                menuTopOffset = 40.dp,
-                                menuItemSpacing = 6.dp,
-                                menuYOffset = (-36).dp,
+                        FontScaleCap {
+                            DashboardChartSection(
                                 modifier = Modifier.matchParentSize(),
-                                onTypeSelected = { type ->
-                                    onAddJournalEntry(
-                                        actionTimestamp,
-                                        type,
-                                        chartActionDisplayValue,
-                                        chartActionAmountFraction
-                                    )
+                                appChartRangeColors = chartRangeColors,
+                                glucoseHistory = sortedHistory,
+                                dataBounds = timelineExtents?.let { ChartDataBounds(it.earliestMs, it.latestMs) },
+                                onVisibleRangeChanged = onVisibleRangeChanged,
+                                journalMarkers = markers,
+                                graphSmoothingMinutes = graphSmoothingMinutes,
+                                collapseSmoothedData = collapseSmoothedData,
+                                previewWindowMode = previewWindowMode,
+                                graphLow = graphLow,
+                                graphHigh = graphHigh,
+                                targetLow = targetLow,
+                                targetHigh = targetHigh,
+                                unit = unit,
+                                viewMode = viewMode,
+                                calibrations = calibrations,
+                                onTimeRangeSelected = { selectedChartRange = it },
+                                selectedTimeRange = selectedChartRange,
+                                isExpanded = false,
+                                expandedProgress = 0f,
+                                onToggleExpanded = null,
+                                onPointClick = {
                                     clearChartAction()
-                                    fabExpanded = false
-                                }
+                                    onPointClick?.invoke(it)
+                                },
+                                onCalibrationClick = null,
+                                onTimelineTap = { suggestion ->
+                                    if (chartActionTimestamp != null && !suggestion.forceMenu) {
+                                        clearChartAction()
+                                        view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                                    } else {
+                                        chartActionTimestamp = suggestion.timestamp
+                                        chartActionDisplayValue = suggestion.suggestedDisplayGlucose
+                                        chartActionAmountFraction = suggestion.normalizedYFraction
+                                        view.performHapticFeedback(
+                                            if (suggestion.forceMenu) HapticFeedbackConstants.LONG_PRESS
+                                            else HapticFeedbackConstants.CLOCK_TICK
+                                        )
+                                    }
+                                },
+                                journalActionTimestamp = chartActionTimestamp,
+                                journalActionDisplayValue = chartActionDisplayValue,
+                                journalActionAnchor = chartActionAnchor,
+                                onDismissJournalAction = { clearChartAction() },
+                                onJournalMarkerClick = { entryId ->
+                                    entriesById[entryId]?.let { onJournalEntryClick?.invoke(it) }
+                                },
+                                onViewportSnapshotChanged = { viewportSnapshot = it }
                             )
                         }
+
+                        JournalFloatingActionMenu(
+                            selectedTimestamp = chartActionTimestamp,
+                            anchor = chartActionAnchor,
+                            onDismissRequest = { clearChartAction() },
+                            onTypeSelected = { type, actionTimestamp ->
+                                onAddJournalEntry(
+                                    actionTimestamp,
+                                    type,
+                                    chartActionDisplayValue,
+                                    chartActionAmountFraction
+                                )
+                                clearChartAction()
+                                fabExpanded = false
+                            }
+                        )
                     }
                 }
             }
@@ -297,33 +330,26 @@ fun JournalScreen(
                             text = section.label,
                             modifier = Modifier.padding(
                                 start = 16.dp,
-                                top = if (sectionIndex == 0) 12.dp else 18.dp,
+                                top = if (sectionIndex == 0) 12.dp else 16.dp,
                                 bottom = 8.dp
                             ),
-                            style = MaterialTheme.typography.titleSmall,
-                            fontWeight = FontWeight.SemiBold,
+                            style = MaterialTheme.typography.titleSmallEmphasized,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
                     itemsIndexed(
                         items = section.items,
-                        key = { index, item ->
-                            "${item.timestamp}-${item.entries.joinToString(",") { it.id.toString() }}-$index"
-                        }
+                        key = { index, _ -> section.keys[index] }
                     ) { index, item ->
                         val point = item.point
                         if (point != null) {
-                            val sectionPoints = section.items.mapNotNull(JournalLedgerItem::point)
-                            val pointIndex = sectionPoints.indexOfFirst { it.timestamp == point.timestamp }
-                                .takeIf { it >= 0 }
-                                ?: index
                             ReadingRow(
                                 point = point,
                                 unit = unit,
                                 viewMode = viewMode,
-                                index = pointIndex,
+                                index = 0,
                                 totalCount = section.items.size,
-                                history = sectionPoints,
+                                history = item.trendHistory,
                                 sensorId = sensorId,
                                 calibrations = calibrations,
                                 journalEntries = item.entries,
@@ -380,9 +406,7 @@ fun JournalScreen(
                     null
                 )
             },
-            modifier = Modifier
-                .align(Alignment.BottomEnd)
-                .padding(end = 20.dp, bottom = 20.dp)
+            modifier = Modifier.align(Alignment.BottomEnd)
         )
     }
 }
@@ -414,7 +438,7 @@ private fun JournalHeader(
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(bottom = 22.dp),
+            .padding(bottom = 24.dp),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically
     ) {
@@ -428,19 +452,23 @@ private fun JournalHeader(
             overflow = TextOverflow.Ellipsis
         )
         Row(verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = onOpenFoodLibrary, modifier = Modifier.size(40.dp)) {
-                Icon(
-                    imageVector = Icons.Default.Restaurant,
-                    contentDescription = stringResource(R.string.journal_food_library),
-                    tint = journalTypeColor(JournalEntryType.CARBS)
-                )
+            IconButtonTooltip(stringResource(R.string.journal_food_library)) {
+                IconButton(onClick = onOpenFoodLibrary, modifier = Modifier.size(40.dp), shapes = IconButtonDefaults.shapes()) {
+                    Icon(
+                        imageVector = Icons.Default.Restaurant,
+                        contentDescription = stringResource(R.string.journal_food_library),
+                        tint = journalTypeColor(JournalEntryType.CARBS)
+                    )
+                }
             }
-            IconButton(onClick = onOpenInsulinLibrary, modifier = Modifier.size(40.dp)) {
-                Icon(
-                    imageVector = Icons.Default.Vaccines,
-                    contentDescription = stringResource(R.string.journal_insulin_library),
-                    tint = journalTypeColor(JournalEntryType.INSULIN)
-                )
+            IconButtonTooltip(stringResource(R.string.journal_insulin_library)) {
+                IconButton(onClick = onOpenInsulinLibrary, modifier = Modifier.size(40.dp), shapes = IconButtonDefaults.shapes()) {
+                    Icon(
+                        imageVector = Icons.Default.Vaccines,
+                        contentDescription = stringResource(R.string.journal_insulin_library),
+                        tint = journalTypeColor(JournalEntryType.INSULIN)
+                    )
+                }
             }
         }
     }
@@ -469,9 +497,29 @@ private fun JournalMetricsPanel(
     val todaysEntries = remember(entries, startOfDayMillis, nowMillis) {
         entries.filter { it.timestamp in startOfDayMillis..nowMillis }
     }
-    val activeInsulin = remember(entries, presetsById, nowMillis) {
+    val localActiveInsulin = remember(entries, presetsById, nowMillis) {
         JournalIobCalculator.buildActiveInsulinSummary(entries, presetsById, nowMillis)
     }
+    // Mirrors the dashboard chip and every outbound surface. A received or
+    // cleared Clone snapshot updates immediately; the ticker retires stale
+    // remote state on its own.
+    val iobRefreshRevision by UiRefreshBus.revision.collectAsStateWithLifecycle(initialValue = 0L)
+    val remoteInsulin = remember(nowMillis, iobRefreshRevision) {
+        RemoteIobSnapshot.fresh(nowMillis)
+    }
+    val activeInsulin = remember(localActiveInsulin, remoteInsulin) {
+        when {
+            remoteInsulin == null -> localActiveInsulin
+            localActiveInsulin == null && remoteInsulin.iobUnits < 0.005f -> null
+            else -> (localActiveInsulin ?: JournalActiveInsulinSummary(0, 0f, 0, null)).copy(
+                iobUnits = remoteInsulin.iobUnits,
+                eiobUnits = remoteInsulin.eiobUnits.takeIf { it.isFinite() }
+                    ?: localActiveInsulin?.eiobUnits ?: 0f
+            )
+        }
+    }
+    val activeInsulinFromRemote = remoteInsulin != null && activeInsulin != null
+    val cobGrams = rememberJournalCob(nowMillis, entries)
     val iobUnits = activeInsulin?.iobUnits?.coerceAtLeast(0f) ?: 0f
     val eiobUnits = activeInsulin?.eiobUnits?.coerceAtLeast(0f) ?: 0f
     val activeUntilFormatter = remember { SimpleDateFormat("HH:mm", Locale.getDefault()) }
@@ -480,7 +528,7 @@ private fun JournalMetricsPanel(
     } else {
         null
     }
-    val untilText = activeInsulin?.nextEndingAt?.let { endingAt ->
+    val untilText = activeInsulin?.activeUntil?.let { endingAt ->
         stringResource(R.string.journal_active_insulin_until, activeUntilFormatter.format(Date(endingAt)))
     }
     val activeInsulinDetail = if (activeInsulin == null) {
@@ -506,7 +554,7 @@ private fun JournalMetricsPanel(
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             JournalMetricCard(
                 title = stringResource(R.string.journal_metric_iob),
-                value = "${formatJournalMetric(iobUnits)} U",
+                value = stringResource(R.string.unit_insulin_value, formatJournalMetric(iobUnits)),
                 detail = activeInsulinDetail,
                 icon = Icons.Default.Vaccines,
                 type = JournalEntryType.INSULIN,
@@ -519,11 +567,22 @@ private fun JournalMetricsPanel(
             )
             JournalMetricCard(
                 title = stringResource(R.string.journal_type_food),
-                value = "${formatJournalMetric(foodToday, wholeNumber = true)} g",
-                detail = stringResource(
-                    R.string.journal_events_today,
-                    todaysEntries.count { it.type == JournalEntryType.CARBS }
+                value = stringResource(
+                    R.string.unit_carbs_value,
+                    formatJournalMetric(foodToday, wholeNumber = true)
                 ),
+                detail = listOfNotNull(
+                    cobGrams?.let { grams ->
+                        stringResource(
+                            R.string.journal_cob_value,
+                            stringResource(R.string.unit_carbs_value, formatJournalMetric(grams))
+                        )
+                    },
+                    stringResource(
+                        R.string.journal_events_today,
+                        todaysEntries.count { it.type == JournalEntryType.CARBS }
+                    )
+                ).joinToString(" · "),
                 icon = Icons.Default.Restaurant,
                 type = JournalEntryType.CARBS,
                 modifier = Modifier.weight(1f)
@@ -533,14 +592,14 @@ private fun JournalMetricsPanel(
             activeInsulin?.let { summary ->
                 Surface(
                     modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(18.dp),
+                    shape = RoundedCornerShape(16.dp),
                     color = journalTypeSelectedContainerColor(
                         JournalEntryType.INSULIN,
                         MaterialTheme.colorScheme.surfaceContainerHighest
                     ).copy(alpha = 0.68f)
                 ) {
                     Column(
-                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
                         verticalArrangement = Arrangement.spacedBy(2.dp)
                     ) {
                         Text(
@@ -572,12 +631,19 @@ private fun JournalMetricsPanel(
                             ),
                             style = MaterialTheme.typography.titleSmall
                         )
-                        summary.nextEndingAt?.let { endingAt ->
+                        summary.activeUntil?.let { endingAt ->
                             Text(
                                 text = stringResource(
                                     R.string.journal_active_insulin_until,
                                     activeUntilFormatter.format(Date(endingAt))
                                 ),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        if (activeInsulinFromRemote) {
+                            Text(
+                                text = stringResource(R.string.journal_iob_source_remote),
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -589,7 +655,7 @@ private fun JournalMetricsPanel(
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             JournalMetricCard(
                 title = stringResource(R.string.journal_metric_insulin_today),
-                value = "${formatJournalMetric(insulinToday)} U",
+                value = stringResource(R.string.unit_insulin_value, formatJournalMetric(insulinToday)),
                 detail = stringResource(R.string.journal_type_insulin),
                 icon = Icons.Default.Vaccines,
                 type = JournalEntryType.INSULIN,
@@ -622,7 +688,7 @@ private fun JournalMetricCard(
         onClick = onClick ?: {},
         enabled = onClick != null,
         modifier = modifier.heightIn(min = 74.dp),
-        shape = RoundedCornerShape(18.dp),
+        shape = RoundedCornerShape(16.dp),
         color = journalTypeSelectedContainerColor(
             type,
             MaterialTheme.colorScheme.surfaceContainerHighest
@@ -631,9 +697,9 @@ private fun JournalMetricCard(
         shadowElevation = 0.dp
     ) {
         Row(
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 11.dp),
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 12.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(10.dp)
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             Surface(
                 modifier = Modifier.size(34.dp),
@@ -659,8 +725,7 @@ private fun JournalMetricCard(
                 )
                 Text(
                     text = value,
-                    style = MaterialTheme.typography.titleMedium.copy(fontFeatureSettings = "tnum"),
-                    fontWeight = FontWeight.SemiBold,
+                    style = MaterialTheme.typography.titleMediumEmphasized.copy(fontFeatureSettings = "tnum"),
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
@@ -708,22 +773,33 @@ private fun JournalTypeFilter(
 
 private fun buildJournalSections(
     entries: List<JournalEntry>,
-    points: List<GlucosePoint>
+    points: List<GlucosePoint>,
+    anchors: Map<Long, JournalGlucoseAnchor>?
 ): List<JournalDateSection> {
     if (entries.isEmpty()) return emptyList()
     val formatter = SimpleDateFormat("MMM d", Locale.getDefault())
     val zone = ZoneId.systemDefault()
-    return entries
+    val items = entries
         .groupBy { it.timestamp }
         .map { (timestamp, groupedEntries) ->
+            val anchor = anchors?.get(timestamp)
+            val point = if (anchors != null) anchor?.point else findClosestPoint(points, timestamp)
             JournalLedgerItem(
                 timestamp = timestamp,
                 entries = groupedEntries.sortedByDescending { it.timestamp },
-                point = findClosestPoint(points, timestamp)
+                point = point,
+                trendHistory = when {
+                    point == null -> emptyList()
+                    anchors != null -> anchor?.trendHistory.orEmpty()
+                    else -> rowTrendHistory(points, point.timestamp)
+                }
             )
         }
         .sortedByDescending { it.timestamp }
-        .fold(mutableListOf<JournalDateSectionBuilder>()) { sections, item ->
+    // Keys are unique across the whole list, not per section: LazyColumn requires it.
+    val keys = uniqueRowKeys(items.map { "${it.timestamp}-${it.entries.joinToString(",") { entry -> entry.id.toString() }}" })
+    return items
+        .foldIndexed(mutableListOf<JournalDateSectionBuilder>()) { index, sections, item ->
             val date = Instant.ofEpochMilli(item.timestamp).atZone(zone).toLocalDate()
             val section = sections.lastOrNull()?.takeIf { it.date == date }
                 ?: JournalDateSectionBuilder(
@@ -731,13 +807,15 @@ private fun buildJournalSections(
                     label = formatter.format(Date(item.timestamp))
                 ).also(sections::add)
             section.items.add(item)
+            section.keys.add(keys[index])
             sections
         }
         .map { builder ->
             JournalDateSection(
                 date = builder.date,
                 label = builder.label,
-                items = builder.items.toList()
+                items = builder.items.toList(),
+                keys = builder.keys.toList()
             )
         }
 }
@@ -776,5 +854,6 @@ private fun formatJournalMetric(value: Float, wholeNumber: Boolean = false): Str
 private class JournalDateSectionBuilder(
     val date: LocalDate,
     val label: String,
-    val items: MutableList<JournalLedgerItem> = mutableListOf()
+    val items: MutableList<JournalLedgerItem> = mutableListOf(),
+    val keys: MutableList<String> = mutableListOf()
 )

@@ -2,11 +2,18 @@
 
 package tk.glucodata.ui
 
+import androidx.compose.material3.FilterChipDefaults
 import android.accessibilityservice.AccessibilityServiceInfo
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.provider.Settings
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -26,9 +33,10 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.CropSquare
 import androidx.compose.material.icons.filled.Layers
+import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.SettingsAccessibility
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.Card
@@ -36,13 +44,10 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
-import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -63,11 +68,14 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.navigation.NavController
 import tk.glucodata.R
+import tk.glucodata.accessibility.AODOverlayService
 import tk.glucodata.data.settings.FloatingSettingsRepository
+import tk.glucodata.ui.components.AppTopBar
 import tk.glucodata.ui.components.CardPosition
 import tk.glucodata.ui.components.MasterSwitchCard
 import tk.glucodata.ui.components.SectionLabel
 import tk.glucodata.ui.components.SettingsSwitchItem
+import tk.glucodata.ui.components.SettingsItem
 import tk.glucodata.ui.viewmodel.DashboardViewModel
 
 private val legacySettingsHorizontalPadding = 16.dp
@@ -91,13 +99,8 @@ fun NotificationSettingsScreen(
     val prefs = remember(context) {
         context.getSharedPreferences("tk.glucodata_preferences", Context.MODE_PRIVATE)
     }
-    val notificationChartEnabled by viewModel.notificationChartEnabled.collectAsState()
-    val rangeColorsEnabled by viewModel.glucoseValueRangeColorsEnabled.collectAsState()
-    val arrowForecastEnabled by viewModel.glucoseArrowForecastColorsEnabled.collectAsState()
-    val chartRangeColorsEnabled by viewModel.glucoseChartRangeColorsEnabled.collectAsState()
-    val appChartRangeColorsEnabled by viewModel.glucoseAppChartRangeColorsEnabled.collectAsState()
-    val dashboardDeltaEnabled by viewModel.dashboardShowDelta.collectAsState()
-    val deltaIntervalMinutes by viewModel.deltaIntervalMinutes.collectAsState()
+    val notificationChartEnabled by viewModel.notificationChartEnabled.collectAsStateWithLifecycle()
+    val deltaIntervalMinutes by viewModel.deltaIntervalMinutes.collectAsStateWithLifecycle()
 
     var fontSize by rememberSaveable { mutableFloatStateOf(prefs.getFloat("notification_font_size", 1.0f)) }
     var fontType by rememberSaveable { mutableIntStateOf(prefs.getInt("notification_font_family", 0)) }
@@ -106,6 +109,7 @@ fun NotificationSettingsScreen(
     var largeArrow by rememberSaveable { mutableStateOf(prefs.getBoolean("notification_large_trend_arrow", false)) }
     var arrowSize by rememberSaveable { mutableFloatStateOf(prefs.getFloat("notification_arrow_size", 1.0f)) }
     var collapsedChart by rememberSaveable { mutableStateOf(prefs.getBoolean("notification_chart_collapsed", false)) }
+    var pauseChartScreenOff by rememberSaveable { mutableStateOf(prefs.getBoolean("notification_chart_pause_screen_off", false)) }
     var showTargetRange by rememberSaveable { mutableStateOf(prefs.getBoolean("notification_chart_target_range", true)) }
     var showIob by rememberSaveable { mutableStateOf(prefs.getBoolean("notification_show_iob", false)) }
     var showCob by rememberSaveable { mutableStateOf(prefs.getBoolean("notification_show_cob", false)) }
@@ -123,6 +127,7 @@ fun NotificationSettingsScreen(
             .putBoolean("notification_large_trend_arrow", largeArrow)
             .putFloat("notification_arrow_size", arrowSize)
             .putBoolean("notification_chart_collapsed", collapsedChart)
+            .putBoolean("notification_chart_pause_screen_off", pauseChartScreenOff)
             .putBoolean("notification_chart_target_range", showTargetRange)
             .putBoolean("notification_show_iob", showIob)
             .putBoolean("notification_show_cob", showCob)
@@ -152,12 +157,16 @@ fun NotificationSettingsScreen(
             FilterChip(
                 selected = fontType == 0,
                 onClick = { fontType = 0; save() },
-                label = { Text(stringResource(R.string.font_app_plex)) }
+                label = { Text(stringResource(R.string.font_app_plex)) },
+                shapes = FilterChipDefaults.shapes(),
+                colors = FilterChipDefaults.filterChipColors()
             )
             FilterChip(
                 selected = fontType == 1,
                 onClick = { fontType = 1; save() },
-                label = { Text(stringResource(R.string.font_system_google_sans)) }
+                label = { Text(stringResource(R.string.font_system_google_sans)) },
+                shapes = FilterChipDefaults.shapes(),
+                colors = FilterChipDefaults.filterChipColors()
             )
         }
 
@@ -181,7 +190,9 @@ fun NotificationSettingsScreen(
                     FilterChip(
                         selected = fontWeight == weight,
                         onClick = { fontWeight = weight; save() },
-                        label = { Text(label) }
+                        label = { Text(label) },
+                        shapes = FilterChipDefaults.shapes(),
+                        colors = FilterChipDefaults.filterChipColors()
                     )
                 }
             }
@@ -215,7 +226,6 @@ fun NotificationSettingsScreen(
                 title = stringResource(R.string.show_trend_arrow),
                 checked = showArrow,
                 onCheckedChange = { showArrow = it; save() },
-                icon = null,
                 position = CardPosition.TOP
             )
             SettingsSwitchItem(
@@ -223,146 +233,14 @@ fun NotificationSettingsScreen(
                 subtitle = stringResource(R.string.notification_large_arrow_desc),
                 checked = largeArrow,
                 onCheckedChange = { largeArrow = it; save() },
-                icon = null,
-                position = CardPosition.MIDDLE
-            )
-            SettingsSwitchItem(
-                title = stringResource(R.string.show_chart_expanded),
-                subtitle = stringResource(R.string.show_chart_expanded_desc),
-                checked = notificationChartEnabled,
-                onCheckedChange = { viewModel.toggleNotificationChart(it) },
-                icon = null,
-                position = CardPosition.MIDDLE
-            )
-            SettingsSwitchItem(
-                title = stringResource(R.string.show_chart_collapsed),
-                subtitle = stringResource(R.string.show_chart_collapsed_desc),
-                checked = collapsedChart,
-                onCheckedChange = { collapsedChart = it; save() },
-                icon = null,
-                position = CardPosition.MIDDLE
-            )
-            SettingsSwitchItem(
-                title = stringResource(R.string.show_target_range),
-                subtitle = stringResource(R.string.show_target_range_desc),
-                checked = showTargetRange,
-                onCheckedChange = { showTargetRange = it; save() },
-                icon = null,
-                position = CardPosition.MIDDLE
-            )
-            SettingsSwitchItem(
-                title = stringResource(R.string.glucose_range_colors_title),
-                subtitle = stringResource(R.string.glucose_range_colors_desc),
-                checked = rangeColorsEnabled,
-                onCheckedChange = { viewModel.setGlucoseValueRangeColorsEnabled(it) },
-                icon = null,
-                position = CardPosition.MIDDLE
-            )
-            SettingsSwitchItem(
-                title = stringResource(R.string.glucose_arrow_forecast_title),
-                subtitle = stringResource(R.string.glucose_arrow_forecast_desc),
-                checked = arrowForecastEnabled,
-                onCheckedChange = { viewModel.setGlucoseArrowForecastColorsEnabled(it) },
-                icon = null,
-                position = CardPosition.MIDDLE
-            )
-            SettingsSwitchItem(
-                title = stringResource(R.string.glucose_chart_range_colors_title),
-                subtitle = stringResource(R.string.glucose_chart_range_colors_desc),
-                checked = chartRangeColorsEnabled,
-                onCheckedChange = { viewModel.setGlucoseChartRangeColorsEnabled(it) },
-                icon = null,
-                position = CardPosition.MIDDLE
-            )
-            SettingsSwitchItem(
-                title = stringResource(R.string.glucose_app_chart_range_colors_title),
-                subtitle = stringResource(R.string.glucose_app_chart_range_colors_desc),
-                checked = appChartRangeColorsEnabled,
-                onCheckedChange = { viewModel.setGlucoseAppChartRangeColorsEnabled(it) },
-                icon = null,
-                position = CardPosition.MIDDLE
-            )
-            GlucosePaletteCard(position = CardPosition.MIDDLE)
-            SettingsSwitchItem(
-                title = stringResource(R.string.dashboard_show_delta_title),
-                subtitle = stringResource(R.string.dashboard_show_delta_desc),
-                checked = dashboardDeltaEnabled,
-                onCheckedChange = { viewModel.setDashboardShowDelta(it) },
-                icon = null,
-                position = CardPosition.MIDDLE
-            )
-            SettingsSwitchItem(
-                title = stringResource(R.string.notification_show_delta_title),
-                subtitle = stringResource(R.string.notification_show_delta_desc),
-                checked = showDelta,
-                onCheckedChange = { showDelta = it; save() },
-                icon = null,
-                position = CardPosition.MIDDLE
-            )
-            Column(
-                modifier = Modifier.padding(horizontal = legacySettingsHorizontalPadding, vertical = 8.dp)
-            ) {
-                Text(
-                    stringResource(R.string.delta_interval_title),
-                    style = MaterialTheme.typography.bodyLarge
-                )
-                Text(
-                    stringResource(R.string.delta_interval_desc),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-                Spacer(Modifier.height(8.dp))
-                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    FilterChip(
-                        selected = deltaIntervalMinutes == 1,
-                        onClick = { viewModel.setDeltaIntervalMinutes(1) },
-                        label = { Text(stringResource(R.string.delta_interval_1min)) }
-                    )
-                    FilterChip(
-                        selected = deltaIntervalMinutes == 5,
-                        onClick = { viewModel.setDeltaIntervalMinutes(5) },
-                        label = { Text(stringResource(R.string.delta_interval_5min)) }
-                    )
-                }
-            }
-            SettingsSwitchItem(
-                title = stringResource(R.string.notification_show_iob_title),
-                subtitle = stringResource(R.string.notification_show_iob_desc),
-                checked = showIob,
-                onCheckedChange = { showIob = it; save() },
-                icon = null,
-                position = CardPosition.MIDDLE
-            )
-            SettingsSwitchItem(
-                title = stringResource(R.string.notification_show_cob_title),
-                subtitle = stringResource(R.string.notification_show_cob_desc),
-                checked = showCob,
-                onCheckedChange = { showCob = it; save() },
-                icon = null,
-                position = CardPosition.MIDDLE
-            )
-            SettingsSwitchItem(
-                title = stringResource(R.string.notification_iob_cob_risk_title),
-                subtitle = stringResource(R.string.notification_iob_cob_risk_desc),
-                checked = iobCobRiskColored,
-                onCheckedChange = { iobCobRiskColored = it; save() },
-                icon = null,
-                position = CardPosition.MIDDLE,
-                enabled = showIob || showCob
-            )
-            SettingsSwitchItem(
-                title = stringResource(R.string.notification_iob_risk_without_cob_title),
-                subtitle = stringResource(R.string.notification_iob_risk_without_cob_desc),
-                checked = iobRiskWithoutCob,
-                onCheckedChange = { iobRiskWithoutCob = it; save() },
-                icon = null,
-                position = CardPosition.BOTTOM,
-                enabled = (showIob || showCob) && iobCobRiskColored
+                position = CardPosition.BOTTOM
             )
         }
-
-        if (showArrow) {
-            Spacer(Modifier.height(4.dp))
+        AnimatedVisibility(
+            visible = showArrow,
+            enter = fadeIn() + expandVertically(),
+            exit = fadeOut() + shrinkVertically()
+        ) {
             LegacySliderControl(
                 label = stringResource(R.string.arrow_size_percent, (arrowSize * 100).toInt()),
                 value = arrowSize,
@@ -370,6 +248,230 @@ fun NotificationSettingsScreen(
                 range = 0.5f..1.5f
             )
         }
+
+        val showAnyChart = notificationChartEnabled || collapsedChart
+        SectionLabel(
+            stringResource(R.string.notification_charts_section),
+            topPadding = 16.dp,
+            modifier = Modifier.padding(horizontal = legacySettingsHorizontalPadding)
+        )
+        Column(
+            verticalArrangement = Arrangement.spacedBy(2.dp),
+            modifier = Modifier.padding(horizontal = legacySettingsHorizontalPadding)
+        ) {
+            SettingsSwitchItem(
+                title = stringResource(R.string.show_chart_expanded),
+                subtitle = stringResource(R.string.show_chart_expanded_desc),
+                checked = notificationChartEnabled,
+                onCheckedChange = { viewModel.toggleNotificationChart(it) },
+                position = CardPosition.TOP
+            )
+            SettingsSwitchItem(
+                title = stringResource(R.string.show_chart_collapsed),
+                subtitle = stringResource(R.string.show_chart_collapsed_desc),
+                checked = collapsedChart,
+                onCheckedChange = { collapsedChart = it; save() },
+                position = if (showAnyChart) CardPosition.MIDDLE else CardPosition.BOTTOM
+            )
+            AnimatedVisibility(
+                visible = showAnyChart,
+                enter = fadeIn() + expandVertically(),
+                exit = fadeOut() + shrinkVertically()
+            ) {
+                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    SettingsSwitchItem(
+                        title = stringResource(R.string.show_target_range),
+                        subtitle = stringResource(R.string.show_target_range_desc),
+                        checked = showTargetRange,
+                        onCheckedChange = { showTargetRange = it; save() },
+                        position = CardPosition.MIDDLE
+                    )
+                    SettingsSwitchItem(
+                        title = stringResource(R.string.notification_chart_pause_screen_off),
+                        subtitle = stringResource(R.string.notification_chart_pause_screen_off_summary),
+                        checked = pauseChartScreenOff,
+                        onCheckedChange = { pauseChartScreenOff = it; save() },
+                        position = CardPosition.BOTTOM
+                    )
+                }
+            }
+        }
+
+        val showRiskOptions = showIob || showCob
+        SectionLabel(
+            stringResource(R.string.notification_status_line_section),
+            topPadding = 16.dp,
+            modifier = Modifier.padding(horizontal = legacySettingsHorizontalPadding)
+        )
+        Column(
+            verticalArrangement = Arrangement.spacedBy(2.dp),
+            modifier = Modifier.padding(horizontal = legacySettingsHorizontalPadding)
+        ) {
+            SettingsSwitchItem(
+                title = stringResource(R.string.notification_show_delta_title),
+                subtitle = stringResource(R.string.notification_show_delta_minutes_desc, deltaIntervalMinutes),
+                checked = showDelta,
+                onCheckedChange = { showDelta = it; save() },
+                position = CardPosition.TOP
+            )
+            SettingsSwitchItem(
+                title = stringResource(R.string.notification_show_iob_title),
+                subtitle = stringResource(R.string.notification_show_iob_desc),
+                checked = showIob,
+                onCheckedChange = { showIob = it; save() },
+                position = CardPosition.MIDDLE
+            )
+            SettingsSwitchItem(
+                title = stringResource(R.string.notification_show_cob_title),
+                subtitle = stringResource(R.string.notification_show_cob_desc),
+                checked = showCob,
+                onCheckedChange = { showCob = it; save() },
+                position = if (showRiskOptions) CardPosition.MIDDLE else CardPosition.BOTTOM
+            )
+            AnimatedVisibility(
+                visible = showRiskOptions,
+                enter = fadeIn() + expandVertically(),
+                exit = fadeOut() + shrinkVertically()
+            ) {
+                SettingsSwitchItem(
+                    title = stringResource(R.string.notification_iob_cob_risk_title),
+                    subtitle = stringResource(R.string.notification_iob_cob_risk_desc),
+                    checked = iobCobRiskColored,
+                    onCheckedChange = { iobCobRiskColored = it; save() },
+                    position = if (iobCobRiskColored) CardPosition.MIDDLE else CardPosition.BOTTOM
+                )
+            }
+            AnimatedVisibility(
+                visible = showRiskOptions && iobCobRiskColored,
+                enter = fadeIn() + expandVertically(),
+                exit = fadeOut() + shrinkVertically()
+            ) {
+                SettingsSwitchItem(
+                    title = stringResource(R.string.notification_iob_risk_without_cob_title),
+                    subtitle = stringResource(R.string.notification_iob_risk_without_cob_desc),
+                    checked = iobRiskWithoutCob,
+                    onCheckedChange = { iobRiskWithoutCob = it; save() },
+                    position = CardPosition.BOTTOM
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun DisplayAndColorSettingsScreen(
+    navController: NavController,
+    viewModel: DashboardViewModel
+) {
+    val rangeColorsEnabled by viewModel.glucoseValueRangeColorsEnabled.collectAsStateWithLifecycle()
+    val arrowForecastEnabled by viewModel.glucoseArrowForecastColorsEnabled.collectAsStateWithLifecycle()
+    val chartRangeColorsEnabled by viewModel.glucoseChartRangeColorsEnabled.collectAsStateWithLifecycle()
+    val appChartRangeColorsEnabled by viewModel.glucoseAppChartRangeColorsEnabled.collectAsStateWithLifecycle()
+    val dashboardDeltaEnabled by viewModel.dashboardShowDelta.collectAsStateWithLifecycle()
+    val dashboardRowsDeltaEnabled by viewModel.dashboardRowsShowDelta.collectAsStateWithLifecycle()
+    val dashboardReadingAgeEnabled by viewModel.dashboardShowReadingAge.collectAsStateWithLifecycle()
+    val previewWindowMode by viewModel.previewWindowMode.collectAsStateWithLifecycle()
+    var showPreviewWindowDialog by rememberSaveable { mutableStateOf(false) }
+    val previewWindowLabel = when (previewWindowMode) {
+        1 -> stringResource(R.string.preview_window_always)
+        2 -> stringResource(R.string.preview_window_never)
+        else -> stringResource(R.string.preview_window_expanded_only)
+    }
+
+    LegacySettingsScaffold(
+        navController = navController,
+        title = stringResource(R.string.display_colors_title)
+    ) {
+        GlucoseRangeDisplaySettings(viewModel)
+
+        SectionLabel(
+            stringResource(R.string.glucose_palette_edit_title),
+            modifier = Modifier.padding(horizontal = legacySettingsHorizontalPadding)
+        )
+        Column(
+            verticalArrangement = Arrangement.spacedBy(2.dp),
+            modifier = Modifier.padding(horizontal = legacySettingsHorizontalPadding)
+        ) {
+            SettingsSwitchItem(
+                title = stringResource(R.string.glucose_range_colors_title),
+                subtitle = stringResource(R.string.glucose_range_colors_desc),
+                checked = rangeColorsEnabled,
+                onCheckedChange = { viewModel.setGlucoseValueRangeColorsEnabled(it) },
+                position = CardPosition.TOP
+            )
+            SettingsSwitchItem(
+                title = stringResource(R.string.glucose_arrow_forecast_title),
+                subtitle = stringResource(R.string.glucose_arrow_forecast_desc),
+                checked = arrowForecastEnabled,
+                onCheckedChange = { viewModel.setGlucoseArrowForecastColorsEnabled(it) },
+                position = CardPosition.MIDDLE
+            )
+            SettingsSwitchItem(
+                title = stringResource(R.string.glucose_chart_range_colors_title),
+                subtitle = stringResource(R.string.glucose_chart_range_colors_desc),
+                checked = chartRangeColorsEnabled,
+                onCheckedChange = { viewModel.setGlucoseChartRangeColorsEnabled(it) },
+                position = CardPosition.MIDDLE
+            )
+            SettingsSwitchItem(
+                title = stringResource(R.string.glucose_app_chart_range_colors_title),
+                subtitle = stringResource(R.string.glucose_app_chart_range_colors_desc),
+                checked = appChartRangeColorsEnabled,
+                onCheckedChange = { viewModel.setGlucoseAppChartRangeColorsEnabled(it) },
+                position = CardPosition.BOTTOM
+            )
+        }
+
+        SectionLabel(
+            stringResource(R.string.display_readouts_section),
+            modifier = Modifier.padding(horizontal = legacySettingsHorizontalPadding)
+        )
+        Column(
+            verticalArrangement = Arrangement.spacedBy(2.dp),
+            modifier = Modifier.padding(horizontal = legacySettingsHorizontalPadding)
+        ) {
+            SettingsItem(
+                title = stringResource(R.string.preview_window_title),
+                subtitle = previewWindowLabel,
+                icon = Icons.Default.CropSquare,
+                iconTint = MaterialTheme.colorScheme.primary,
+                position = CardPosition.TOP,
+                onClick = { showPreviewWindowDialog = true }
+            )
+            SettingsSwitchItem(
+                title = stringResource(R.string.dashboard_show_delta_title),
+                subtitle = stringResource(R.string.dashboard_show_delta_desc),
+                checked = dashboardDeltaEnabled,
+                onCheckedChange = { viewModel.setDashboardShowDelta(it) },
+                position = CardPosition.MIDDLE
+            )
+            SettingsSwitchItem(
+                title = stringResource(R.string.dashboard_rows_show_delta_title),
+                subtitle = stringResource(R.string.dashboard_rows_show_delta_desc),
+                checked = dashboardRowsDeltaEnabled,
+                onCheckedChange = { viewModel.setDashboardRowsShowDelta(it) },
+                position = CardPosition.MIDDLE
+            )
+            SettingsSwitchItem(
+                title = stringResource(R.string.dashboard_show_reading_age_title),
+                subtitle = stringResource(R.string.dashboard_show_reading_age_desc),
+                checked = dashboardReadingAgeEnabled,
+                onCheckedChange = { viewModel.setDashboardShowReadingAge(it) },
+                position = CardPosition.BOTTOM
+            )
+        }
+
+    }
+
+    if (showPreviewWindowDialog) {
+        PreviewWindowPickerDialog(
+            currentMode = previewWindowMode,
+            onSelect = {
+                viewModel.setPreviewWindowMode(it)
+                showPreviewWindowDialog = false
+            },
+            onDismiss = { showPreviewWindowDialog = false }
+        )
     }
 }
 
@@ -381,19 +483,19 @@ fun FloatingGlucoseSettingsScreen(
     val context = LocalContext.current
     val repository = remember { viewModel.floatingRepository }
 
-    val isEnabled by repository.isEnabled.collectAsState(initial = false)
-    val isTransparent by repository.isTransparent.collectAsState(initial = false)
-    val showSecondary by repository.showSecondary.collectAsState(initial = false)
-    val fontSource by repository.fontSource.collectAsState(initial = "APP")
-    val fontSize by repository.fontSize.collectAsState(initial = FloatingSettingsRepository.DEFAULT_FONT_SIZE)
-    val fontWeight by repository.fontWeight.collectAsState(initial = "REGULAR")
-    val showArrow by repository.showArrow.collectAsState(initial = true)
-    val cornerRadius by repository.cornerRadius.collectAsState(initial = 28f)
-    val opacity by repository.backgroundOpacity.collectAsState(initial = FloatingSettingsRepository.DEFAULT_BACKGROUND_OPACITY)
-    val isDynamicIsland by repository.isDynamicIslandEnabled.collectAsState(initial = false)
-    val verticalOffset by repository.islandVerticalOffset.collectAsState(initial = FloatingSettingsRepository.DEFAULT_ISLAND_VERTICAL_OFFSET)
-    val manualGap by repository.islandGap.collectAsState(initial = 0f)
-    val useSubtleOutline by repository.useSubtleOutline.collectAsState(initial = false)
+    val isEnabled by repository.isEnabled.collectAsStateWithLifecycle(initialValue = false)
+    val isTransparent by repository.isTransparent.collectAsStateWithLifecycle(initialValue = false)
+    val showSecondary by repository.showSecondary.collectAsStateWithLifecycle(initialValue = false)
+    val fontSource by repository.fontSource.collectAsStateWithLifecycle(initialValue = "APP")
+    val fontSize by repository.fontSize.collectAsStateWithLifecycle(initialValue = FloatingSettingsRepository.DEFAULT_FONT_SIZE)
+    val fontWeight by repository.fontWeight.collectAsStateWithLifecycle(initialValue = "REGULAR")
+    val showArrow by repository.showArrow.collectAsStateWithLifecycle(initialValue = true)
+    val cornerRadius by repository.cornerRadius.collectAsStateWithLifecycle(initialValue = 28f)
+    val opacity by repository.backgroundOpacity.collectAsStateWithLifecycle(initialValue = FloatingSettingsRepository.DEFAULT_BACKGROUND_OPACITY)
+    val isDynamicIsland by repository.isDynamicIslandEnabled.collectAsStateWithLifecycle(initialValue = false)
+    val verticalOffset by repository.islandVerticalOffset.collectAsStateWithLifecycle(initialValue = FloatingSettingsRepository.DEFAULT_ISLAND_VERTICAL_OFFSET)
+    val manualGap by repository.islandGap.collectAsStateWithLifecycle(initialValue = 0f)
+    val useSubtleOutline by repository.useSubtleOutline.collectAsStateWithLifecycle(initialValue = false)
     var hasPermission by remember { mutableStateOf(Settings.canDrawOverlays(context)) }
 
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
@@ -455,12 +557,16 @@ fun FloatingGlucoseSettingsScreen(
                 FilterChip(
                     selected = !isTransparent,
                     onClick = { repository.setTransparent(false) },
-                    label = { Text(stringResource(R.string.filled)) }
+                    label = { Text(stringResource(R.string.filled)) },
+                    shapes = FilterChipDefaults.shapes(),
+                    colors = FilterChipDefaults.filterChipColors()
                 )
                 FilterChip(
                     selected = isTransparent,
                     onClick = { repository.setTransparent(true) },
-                    label = { Text(stringResource(R.string.transparent)) }
+                    label = { Text(stringResource(R.string.transparent)) },
+                    shapes = FilterChipDefaults.shapes(),
+                    colors = FilterChipDefaults.filterChipColors()
                 )
         }
 
@@ -581,12 +687,16 @@ fun FloatingGlucoseSettingsScreen(
                 FilterChip(
                     selected = fontSource == "APP",
                     onClick = { repository.setFontSource("APP") },
-                    label = { Text(stringResource(R.string.font_app_plex)) }
+                    label = { Text(stringResource(R.string.font_app_plex)) },
+                    shapes = FilterChipDefaults.shapes(),
+                    colors = FilterChipDefaults.filterChipColors()
                 )
                 FilterChip(
                     selected = fontSource == "SYSTEM",
                     onClick = { repository.setFontSource("SYSTEM") },
-                    label = { Text(stringResource(R.string.font_system_sans)) }
+                    label = { Text(stringResource(R.string.font_system_sans)) },
+                    shapes = FilterChipDefaults.shapes(),
+                    colors = FilterChipDefaults.filterChipColors()
                 )
         }
 
@@ -620,7 +730,9 @@ fun FloatingGlucoseSettingsScreen(
                 FilterChip(
                     selected = fontWeight == weight,
                     onClick = { repository.setFontWeight(weight) },
-                    label = { Text(stringResource(labelRes)) }
+                    label = { Text(stringResource(labelRes)) },
+                    shapes = FilterChipDefaults.shapes(),
+                    colors = FilterChipDefaults.filterChipColors()
                 )
             }
         }
@@ -646,6 +758,14 @@ fun AodSettingsScreen(navController: NavController) {
     var alignment by rememberSaveable { mutableStateOf(prefs.getString("aod_alignment", "CENTER") ?: "CENTER") }
     var fontSource by rememberSaveable { mutableStateOf(prefs.getString("aod_font_source", "APP") ?: "APP") }
     var fontWeight by rememberSaveable { mutableIntStateOf(prefs.getInt("aod_font_weight", 400)) }
+    var showOnLockscreen by rememberSaveable {
+        mutableStateOf(
+            prefs.getBoolean(
+                AODOverlayService.PREF_SHOW_ON_LOCKSCREEN,
+                AODOverlayService.DEFAULT_SHOW_ON_LOCKSCREEN
+            )
+        )
+    }
 
     fun save() {
         prefs.edit()
@@ -660,6 +780,7 @@ fun AodSettingsScreen(navController: NavController) {
             .putString("aod_alignment", alignment)
             .putString("aod_font_source", fontSource)
             .putInt("aod_font_weight", fontWeight)
+            .putBoolean(AODOverlayService.PREF_SHOW_ON_LOCKSCREEN, showOnLockscreen)
             .apply()
     }
 
@@ -686,6 +807,23 @@ fun AodSettingsScreen(navController: NavController) {
             modifier = Modifier.padding(horizontal = legacySettingsHorizontalPadding)
         )
 
+        Spacer(Modifier.height(8.dp))
+        SettingsSwitchItem(
+            title = stringResource(R.string.aod_show_on_lockscreen),
+            subtitle = stringResource(R.string.aod_show_on_lockscreen_desc),
+            checked = showOnLockscreen,
+            onCheckedChange = {
+                showOnLockscreen = it
+                save()
+                context.sendBroadcast(
+                    Intent(AODOverlayService.ACTION_IMMEDIATE_REFRESH).setPackage(context.packageName)
+                )
+            },
+            icon = Icons.Default.Lock,
+            position = CardPosition.SINGLE,
+            modifier = Modifier.padding(horizontal = legacySettingsHorizontalPadding)
+        )
+
         Spacer(Modifier.height(24.dp))
         Text(
             stringResource(R.string.visuals),
@@ -706,12 +844,16 @@ fun AodSettingsScreen(navController: NavController) {
             FilterChip(
                 selected = fontSource == "APP",
                 onClick = { fontSource = "APP"; save() },
-                label = { Text(stringResource(R.string.font_app_plex)) }
+                label = { Text(stringResource(R.string.font_app_plex)) },
+                shapes = FilterChipDefaults.shapes(),
+                colors = FilterChipDefaults.filterChipColors()
             )
             FilterChip(
                 selected = fontSource == "SYSTEM",
                 onClick = { fontSource = "SYSTEM"; save() },
-                label = { Text(stringResource(R.string.font_system_google_sans)) }
+                label = { Text(stringResource(R.string.font_system_google_sans)) },
+                shapes = FilterChipDefaults.shapes(),
+                colors = FilterChipDefaults.filterChipColors()
             )
         }
 
@@ -733,7 +875,9 @@ fun AodSettingsScreen(navController: NavController) {
                 FilterChip(
                     selected = fontWeight == weight,
                     onClick = { fontWeight = weight; save() },
-                    label = { Text(label) }
+                    label = { Text(label) },
+                    shapes = FilterChipDefaults.shapes(),
+                    colors = FilterChipDefaults.filterChipColors()
                 )
             }
         }
@@ -770,7 +914,9 @@ fun AodSettingsScreen(navController: NavController) {
                     label = { Text(stringResource(labelRes)) },
                     leadingIcon = if (positions.contains(pos)) {
                         { Icon(Icons.Default.Check, null, Modifier.size(16.dp)) }
-                    } else null
+                    } else null,
+                    shapes = FilterChipDefaults.shapes(),
+                    colors = FilterChipDefaults.filterChipColors()
                 )
             }
         }
@@ -790,7 +936,9 @@ fun AodSettingsScreen(navController: NavController) {
                 FilterChip(
                     selected = alignment == align,
                     onClick = { alignment = align; save() },
-                    label = { Text(stringResource(labelRes)) }
+                    label = { Text(stringResource(labelRes)) },
+                    shapes = FilterChipDefaults.shapes(),
+                    colors = FilterChipDefaults.filterChipColors()
                 )
             }
         }
@@ -870,14 +1018,9 @@ private fun LegacySettingsScaffold(
     Scaffold(
         contentWindowInsets = WindowInsets(0.dp),
         topBar = {
-            TopAppBar(
-                title = { Text(title) },
-                navigationIcon = {
-                    IconButton(onClick = { navController.popBackStack() }) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = stringResource(R.string.navigate_back))
-                    }
-                },
-                colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent)
+            AppTopBar(
+                title = title,
+                onNavigateBack = { navController.popBackStack() },
             )
         }
     ) { padding ->
@@ -932,7 +1075,7 @@ private fun WarningPanel(text: String, modifier: Modifier = Modifier) {
     }
 }
 
-private fun isAodAccessibilityEnabled(context: Context): Boolean {
+internal fun isAodAccessibilityEnabled(context: Context): Boolean {
     val manager = context.getSystemService(Context.ACCESSIBILITY_SERVICE) as android.view.accessibility.AccessibilityManager
     return manager.getEnabledAccessibilityServiceList(AccessibilityServiceInfo.FEEDBACK_ALL_MASK).any { info ->
         info.resolveInfo?.serviceInfo?.packageName == context.packageName &&

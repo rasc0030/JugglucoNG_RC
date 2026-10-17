@@ -37,6 +37,8 @@ object GlucosePaletteState {
 
     fun override(band: Band): Int? = GlucoseRangeColors.getOverride(band)
 
+    fun targetBackgroundOverride(): Int? = GlucoseRangeColors.getTargetBackgroundOverride()
+
     fun hasAnyOverride(): Boolean = GlucoseRangeColors.hasAnyOverride()
 
     private fun prefs(context: Context) =
@@ -60,9 +62,22 @@ object GlucosePaletteState {
         refreshNotification()
     }
 
+    fun setTargetBackgroundOverride(context: Context, argb: Int?) {
+        prefs(context).edit {
+            if (argb == null) {
+                remove(GlucoseRangeColors.PREF_TARGET_BACKGROUND)
+            } else {
+                putInt(GlucoseRangeColors.PREF_TARGET_BACKGROUND, argb)
+            }
+        }
+        GlucoseRangeColors.setTargetBackgroundOverride(argb)
+        refreshNotification()
+    }
+
     fun clearOverrides(context: Context) {
         prefs(context).edit {
             GlucoseRangeColors.PREF_OVERRIDE_KEYS.forEach { remove(it) }
+            remove(GlucoseRangeColors.PREF_TARGET_BACKGROUND)
         }
         GlucoseRangeColors.clearOverrides()
         refreshNotification()
@@ -71,10 +86,12 @@ object GlucosePaletteState {
     // Compose recomposes on its own via [revision], but the ongoing notification
     // is a rendered bitmap that only refreshes on a new reading. Repaint it now
     // so a palette change is visible there immediately, not minutes later.
+    // The watch mirrors the same scheme, and only learns of a change when told.
     private fun refreshNotification() {
         try {
             tk.glucodata.Notify.showoldglucose()
         } catch (_: Throwable) {
         }
+        tk.glucodata.GlucoseColorSync.push()
     }
 }

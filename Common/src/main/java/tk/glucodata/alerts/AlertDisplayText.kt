@@ -9,9 +9,14 @@ package tk.glucodata.alerts
 object AlertDisplayText {
 
     // These alerts embed a duration/lead time in their message ("Sensor expires
-    // in 12 hours", "Missed reading - 30 min"); the numbers ARE the payload.
+    // in 12 hours", "Missed reading - 30 min", "Forecast low: 33 mg/dL (30 min)");
+    // the numbers ARE the payload. The forecast horizon is a number too -
+    // stripping digits turned the title into "Forecast low:  ( min)".
     private fun carriesDurationNumbers(type: AlertType?): Boolean =
-        type == AlertType.SENSOR_EXPIRY || type == AlertType.MISSED_READING
+        type == AlertType.SENSOR_EXPIRY ||
+            type == AlertType.MISSED_READING ||
+            type == AlertType.PRE_LOW ||
+            type == AlertType.PRE_HIGH
 
     /**
      * Badge/title of the separate alert notification. Glucose-carrying messages
@@ -30,6 +35,23 @@ object AlertDisplayText {
             .replace("mg/dL", "", ignoreCase = true)
             .trim()
         return cleaned.ifEmpty { message }
+    }
+
+    /**
+     * Value shown for a triggered alert on the alarm screen and the separate
+     * notification. A usable reading is rendered by the caller-supplied
+     * formatter; without one the snapshot's preformatted string is reused. A
+     * message-only alert (no reading at all: NaN value, blank snapshot) shows
+     * no value - never the literal "NaN", a stale figure, or a fabricated one.
+     * Values at or below the 0.1 sentinel count as absent, like the legacy
+     * "wasvalue" convention.
+     */
+    @JvmStatic
+    fun alarmDisplayValue(glvalue: Float, snapshotValue: String?, formatValue: (Float) -> String): String {
+        if (glvalue.isFinite() && glvalue > 0.1f) {
+            return formatValue(glvalue)
+        }
+        return snapshotValue?.takeIf { it.isNotBlank() } ?: ""
     }
 
     /**

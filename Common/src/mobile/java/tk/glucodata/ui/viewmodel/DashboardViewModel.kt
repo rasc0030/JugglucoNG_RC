@@ -12,8 +12,15 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.distinctUntilChangedBy
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.emitAll
+import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 import tk.glucodata.Natives
 import tk.glucodata.UiRefreshBus
@@ -35,6 +42,11 @@ import tk.glucodata.data.journal.JournalFood
 import tk.glucodata.data.journal.JournalFoodInput
 import tk.glucodata.data.journal.JournalInsulinPreset
 import tk.glucodata.data.journal.JournalInsulinPresetInput
+import tk.glucodata.data.journal.JournalHumanProfile
+import tk.glucodata.data.prediction.DoseTarget
+import tk.glucodata.data.prediction.PredictionModelProfile
+import tk.glucodata.data.prediction.PredictionModelProfileStore
+import tk.glucodata.data.prediction.StateDoseHintCalculator
 import tk.glucodata.ui.GlucosePoint
 import tk.glucodata.ui.util.inDisplayUnit
 import tk.glucodata.data.journal.JournalRepository
@@ -43,17 +55,50 @@ import tk.glucodata.alerts.CustomAlertRepository
 import tk.glucodata.drivers.ManagedSensorRuntime
 import tk.glucodata.drivers.ManagedSensorStatusPolicy
 import tk.glucodata.drivers.ManagedSensorUiFamily
+import tk.glucodata.drivers.aidex.native.protocol.AiDexWearProfile
 import tk.glucodata.ui.util.resolveDashboardSensorStatus
 import kotlin.math.roundToInt
 
 internal object DashboardHistoryCollectionPolicy {
-    fun usesMergedCrossSensorHistory(mode: DashboardViewModel.CollectionMode): Boolean =
-        mode == DashboardViewModel.CollectionMode.FULL_HISTORY
+    fun shouldCoalesceEmission(
+        mode: DashboardViewModel.CollectionMode,
+        hasSeenHistoryEmission: Boolean,
+    ): Boolean = mode == DashboardViewModel.CollectionMode.DASHBOARD && hasSeenHistoryEmission
 
-    fun shouldCoalesceEmission(mode: DashboardViewModel.CollectionMode, hasSeenHistoryEmission: Boolean): Boolean =
-        mode == DashboardViewModel.CollectionMode.DASHBOARD && hasSeenHistoryEmission
+    /**
+     * Whether the current sensor's stored history is behind enough to ask native
+     * for a re-sync — the pure core of `shouldRequestHistoryRecovery`.
+     *
+     * Every argument describes **the current sensor**. That is not a detail: the
+     * caller used to pass the dashboard's drawn history, which is now merged
+     * across sensors, and a retired sensor's newer rows would answer this
+     * question on the live sensor's behalf — reporting it up to date while it sat
+     * silent, so no re-sync was ever requested.
+     *
+     * @param requiredStartMs history must reach back at least this far; 0 means
+     *   no coverage requirement (a new sensor legitimately has no old rows).
+     * @param currentSnapshotTimeMs the live reading's time, or 0 when there is
+     *   none to compare against.
+     * @param snapshotIsSameSensor whether that live reading is this sensor's. A
+     *   reading from another sensor says nothing about this one's staleness.
+     */
+    fun shouldRequestHistoryRecovery(
+        requiredStartMs: Long,
+        oldestStoredMs: Long?,
+        latestStoredMs: Long?,
+        currentSnapshotTimeMs: Long,
+        snapshotIsSameSensor: Boolean,
+        coverageToleranceMs: Long,
+        tailToleranceMs: Long
+    ): Boolean {
+        if (oldestStoredMs == null || latestStoredMs == null) return true
+        if (requiredStartMs > 0L && oldestStoredMs > (requiredStartMs + coverageToleranceMs)) return true
+        if (currentSnapshotTimeMs <= 0L || !snapshotIsSameSensor) return false
+        return currentSnapshotTimeMs > (latestStoredMs + tailToleranceMs)
+    }
 }
 
+@OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 class DashboardViewModel(
     private val glucoseRepository: GlucoseRepository = GlucoseRepository(),
     private val journalRepository: JournalRepository = JournalRepository(),
@@ -66,7 +111,21 @@ class DashboardViewModel(
         val sampleHash: Int,
         val lastValueBits: Int,
         val lastRawBits: Int,
-        val lastSerial: String?
+        val lastSerial: String?,
+        /**
+         * How many points carry a credible interval, plus the newest one's
+         * bounds.
+         *
+         * Without this the cache is blind to uncertainty: a reading and its
+         * interval arrive in separate emissions, the second differs only in
+         * the band, the signature is unchanged, and the cached band-less list
+         * is returned — so the ribbon permanently stopped short of the live
+         * edge. Cheap to compute and it makes the cache key describe
+         * everything the chart actually draws.
+         */
+        val uncertaintyCount: Int,
+        val lastUncertaintyBits: Long,
+        val recordedDisplayHash: Int,
     )
 
     private data class DashboardHistoryCacheKey(
@@ -104,7 +163,23 @@ class DashboardViewModel(
     private companion object {
         const val TARGET_RANGE_DEFAULTS_MIGRATION_KEY = "target_range_defaults_v2"
         const val UI_RECOVERY_SYNC_MIN_INTERVAL_MS = 30_000L
+
+        /**
+         * How far back [currentSensorTail] reaches.
+         *
+         * Long enough for the trend regression, the Δ interval and the recovery
+         * check to have their inputs even after a gap, and short enough that it
+         * stays a handful of rows rather than a second scan of the store.
+         */
+        const val CURRENT_SENSOR_TAIL_WINDOW_MS = 6L * 60L * 60L * 1000L
         const val DASHBOARD_HISTORY_COALESCE_MS = 300L
+        /** The viewport assumed before the chart reports one; TimeRange.H3, the default. */
+        const val INITIAL_CHART_VIEWPORT_MS = 3L * 60L * 60L * 1000L
+        // Drivers request a data refresh per delivered batch, and dowithglucose
+        // requests one per non-main-sensor reading, so with three sensors these
+        // arrive far faster than the dashboard can usefully redraw. Matches the
+        // 1 s gate GlucoseUpdateBroadcaster already applies to the same signal.
+        private const val DASHBOARD_DATA_REFRESH_COALESCE_MS = 1_000L
         const val HISTORY_RECOVERY_TOLERANCE_MS = 5L * 60L * 1000L
         const val HISTORY_RECOVERY_TAIL_TOLERANCE_MS = 2L * 60L * 1000L
         const val DASHBOARD_PEER_HISTORY_WINDOW_MS = 72L * 60L * 60L * 1000L
@@ -120,17 +195,25 @@ class DashboardViewModel(
         const val CHART_RANGE_COLORS_KEY = "glucose_chart_range_colors_enabled"
         const val APP_CHART_RANGE_COLORS_KEY = "glucose_app_chart_range_colors_enabled"
         const val DASHBOARD_SHOW_DELTA_KEY = "dashboard_show_delta"
+        const val DASHBOARD_ROWS_SHOW_DELTA_KEY = "dashboard_rows_show_delta"
+        const val DASHBOARD_SHOW_READING_AGE_KEY = "dashboard_show_reading_age"
         const val DELTA_INTERVAL_KEY = "delta_interval_minutes"
         const val JOURNAL_HEALTH_CONNECT_ACTIVITY_KEY = "dashboard_journal_health_connect_activity_enabled"
-        const val PREDICTION_CARB_RATIO_KEY = "dashboard_prediction_carb_ratio_g_per_u"
-        const val PREDICTION_INSULIN_SENSITIVITY_KEY = "dashboard_prediction_insulin_sensitivity_mgdl_per_u"
-        const val PREDICTION_CARB_ABSORPTION_KEY = "dashboard_prediction_carb_absorption_g_per_h"
-        const val PREDICTION_HORIZON_MINUTES_KEY = "dashboard_prediction_horizon_minutes"
+        const val PREDICTION_CARB_RATIO_KEY = tk.glucodata.settings.KEY_PREDICTION_CARB_RATIO
+        const val PREDICTION_INSULIN_SENSITIVITY_KEY = tk.glucodata.settings.KEY_PREDICTION_INSULIN_SENSITIVITY
+        const val PREDICTION_HORIZON_MINUTES_KEY = tk.glucodata.settings.KEY_PREDICTION_HORIZON
         const val PREDICTION_NOTIFICATION_CHART_KEY = "dashboard_prediction_notification_chart_enabled"
-        const val PREDICTION_CARB_RATIO_DEFAULT = 10f
-        const val PREDICTION_INSULIN_SENSITIVITY_DEFAULT = 54f
-        const val PREDICTION_CARB_ABSORPTION_DEFAULT = 35f
-        const val PREDICTION_HORIZON_MINUTES_DEFAULT = 120
+        const val PREDICTION_DOSE_TARGET_KEY = "dashboard_prediction_dose_target_mgdl"
+        const val STATE_DOSE_HINT_KEY = "dashboard_state_dose_hint_enabled"
+        const val STATE_DOSE_HINT_HORIZON_KEY = "dashboard_state_dose_hint_horizon_minutes"
+        const val STATE_DOSE_HINT_PROFILE_NOTICE_KEY = "dashboard_state_dose_hint_profile_notice_ack"
+        const val STATE_DOSE_HINT_IN_RANGE_KEY = "dashboard_state_dose_hint_in_range_enabled"
+        const val PREDICTION_CARB_RATIO_DEFAULT = tk.glucodata.settings.DEFAULT_PREDICTION_CARB_RATIO_G_PER_U
+        const val PREDICTION_INSULIN_SENSITIVITY_DEFAULT =
+            tk.glucodata.settings.DEFAULT_PREDICTION_INSULIN_SENSITIVITY_MGDL_PER_U
+        const val PREDICTION_CARB_ABSORPTION_DEFAULT =
+            tk.glucodata.settings.DEFAULT_PREDICTION_CARB_ABSORPTION_G_PER_H
+        const val PREDICTION_HORIZON_MINUTES_DEFAULT = tk.glucodata.settings.DEFAULT_PREDICTION_HORIZON_MINUTES
 
         private val processUiRecoveryLock = Any()
         private val processHistoryRecoveryLock = Any()
@@ -197,12 +280,52 @@ class DashboardViewModel(
     private val _broadcastComputedTrend = MutableStateFlow(false)
     val broadcastComputedTrend = _broadcastComputedTrend.asStateFlow()
 
+    private val _xdripReportAsLibre2 = MutableStateFlow(false)
+    val xdripReportAsLibre2 = _xdripReportAsLibre2.asStateFlow()
+
+    /**
+     * The chart's line: every sensor that covers the visible window, merged.
+     *
+     * Not the same list as [currentSensorTail], and the difference is the whole
+     * point — see that property.
+     */
     private val _glucoseHistory = MutableStateFlow<List<tk.glucodata.ui.GlucosePoint>>(emptyList())
     val glucoseHistory = _glucoseHistory.asStateFlow()
+
+    /**
+     * The current sensor's own recent readings, never merged with any other.
+     *
+     * Deliberately not a UI input. The one thing that needs it is the native
+     * history-recovery check: it asks "is this sensor behind?", and the merged
+     * list the dashboard draws can answer with a *different* sensor's newer
+     * reading, so a live sensor that has gone quiet looks up to date and no
+     * re-sync is requested.
+     *
+     * Everything the user sees — rows, hero, trend, Δ, prediction — reads
+     * [glucoseHistory], as it always has. Repointing those at this list changed
+     * which reading each row showed and how often the list identity churned, and
+     * regressed both. If you are about to wire a visible surface to this, that is
+     * the reason not to.
+     */
+    private val _currentSensorTail = MutableStateFlow<List<tk.glucodata.ui.GlucosePoint>>(emptyList())
 
     private val _multiSensorDisplay =
         MutableStateFlow(tk.glucodata.ui.MultiSensorDisplayData.EMPTY)
     val multiSensorDisplay = _multiSensorDisplay.asStateFlow()
+
+    /**
+     * Who is the main sensor, minute by minute, over the chart's history window.
+     *
+     * The chart draws what this says. See [tk.glucodata.chart.MainSensorOwnership]
+     * for the rule; this only keeps it current with the record and the selected
+     * primary.
+     */
+    private val _mainSensorOwnership = MutableStateFlow(tk.glucodata.chart.MainSensorOwnership.NONE)
+    val mainSensorOwnership = _mainSensorOwnership.asStateFlow()
+
+    private suspend fun refreshMainSensorOwnership(startTimeMs: Long) {
+        _mainSensorOwnership.value = historyRepository.mainSensorOwnership(startTime = startTimeMs)
+    }
 
     // Raw (display-unit) peer history kept separate from view-mode resolution so
     // the display data rebuilds when a peer's auto/raw mode changes natively,
@@ -219,14 +342,32 @@ class DashboardViewModel(
     val sensorViewModes = _sensorViewModes.asStateFlow()
 
     /**
-     * Cross-sensor merged history for the History browse screen. Includes
-     * previous sensor calibrated readings, CSV imports, and older device data,
-     * so the History route remains complete across sensor swaps. The live
-     * dashboard intentionally uses the per-sensor [glucoseHistory] above.
+     * The oldest and newest stored reading and the row count, across every
+     * sensor. What [glucoseHistory] used to be read end to end to learn — how
+     * far the chart may pan, what "latest" is, how far back a range selector
+     * reaches — now comes from here, and [glucoseHistory] holds only the
+     * stretches on screen.
      */
-    private val _historyScreenGlucoseHistory =
-        MutableStateFlow<List<tk.glucodata.ui.GlucosePoint>>(emptyList())
-    val historyScreenGlucoseHistory = _historyScreenGlucoseHistory.asStateFlow()
+    private val _timelineExtents = MutableStateFlow<tk.glucodata.data.TimelineExtents?>(null)
+    val timelineExtents = _timelineExtents.asStateFlow()
+
+    /**
+     * The stretch of the timeline the chart has asked for, via
+     * [onChartViewportChanged]; null until the chart has said where it is
+     * looking. See [TimelineWindowPolicy] for how it is sized.
+     */
+    private val _chartWindow = MutableStateFlow<TimelineWindow?>(null)
+
+    /** Where the always-loaded live tail starts; re-anchored as the clock moves on. */
+    private val _liveTailStart = MutableStateFlow(TimelineWindowPolicy.liveTailStart(System.currentTimeMillis()))
+
+    /**
+     * The current sensor's newest reading in display units, for surfaces that
+     * prefill from "the latest reading" of the sensor being calibrated. Not the
+     * merged timeline's newest point, which may be another sensor's.
+     */
+    private val _currentSensorLatestReading = MutableStateFlow<tk.glucodata.ui.GlucosePoint?>(null)
+    val currentSensorLatestReading = _currentSensorLatestReading.asStateFlow()
 
     private val _unit = MutableStateFlow("mg/dL")
     val unit = _unit.asStateFlow()
@@ -299,6 +440,30 @@ class DashboardViewModel(
     private val _journalDoseCalculatorEnabled = MutableStateFlow(false)
     val journalDoseCalculatorEnabled = _journalDoseCalculatorEnabled.asStateFlow()
 
+    // On by default. The amounts are only as good as the sensitivity and carb ratio in the
+    // model profile, but a hint the reader acts on is not the place to withhold information
+    // over that -- the profile is named once instead, see stateDoseHintProfileNoticeAck.
+    // Anyone who switched it off keeps that: the key is written on every toggle, so only an
+    // installation that never touched it takes the new default.
+    private val _stateDoseHintEnabled = MutableStateFlow(true)
+    val stateDoseHintEnabled = _stateDoseHintEnabled.asStateFlow()
+
+    // Its own switch rather than part of the rule: whether to correct inside the range is a
+    // matter of therapy style, and folding it in would push anyone who disagrees into
+    // switching the whole hint off, carb branch included.
+    private val _stateDoseHintCorrectInRange = MutableStateFlow(true)
+    val stateDoseHintCorrectInRange = _stateDoseHintCorrectInRange.asStateFlow()
+
+    private val _stateDoseHintProfileNoticeAck = MutableStateFlow(false)
+    val stateDoseHintProfileNoticeAck = _stateDoseHintProfileNoticeAck.asStateFlow()
+
+    private val _predictionModelProfileSaved = MutableStateFlow(false)
+    val predictionModelProfileSaved = _predictionModelProfileSaved.asStateFlow()
+
+    private val _stateDoseHintHorizonMinutes =
+        MutableStateFlow(StateDoseHintCalculator.HORIZON_MINUTES_DEFAULT)
+    val stateDoseHintHorizonMinutes = _stateDoseHintHorizonMinutes.asStateFlow()
+
     private val _journalFoodMacrosEnabled = MutableStateFlow(false)
     val journalFoodMacrosEnabled = _journalFoodMacrosEnabled.asStateFlow()
 
@@ -314,6 +479,9 @@ class DashboardViewModel(
     private val _journalDashboardQuickAddButton = MutableStateFlow(false)
     val journalDashboardQuickAddButton = _journalDashboardQuickAddButton.asStateFlow()
 
+    private val _journalBodyWeightKg = MutableStateFlow<Float?>(null)
+    val journalBodyWeightKg = _journalBodyWeightKg.asStateFlow()
+
     private val _glucoseValueRangeColorsEnabled = MutableStateFlow(false)
     val glucoseValueRangeColorsEnabled = _glucoseValueRangeColorsEnabled.asStateFlow()
 
@@ -328,6 +496,12 @@ class DashboardViewModel(
 
     private val _dashboardShowDelta = MutableStateFlow(false)
     val dashboardShowDelta = _dashboardShowDelta.asStateFlow()
+
+    private val _dashboardRowsShowDelta = MutableStateFlow(false)
+    val dashboardRowsShowDelta = _dashboardRowsShowDelta.asStateFlow()
+
+    private val _dashboardShowReadingAge = MutableStateFlow(false)
+    val dashboardShowReadingAge = _dashboardShowReadingAge.asStateFlow()
 
     private val _deltaIntervalMinutes = MutableStateFlow(tk.glucodata.GlucoseDelta.DEFAULT_INTERVAL_MINUTES)
     val deltaIntervalMinutes = _deltaIntervalMinutes.asStateFlow()
@@ -353,11 +527,23 @@ class DashboardViewModel(
     private val _predictionInsulinSensitivityMgDlPerUnit = MutableStateFlow(PREDICTION_INSULIN_SENSITIVITY_DEFAULT)
     val predictionInsulinSensitivityMgDlPerUnit = _predictionInsulinSensitivityMgDlPerUnit.asStateFlow()
 
+    private val _predictionModelProfile = MutableStateFlow(
+        PredictionModelProfile.single(
+            PREDICTION_CARB_RATIO_DEFAULT,
+            PREDICTION_INSULIN_SENSITIVITY_DEFAULT,
+            PREDICTION_CARB_ABSORPTION_DEFAULT
+        )
+    )
+    val predictionModelProfile = _predictionModelProfile.asStateFlow()
+
     private val _predictionCarbAbsorptionGramsPerHour = MutableStateFlow(PREDICTION_CARB_ABSORPTION_DEFAULT)
     val predictionCarbAbsorptionGramsPerHour = _predictionCarbAbsorptionGramsPerHour.asStateFlow()
 
     private val _predictionHorizonMinutes = MutableStateFlow(PREDICTION_HORIZON_MINUTES_DEFAULT)
     val predictionHorizonMinutes = _predictionHorizonMinutes.asStateFlow()
+
+    private val _predictionDoseTargetMgDl = MutableStateFlow(DoseTarget.DEFAULT_MGDL)
+    val predictionDoseTargetMgDl = _predictionDoseTargetMgDl.asStateFlow()
 
     private val _journalEntries = MutableStateFlow<List<JournalEntry>>(emptyList())
     val journalEntries = _journalEntries.asStateFlow()
@@ -367,6 +553,19 @@ class DashboardViewModel(
 
     private val _journalFoods = MutableStateFlow<List<JournalFood>>(emptyList())
     val journalFoods = _journalFoods.asStateFlow()
+
+    /**
+     * The reading each journal entry sits on, keyed by entry timestamp, in
+     * display units — see [JournalGlucoseAnchors]. Resolved from bounded reads
+     * around the entries, newest first, and kept for the life of the view
+     * model; entries near the live edge are re-resolved as readings land.
+     */
+    private val _journalGlucoseAnchors = MutableStateFlow<Map<Long, JournalGlucoseAnchor>>(emptyMap())
+    val journalGlucoseAnchors = _journalGlucoseAnchors.asStateFlow()
+    private val journalAnchorCache = HashMap<Long, JournalGlucoseAnchor>()
+    private var journalAnchorCacheUnit: String? = null
+    private var journalAnchorRewriteRevision = -1L
+    private var journalAnchorsJob: Job? = null
 
     private val _lowAlarmSoundMode = MutableStateFlow(0)
     val lowAlarmSoundMode = _lowAlarmSoundMode.asStateFlow()
@@ -380,15 +579,26 @@ class DashboardViewModel(
     private val _alertsMasterEnabled = MutableStateFlow(false)
     val alertsMasterEnabled = _alertsMasterEnabled.asStateFlow()
 
+    /** End of the running alarm quiet window, 0 when none: the dashboard's chip. */
+    val quietWindowUntilMs: kotlinx.coroutines.flow.StateFlow<Long> =
+        tk.glucodata.alerts.QuietWindow.state
+            .map { it.untilMs }
+            .stateIn(
+                viewModelScope,
+                kotlinx.coroutines.flow.SharingStarted.WhileSubscribed(5_000),
+                tk.glucodata.alerts.QuietWindow.state.value.untilMs
+            )
+
     private var collectionMode = CollectionMode.INACTIVE
     private var currentReadingJob: Job? = null
     private var historyJob: Job? = null
     private var multiSensorHistoryJob: Job? = null
-    private var historyScreenJob: Job? = null
+    private var timelineExtentsJob: Job? = null
     private var uiRefreshJob: Job? = null
     private var journalEntriesJob: Job? = null
     private var journalPresetsJob: Job? = null
     private var journalFoodsJob: Job? = null
+    private var currentSensorTailJob: Job? = null
     private var activeHistoryMode: CollectionMode? = null
     private var activeHistoryStartTimeMs: Long? = null
 
@@ -418,7 +628,9 @@ class DashboardViewModel(
     private fun stopJournalEntriesObservation() {
         journalEntriesJob?.cancel()
         journalEntriesJob = null
-        _journalEntries.value = emptyList()
+        // The enabled state controls visibility at the UI boundary. Keep the
+        // last Room emission while observation is paused so a receiver or
+        // sensor-mode refresh cannot masquerade as an empty database.
     }
 
     private fun ensureJournalPresetsObserved() {
@@ -496,9 +708,18 @@ class DashboardViewModel(
         val serial = preferredDashboardSensorId()?.takeIf { it.isNotBlank() }
         val historyStartTimeMs = activeHistoryStartTimeMs
         val current = resolveCurrentForHistoryRecovery(serial)
+        // Decide from the store, not the retained tail: the retained list
+        // predates the hide, so its hours-old timestamps would read as "sensor
+        // behind" and fire a BLE history pull plus chunked backfill replay on
+        // every return after idle. The restarted tail flow re-evaluates with
+        // live data right after anyway.
+        val decisionTail = runCatching {
+            val tailStartMs = (System.currentTimeMillis() - CURRENT_SENSOR_TAIL_WINDOW_MS).coerceAtLeast(0L)
+            glucoseRepository.getCurrentSensorTailFlowRaw(tailStartMs).first()
+        }.getOrDefault(_currentSensorTail.value)
         val shouldPreferHistoryRecovery = serial != null &&
             historyStartTimeMs != null &&
-            shouldRequestHistoryRecovery(historyStartTimeMs, _glucoseHistory.value, serial, current)
+            shouldRequestHistoryRecovery(historyStartTimeMs, decisionTail, serial, current)
 
         if (!shouldPreferHistoryRecovery) {
             glucoseRepository.syncLatestNativeReadingOnce()
@@ -512,9 +733,30 @@ class DashboardViewModel(
     private fun ensureUiRefreshCollection() {
         if (uiRefreshJob?.isActive == true) return
         uiRefreshJob = viewModelScope.launch {
+            // Leading edge fires immediately so a single reading still feels live;
+            // a burst collapses into one trailing refresh instead of running
+            // refreshDashboardSettings + refreshSensorSnapshot +
+            // refreshCurrentDisplaySnapshot once per event.
+            var lastDataRefreshMs = 0L
+            var trailingRefresh: Job? = null
             UiRefreshBus.events.collect { event ->
                 when (event) {
-                    UiRefreshBus.Event.DataChanged -> refreshData()
+                    UiRefreshBus.Event.DataChanged -> {
+                        val now = SystemClock.elapsedRealtime()
+                        val sinceLast = now - lastDataRefreshMs
+                        if (sinceLast >= DASHBOARD_DATA_REFRESH_COALESCE_MS) {
+                            trailingRefresh?.cancel()
+                            trailingRefresh = null
+                            lastDataRefreshMs = now
+                            refreshData()
+                        } else if (trailingRefresh?.isActive != true) {
+                            trailingRefresh = launch {
+                                delay(DASHBOARD_DATA_REFRESH_COALESCE_MS - sinceLast)
+                                lastDataRefreshMs = SystemClock.elapsedRealtime()
+                                refreshData()
+                            }
+                        }
+                    }
                     UiRefreshBus.Event.StatusOnly -> refreshStatusOnly()
                 }
             }
@@ -607,36 +849,54 @@ class DashboardViewModel(
         _journalEnabled.value = journalEnabled
         _journalNavigationTabEnabled.value = prefs.getBoolean(JOURNAL_NAVIGATION_TAB_KEY, false)
         _journalDoseCalculatorEnabled.value = prefs.getBoolean(JOURNAL_DOSE_CALCULATOR_KEY, false)
+        _stateDoseHintEnabled.value = prefs.getBoolean(STATE_DOSE_HINT_KEY, true)
+        _stateDoseHintCorrectInRange.value = prefs.getBoolean(STATE_DOSE_HINT_IN_RANGE_KEY, true)
+        _stateDoseHintProfileNoticeAck.value = prefs.getBoolean(STATE_DOSE_HINT_PROFILE_NOTICE_KEY, false)
+        _stateDoseHintHorizonMinutes.value = prefs
+            .getInt(STATE_DOSE_HINT_HORIZON_KEY, StateDoseHintCalculator.HORIZON_MINUTES_DEFAULT)
+            .coerceIn(
+                StateDoseHintCalculator.HORIZON_MINUTES_MIN,
+                StateDoseHintCalculator.HORIZON_MINUTES_MAX
+            )
         _journalFoodMacrosEnabled.value = prefs.getBoolean(JOURNAL_FOOD_MACROS_KEY, false)
         _journalFoodLibraryEnabled.value = prefs.getBoolean(JOURNAL_FOOD_LIBRARY_KEY, true)
         _journalEiobDisplayEnabled.value = prefs.getBoolean(JOURNAL_EIOB_DISPLAY_KEY, true)
         _journalQuickAddAlwaysNow.value = prefs.getBoolean(JOURNAL_QUICKADD_ALWAYS_NOW_KEY, false)
         _journalDashboardQuickAddButton.value = prefs.getBoolean(JOURNAL_DASHBOARD_QUICKADD_KEY, false)
+        _journalBodyWeightKg.value = JournalHumanProfile.bodyWeightKg(context)
         _glucoseValueRangeColorsEnabled.value = prefs.getBoolean(GLUCOSE_RANGE_COLORS_KEY, false)
         _glucoseArrowForecastColorsEnabled.value = prefs.getBoolean(ARROW_FORECAST_COLORS_KEY, false)
         _glucoseChartRangeColorsEnabled.value = prefs.getBoolean(CHART_RANGE_COLORS_KEY, false)
         _glucoseAppChartRangeColorsEnabled.value = prefs.getBoolean(APP_CHART_RANGE_COLORS_KEY, false)
         _dashboardShowDelta.value = prefs.getBoolean(DASHBOARD_SHOW_DELTA_KEY, false)
+        _dashboardRowsShowDelta.value = prefs.getBoolean(DASHBOARD_ROWS_SHOW_DELTA_KEY, false)
+        _dashboardShowReadingAge.value = prefs.getBoolean(DASHBOARD_SHOW_READING_AGE_KEY, false)
         _deltaIntervalMinutes.value = tk.glucodata.GlucoseDelta.sanitizeIntervalMinutes(
             prefs.getInt(DELTA_INTERVAL_KEY, tk.glucodata.GlucoseDelta.DEFAULT_INTERVAL_MINUTES)
         )
         _journalHealthConnectActivityEnabled.value = prefs.getBoolean(JOURNAL_HEALTH_CONNECT_ACTIVITY_KEY, false)
         _aapsJournalImportEnabled.value = AapsJournalImport.isEnabled(context)
-        _predictiveSimulationEnabled.value = prefs.getBoolean("dashboard_predictive_simulation_enabled", true)
+        _predictiveSimulationEnabled.value =
+            tk.glucodata.settings.SettingsRegistry.PREDICTION_ENABLED.readBool(prefs)
         _predictiveSimulationNotificationChartEnabled.value = prefs.getBoolean(PREDICTION_NOTIFICATION_CHART_KEY, true)
-        _predictionTrendMomentumEnabled.value = prefs.getBoolean("dashboard_prediction_trend_momentum_enabled", true)
-        _predictionCarbRatioGramsPerUnit.value = prefs
-            .getFloat(PREDICTION_CARB_RATIO_KEY, PREDICTION_CARB_RATIO_DEFAULT)
-            .coerceIn(3f, 30f)
-        _predictionInsulinSensitivityMgDlPerUnit.value = prefs
-            .getFloat(PREDICTION_INSULIN_SENSITIVITY_KEY, PREDICTION_INSULIN_SENSITIVITY_DEFAULT)
-            .coerceIn(10f, 180f)
-        _predictionCarbAbsorptionGramsPerHour.value = prefs
-            .getFloat(PREDICTION_CARB_ABSORPTION_KEY, PREDICTION_CARB_ABSORPTION_DEFAULT)
-            .coerceIn(10f, 90f)
-        _predictionHorizonMinutes.value = prefs
-            .getInt(PREDICTION_HORIZON_MINUTES_KEY, PREDICTION_HORIZON_MINUTES_DEFAULT)
-            .coerceIn(30, 360)
+        _predictionTrendMomentumEnabled.value =
+            tk.glucodata.settings.SettingsRegistry.PREDICTION_TREND_MOMENTUM.readBool(prefs)
+        _predictionCarbRatioGramsPerUnit.value =
+            tk.glucodata.settings.SettingsRegistry.PREDICTION_CARB_RATIO.readFloatClamped(prefs)
+        _predictionInsulinSensitivityMgDlPerUnit.value =
+            tk.glucodata.settings.SettingsRegistry.PREDICTION_INSULIN_SENSITIVITY.readFloatClamped(prefs)
+        _predictionModelProfile.value = PredictionModelProfileStore.load(prefs)
+        _predictionModelProfileSaved.value = PredictionModelProfileStore.isSaved(prefs)
+        _predictionCarbRatioGramsPerUnit.value = _predictionModelProfile.value.blocks.first().carbRatioGramsPerUnit
+        _predictionInsulinSensitivityMgDlPerUnit.value =
+            _predictionModelProfile.value.blocks.first().insulinSensitivityMgDlPerUnit
+        _predictionCarbAbsorptionGramsPerHour.value =
+            _predictionModelProfile.value.blocks.first().carbAbsorptionGramsPerHour
+        _predictionHorizonMinutes.value =
+            tk.glucodata.settings.SettingsRegistry.PREDICTION_HORIZON.readIntClamped(prefs)
+        _predictionDoseTargetMgDl.value = prefs
+            .getFloat(PREDICTION_DOSE_TARGET_KEY, DoseTarget.DEFAULT_MGDL)
+            .coerceIn(DoseTarget.MIN_MGDL, DoseTarget.MAX_MGDL)
         if (journalEnabled) {
             ensureJournalEntriesObserved()
         } else if (journalEntriesJob != null) {
@@ -653,6 +913,7 @@ class DashboardViewModel(
         _patchedLibreBroadcastEnabled.value = Natives.getlibrelinkused()
         _glucodataBroadcastEnabled.value = Natives.getJugglucobroadcast()
         _broadcastComputedTrend.value = prefs.getBoolean(tk.glucodata.BroadcastTrendRate.PREF_KEY, false)
+        _xdripReportAsLibre2.value = prefs.getBoolean(tk.glucodata.XdripReportAsLibre2.PREF_KEY, false)
 
         _hasLowAlarm.value = Natives.hasalarmlow()
         _lowAlarmThreshold.value = Natives.alarmlow()
@@ -733,7 +994,7 @@ class DashboardViewModel(
                 if (managedSnapshot?.uiFamily == ManagedSensorUiFamily.AIDEX ||
                     sName.startsWith("X-", ignoreCase = true)
                 ) {
-                    15
+                    AiDexWearProfile.ratedDays(managedSnapshot?.vendorModel) ?: 15
                 } else {
                     14
                 }
@@ -758,6 +1019,9 @@ class DashboardViewModel(
                     sensorRemainingHours = managedSnapshot?.sensorRemainingHours ?: -1,
                     sensorAgeHours = managedSnapshot?.sensorAgeHours ?: -1,
                     fallbackDurationDays = fallbackDurationDays,
+                    allowExpectedEndOverrun = managedSnapshot?.uiFamily == ManagedSensorUiFamily.ANYTIME &&
+                        managedSnapshot.expectedEndMs > 0L &&
+                        !managedSnapshot.isSensorExpired,
                     nowMs = System.currentTimeMillis()
                 )
                 _sensorProgress.value = lifecycle.progress
@@ -774,6 +1038,9 @@ class DashboardViewModel(
                     sensorRemainingHours = managedSnapshot?.sensorRemainingHours ?: -1,
                     sensorAgeHours = managedSnapshot?.sensorAgeHours ?: -1,
                     fallbackDurationDays = fallbackDurationDays,
+                    allowExpectedEndOverrun = managedSnapshot?.uiFamily == ManagedSensorUiFamily.ANYTIME &&
+                        managedSnapshot.expectedEndMs > 0L &&
+                        !managedSnapshot.isSensorExpired,
                     nowMs = System.currentTimeMillis()
                 )
                 _sensorProgress.value = lifecycle.progress
@@ -820,16 +1087,17 @@ class DashboardViewModel(
     }
 
     private fun refreshCurrentDisplaySnapshot() {
-        refreshCurrentDisplayAfterSmoothingChange()
+        CurrentDisplaySource.resolveCurrent(
+            maxAgeMillis = Notify.glucosetimeout,
+            preferredSensorId = preferredDashboardSensorId()
+        )?.let { resolved ->
+            _currentGlucose.value = resolved.primaryStr
+            _currentRate.value = resolved.rate.takeIf { it.isFinite() } ?: 0f
+        }
     }
 
     private fun startHistoryCollectionForMode(mode: CollectionMode) {
         val recoveryStartTimeMs = when (mode) {
-            CollectionMode.INACTIVE -> return
-            CollectionMode.DASHBOARD -> 0L
-            CollectionMode.FULL_HISTORY -> 0L
-        }
-        val queryStartTimeMs = when (mode) {
             CollectionMode.INACTIVE -> return
             CollectionMode.DASHBOARD -> 0L
             CollectionMode.FULL_HISTORY -> 0L
@@ -840,45 +1108,79 @@ class DashboardViewModel(
         if (historyJob?.isActive == true && activeHistoryMode == mode) return
 
         historyJob?.cancel()
-        historyScreenJob?.cancel()
+        timelineExtentsJob?.cancel()
         activeHistoryMode = mode
         _isLoading.value = _glucoseHistory.value.isEmpty()
 
-        if (DashboardHistoryCollectionPolicy.usesMergedCrossSensorHistory(mode)) {
-            // Parallel cross-sensor merged stream that backs the History browse
-            // screen. Keep it off the dashboard path so dashboard startup does
-            // not scan and convert the full multi-sensor Room timeline.
-            historyScreenJob = viewModelScope.launch {
-                combine(
-                    _unit,
-                    glucoseRepository.getMergedHistoryFlowRaw(queryStartTimeMs)
-                        .distinctUntilChangedBy(::historyEdgeSignature)
-                ) { unitStr, rawHistory ->
-                    unitStr to rawHistory
-                }.collect { (unitStr, rawHistory) ->
-                    _historyScreenGlucoseHistory.value = withContext(Dispatchers.Default) {
-                        rawHistory.inDisplayUnit(unitStr)
-                    }
+        timelineExtentsJob = viewModelScope.launch {
+            glucoseRepository.getTimelineExtentsFlow().collect { extents ->
+                _timelineExtents.value = extents
+                // A store whose newest reading is older than the live tail would
+                // otherwise show nothing until the chart said where it was
+                // looking — and the chart is not composed without data. Open
+                // around the newest reading, which is where every chart opens.
+                if (extents != null && _chartWindow.value == null && extents.latestMs < _liveTailStart.value) {
+                    _chartWindow.value = TimelineWindowPolicy.windowFor(
+                        extents.latestMs - INITIAL_CHART_VIEWPORT_MS,
+                        extents.latestMs
+                    )
                 }
             }
-        } else {
-            _historyScreenGlucoseHistory.value = emptyList()
         }
 
+        startCurrentSensorTailCollection(mode)
+
+        // The chart's list is two stretches of the merged timeline: the live
+        // tail, which every non-chart consumer reads and which is always there,
+        // and the window the chart has asked for around its viewport. Each is a
+        // bounded Room query merged against the store's coverage, so a write
+        // costs the stretches on screen and not the store — see
+        // HistoryRepository.observeMergedWindow for why the answer is still the
+        // whole timeline's.
         historyJob = viewModelScope.launch {
-            var lastRecoveryRequestSerial: String? = null
+            val hasRetainedHistory = _glucoseHistory.value.isNotEmpty()
             var hasSeenHistoryEmission = false
-            val rawHistoryFlow = when (mode) {
-                CollectionMode.DASHBOARD -> glucoseRepository.getDashboardHistoryFlowRaw(startTime = queryStartTimeMs)
-                CollectionMode.FULL_HISTORY -> glucoseRepository.getHistoryFlowRaw(queryStartTimeMs)
-                CollectionMode.INACTIVE -> return@launch
+            // A warm cache is already painted: skip the quick-sample stage,
+            // or the chart would jump back to the first-paint window and
+            // forward again on every return. The tail flow below takes over
+            // live; an unchanged signature resolves to the cached list
+            // instance, so collectors see no emission at all.
+            var firstPainted = hasRetainedHistory
+            val tailFlow = _liveTailStart.flatMapLatest { tailStart ->
+                kotlinx.coroutines.flow.flow {
+                    // First paint: the default range and its margin, read once
+                    // and answered from the window's own rows if the coverage
+                    // index is still to be built — what the dashboard's first
+                    // frame always was. The whole tail follows and replaces it.
+                    if (!firstPainted) {
+                        firstPainted = true
+                        val quickStart = TimelineWindowPolicy.liveTailStart(System.currentTimeMillis()) +
+                            (TimelineWindowPolicy.LIVE_TAIL_MS - TimelineWindowPolicy.FIRST_PAINT_MS)
+                        val quick = glucoseRepository.loadMergedWindowRaw(quickStart, Long.MAX_VALUE, allowProvisional = true)
+                        if (quick.isNotEmpty()) emit(quick)
+                    }
+                    emitAll(glucoseRepository.getMergedWindowFlowRaw(tailStart, Long.MAX_VALUE))
+                }
+            }
+            val windowFlow = _chartWindow.flatMapLatest { window ->
+                if (window == null) {
+                    kotlinx.coroutines.flow.flowOf(emptyList())
+                } else {
+                    glucoseRepository.getMergedWindowFlowRaw(window.startMs, window.endMs)
+                }
             }
             combine(
                 _unit,
-                rawHistoryFlow.distinctUntilChangedBy(::historyEdgeSignature)
-            ) { unitStr, rawHistory ->
-                unitStr to rawHistory
-            }.collectLatest { (unitStr, rawHistory) ->
+                combine(tailFlow, windowFlow) { tail, window -> mergeSortedTimelines(tail, window) }
+                    // Signed once, off the main thread: the signature is the
+                    // change gate and the display cache's key.
+                    .map { rawHistory -> rawHistory to historyEdgeSignature(rawHistory) }
+                    .distinctUntilChangedBy { it.second }
+                    .flowOn(Dispatchers.Default)
+            ) { unitStr, signedHistory ->
+                unitStr to signedHistory
+            }.collectLatest { (unitStr, signedHistory) ->
+                val (rawHistory, signature) = signedHistory
                 val shouldCoalesce = DashboardHistoryCollectionPolicy.shouldCoalesceEmission(
                     mode,
                     hasSeenHistoryEmission,
@@ -887,27 +1189,159 @@ class DashboardViewModel(
                 if (shouldCoalesce) {
                     delay(DASHBOARD_HISTORY_COALESCE_MS)
                 }
-                val signature = historyEdgeSignature(rawHistory)
-                val preferredSerial = preferredDashboardSensorId()?.takeIf { it.isNotBlank() }
-                val current = resolveCurrentForHistoryRecovery(preferredSerial)
-                val currentRecoveryStartTimeMs = activeHistoryStartTimeMs ?: recoveryStartTimeMs
-                if (preferredSerial != null &&
-                    shouldRequestHistoryRecovery(currentRecoveryStartTimeMs, rawHistory, preferredSerial, current) &&
-                    lastRecoveryRequestSerial != preferredSerial
-                ) {
-                    lastRecoveryRequestSerial = preferredSerial
-                    requestHistoryRecoverySync(
-                        serial = preferredSerial,
-                        reason = "history_flow_${mode.name.lowercase()}_${rawHistory.size}"
-                    )
-                }
                 BatteryTrace.bump(
                     key = "dashboard.history.emission",
                     logEvery = 20L,
                     detail = "mode=$mode size=${rawHistory.size}"
                 )
-                _glucoseHistory.value = resolveHistoryDisplayList(rawHistory, unitStr, mode, signature)
+                if (tk.glucodata.BuildConfig.DEBUG) {
+                    android.util.Log.d("DashboardHistory", "publish mode=$mode count=${rawHistory.size} latest=${rawHistory.lastOrNull()?.timestamp} previous=${_glucoseHistory.value.lastOrNull()?.timestamp}")
+                }
+                _glucoseHistory.value = resolveHistoryDisplayList(rawHistory, unitStr, signature)
                 _isLoading.value = false
+            }
+        }
+    }
+
+    /**
+     * Starts resolving [journalGlucoseAnchors] for the entries on record and
+     * keeps them current. Idempotent; the journal screen asks for it when it
+     * appears, since nothing else needs a reading per entry.
+     */
+    fun ensureJournalGlucoseAnchorsObserved() {
+        if (journalAnchorsJob?.isActive == true) return
+        journalAnchorsJob = viewModelScope.launch {
+            data class Inputs(val timestamps: List<Long>, val latestMs: Long?, val rewrites: Long, val unit: String)
+            combine(
+                _journalEntries.map { entries -> entries.map { it.timestamp }.distinct() }.distinctUntilChanged(),
+                _timelineExtents.map { it?.latestMs }.distinctUntilChanged(),
+                glucoseRepository.getTimelineRewritesFlow(),
+                _unit,
+            ) { timestamps, latest, rewrites, unit -> Inputs(timestamps, latest, rewrites, unit) }
+                .collectLatest { inputs ->
+                    if (inputs.rewrites != journalAnchorRewriteRevision || inputs.unit != journalAnchorCacheUnit) {
+                        journalAnchorCache.clear()
+                        journalAnchorRewriteRevision = inputs.rewrites
+                        journalAnchorCacheUnit = inputs.unit
+                    }
+                    val pending = JournalGlucoseAnchors.pending(inputs.timestamps, journalAnchorCache, inputs.latestMs)
+                    publishJournalAnchors()
+                    var sincePublish = 0
+                    for (cluster in JournalGlucoseAnchors.clusters(pending)) {
+                        val points = glucoseRepository.loadMergedWindowRaw(cluster.startMs, cluster.endMs)
+                            .inDisplayUnit(inputs.unit)
+                        journalAnchorCache.putAll(JournalGlucoseAnchors.resolve(cluster, points))
+                        // Newest clusters first, published as they land: the top of
+                        // the ledger fills within a read or two on a long journal.
+                        if (++sincePublish >= 4) {
+                            publishJournalAnchors()
+                            sincePublish = 0
+                        }
+                    }
+                    publishJournalAnchors()
+                }
+        }
+    }
+
+    private fun publishJournalAnchors() {
+        _journalGlucoseAnchors.value = HashMap(journalAnchorCache)
+    }
+
+    /**
+     * The chart says where it is looking; the window it holds follows, with a
+     * margin, per [TimelineWindowPolicy]. Called on every viewport change, so it
+     * must be — and is — a comparison, not a query.
+     */
+    fun onChartViewportChanged(viewportStartMs: Long, viewportEndMs: Long) {
+        if (viewportEndMs <= viewportStartMs) return
+        val now = System.currentTimeMillis()
+        if (TimelineWindowPolicy.liveTailNeedsReanchor(_liveTailStart.value, now)) {
+            _liveTailStart.value = TimelineWindowPolicy.liveTailStart(now)
+        }
+        val current = _chartWindow.value
+        val next = TimelineWindowPolicy.windowUpdate(current, _liveTailStart.value, viewportStartMs, viewportEndMs)
+        if (next != current) _chartWindow.value = next
+    }
+
+    /**
+     * What a range of the merged timeline holds — how many readings, and the
+     * first and last of them — live: recomputed when the store changes. For
+     * the history screen, which used to learn these by slicing the whole list
+     * it was handed.
+     */
+    fun timelineRangeSummaryFlow(startMs: Long, endMs: Long): kotlinx.coroutines.flow.Flow<tk.glucodata.data.TimelineRangeSummary?> =
+        kotlinx.coroutines.flow.flow {
+            // Counted in parts, so a year-long range costs the year once and
+            // about an hour a minute — see TimelineRangeSummaryTracker.
+            val tracker = TimelineRangeSummaryTracker(startMs, endMs)
+            combine(_timelineExtents, glucoseRepository.getTimelineRewritesFlow()) { extents, rewrites ->
+                extents to rewrites
+            }.collect { (extents, rewrites) ->
+                if (extents == null) {
+                    emit(null)
+                    return@collect
+                }
+                val plan = tracker.plan(extents.latestMs, rewrites)
+                val counted = plan.stretches.map { glucoseRepository.mergedRangeSummary(it.first, it.last) }
+                emit(tracker.apply(plan, counted, rewrites))
+            }
+        }
+            .distinctUntilChanged()
+            .flowOn(Dispatchers.IO)
+
+    /** The merged timeline around one moment, live — for a sheet that opens on a tapped point. */
+    fun mergedWindowFlow(startMs: Long, endMs: Long): kotlinx.coroutines.flow.Flow<List<GlucosePoint>> =
+        combine(_unit, glucoseRepository.getMergedWindowFlowRaw(startMs, endMs)) { unitStr, raw ->
+            raw.inDisplayUnit(unitStr)
+        }.flowOn(Dispatchers.Default)
+
+    /**
+     * Collects the current sensor's own tail, and owns the history-recovery
+     * decision that used to ride on the chart's emissions.
+     *
+     * Recovery moved here with the data it reasons about. Now that the chart
+     * shows every sensor covering the window, "the newest point in the drawn
+     * list" can belong to a sensor that is not the current one — and asking that
+     * list whether the current sensor is behind would answer no while it sits
+     * silent. This flow is that sensor and only that sensor.
+     */
+    private fun startCurrentSensorTailCollection(mode: CollectionMode) {
+        currentSensorTailJob?.cancel()
+        if (mode == CollectionMode.INACTIVE) {
+            currentSensorTailJob = null
+            _currentSensorTail.value = emptyList()
+            return
+        }
+
+        currentSensorTailJob = viewModelScope.launch {
+            var lastRecoveryRequestSerial: String? = null
+            val tailStartMs =
+                (System.currentTimeMillis() - CURRENT_SENSOR_TAIL_WINDOW_MS).coerceAtLeast(0L)
+            glucoseRepository.getCurrentSensorTailFlowRaw(tailStartMs)
+                .distinctUntilChangedBy(::historyEdgeSignature)
+                .flowOn(Dispatchers.Default)
+                .collectLatest { tail ->
+                // Stored mg/dL, unconverted: the recovery check reads timestamps
+                // only, and converting would be work no one looks at.
+                _currentSensorTail.value = tail
+                _currentSensorLatestReading.value = tail.lastOrNull()?.inDisplayUnit(_unit.value)
+
+                val preferredSerial = preferredDashboardSensorId()?.takeIf { it.isNotBlank() }
+                val current = resolveCurrentForHistoryRecovery(preferredSerial)
+                // Deliberately still 0: shouldRequestHistoryRecovery treats a
+                // non-zero start as "history must reach back this far", and the
+                // tail window is a display bound, not a coverage requirement.
+                val currentRecoveryStartTimeMs = activeHistoryStartTimeMs ?: 0L
+                if (preferredSerial != null &&
+                    shouldRequestHistoryRecovery(currentRecoveryStartTimeMs, tail, preferredSerial, current) &&
+                    lastRecoveryRequestSerial != preferredSerial
+                ) {
+                    lastRecoveryRequestSerial = preferredSerial
+                    requestHistoryRecoverySync(
+                        serial = preferredSerial,
+                        reason = "current_sensor_tail_${mode.name.lowercase()}_${tail.size}"
+                    )
+                }
             }
         }
     }
@@ -971,6 +1405,14 @@ class DashboardViewModel(
                 _sensorViewModes.value = config.sensorViewModes
 
                 val peerSensors = config.selectedSensorIds.drop(1)
+                val startTimeMs = System.currentTimeMillis() - DASHBOARD_PEER_HISTORY_WINDOW_MS
+                // Ownership is resolved here, beside the peer history, because
+                // both change on the same events: a swap, or the record gaining
+                // a minute. With a single sensor there is nothing to contest,
+                // but the answer is still the record's to give.
+                // Equality compares effective ownership, so a warm refresh can
+                // pick up newly sealed minutes without emitting for clock drift.
+                refreshMainSensorOwnership(startTimeMs)
                 if (peerSensors.isEmpty()) {
                     _multiSensorRawHistory.value = PeerRawHistory.EMPTY
                     _peerCurrentReadings.value = emptyList()
@@ -978,10 +1420,10 @@ class DashboardViewModel(
                 }
 
                 var hasSeenPeerEmission = false
-                val startTimeMs = System.currentTimeMillis() - DASHBOARD_PEER_HISTORY_WINDOW_MS
                 historyRepository.getHistoryFlowForDisplaySensors(peerSensors, startTimeMs)
                     .conflate()
                     .distinctUntilChangedBy(::historyEdgeSignature)
+                    .flowOn(Dispatchers.Default)
                     .collectLatest { rawHistory ->
                         if (hasSeenPeerEmission) {
                             delay(DASHBOARD_HISTORY_COALESCE_MS)
@@ -992,6 +1434,7 @@ class DashboardViewModel(
                         }
                         _multiSensorRawHistory.value = PeerRawHistory(config.selectedSensorIds, peerSensors, converted)
                         refreshPeerCurrentReadings(peerSensors)
+                        refreshMainSensorOwnership(startTimeMs)
                     }
                 }
         }
@@ -1059,15 +1502,8 @@ class DashboardViewModel(
     private suspend fun resolveHistoryDisplayList(
         rawHistory: List<GlucosePoint>,
         unitStr: String,
-        mode: CollectionMode,
         signature: HistoryEdgeSignature
     ): List<GlucosePoint> {
-        if (mode != CollectionMode.DASHBOARD) {
-            return withContext(Dispatchers.Default) {
-                rawHistory.inDisplayUnit(unitStr)
-            }
-        }
-
         val cacheKey = DashboardHistoryCacheKey(signature, unitStr)
         synchronized(processDashboardHistoryCacheLock) {
             if (processDashboardHistoryCacheKey == cacheKey) {
@@ -1096,7 +1532,13 @@ class DashboardViewModel(
             sampleHash = sparseHistorySampleHash(points),
             lastValueBits = java.lang.Float.floatToRawIntBits(last?.value ?: 0f),
             lastRawBits = java.lang.Float.floatToRawIntBits(last?.rawValue ?: 0f),
-            lastSerial = last?.sensorSerial
+            lastSerial = last?.sensorSerial,
+            uncertaintyCount = points.count { it.uncertainty != null },
+            lastUncertaintyBits = last?.uncertainty?.let { uncertainty ->
+                (java.lang.Float.floatToRawIntBits(uncertainty.lower).toLong() shl 32) or
+                    (java.lang.Float.floatToRawIntBits(uncertainty.upper).toLong() and 0xffffffffL)
+            } ?: 0L,
+            recordedDisplayHash = tk.glucodata.ui.recordedDisplaySignature(points),
         )
     }
 
@@ -1122,15 +1564,20 @@ class DashboardViewModel(
         historyJob = null
         multiSensorHistoryJob?.cancel()
         multiSensorHistoryJob = null
-        historyScreenJob?.cancel()
-        historyScreenJob = null
+        timelineExtentsJob?.cancel()
+        timelineExtentsJob = null
+        journalAnchorsJob?.cancel()
+        journalAnchorsJob = null
+        currentSensorTailJob?.cancel()
+        currentSensorTailJob = null
         uiRefreshJob?.cancel()
         uiRefreshJob = null
         activeHistoryMode = null
         activeHistoryStartTimeMs = null
-        _multiSensorRawHistory.value = PeerRawHistory.EMPTY
-        _multiSensorDisplay.value = tk.glucodata.ui.MultiSensorDisplayData.EMPTY
-        _peerCurrentReadings.value = emptyList()
+        // Jobs stop, values stay: the rows keep their last paint while hidden
+        // instead of flashing empty-then-populated on every return. The
+        // restarted collectors replace them behind the cached frame; anything
+        // genuinely new arrives as a single update, not a restage.
     }
 
     fun setLowAlarm(enabled: Boolean, threshold: Float) {
@@ -1252,6 +1699,13 @@ class DashboardViewModel(
         _broadcastComputedTrend.value = enabled
     }
 
+    fun setXdripReportAsLibre2(enabled: Boolean) {
+        val context = tk.glucodata.Applic.app
+        val prefs = context.getSharedPreferences("tk.glucodata_preferences", android.content.Context.MODE_PRIVATE)
+        prefs.edit().putBoolean(tk.glucodata.XdripReportAsLibre2.PREF_KEY, enabled).apply()
+        _xdripReportAsLibre2.value = enabled
+    }
+
     fun toggleGlucodataBroadcast(enabled: Boolean) {
         val context = tk.glucodata.Applic.app
         if (enabled) {
@@ -1356,6 +1810,38 @@ class DashboardViewModel(
         _journalDoseCalculatorEnabled.value = enabled
     }
 
+    fun setStateDoseHintEnabled(enabled: Boolean) {
+        val context = tk.glucodata.Applic.app
+        val prefs = context.getSharedPreferences("tk.glucodata_preferences", android.content.Context.MODE_PRIVATE)
+        prefs.edit().putBoolean(STATE_DOSE_HINT_KEY, enabled).apply()
+        _stateDoseHintEnabled.value = enabled
+    }
+
+    fun setStateDoseHintCorrectInRange(enabled: Boolean) {
+        val context = tk.glucodata.Applic.app
+        val prefs = context.getSharedPreferences("tk.glucodata_preferences", android.content.Context.MODE_PRIVATE)
+        prefs.edit().putBoolean(STATE_DOSE_HINT_IN_RANGE_KEY, enabled).apply()
+        _stateDoseHintCorrectInRange.value = enabled
+    }
+
+    fun acknowledgeStateDoseHintProfileNotice() {
+        val context = tk.glucodata.Applic.app
+        val prefs = context.getSharedPreferences("tk.glucodata_preferences", android.content.Context.MODE_PRIVATE)
+        prefs.edit().putBoolean(STATE_DOSE_HINT_PROFILE_NOTICE_KEY, true).apply()
+        _stateDoseHintProfileNoticeAck.value = true
+    }
+
+    fun setStateDoseHintHorizonMinutes(value: Int) {
+        val normalized = value.coerceIn(
+            StateDoseHintCalculator.HORIZON_MINUTES_MIN,
+            StateDoseHintCalculator.HORIZON_MINUTES_MAX
+        )
+        val context = tk.glucodata.Applic.app
+        val prefs = context.getSharedPreferences("tk.glucodata_preferences", android.content.Context.MODE_PRIVATE)
+        prefs.edit().putInt(STATE_DOSE_HINT_HORIZON_KEY, normalized).apply()
+        _stateDoseHintHorizonMinutes.value = normalized
+    }
+
     fun setJournalFoodMacrosEnabled(enabled: Boolean) {
         val context = tk.glucodata.Applic.app
         val prefs = context.getSharedPreferences("tk.glucodata_preferences", android.content.Context.MODE_PRIVATE)
@@ -1392,12 +1878,20 @@ class DashboardViewModel(
         _journalDashboardQuickAddButton.value = enabled
     }
 
+    fun setJournalBodyWeightKg(value: Float?) {
+        val context = tk.glucodata.Applic.app
+        JournalHumanProfile.setBodyWeightKg(context, value)
+        _journalBodyWeightKg.value = JournalHumanProfile.bodyWeightKg(context)
+    }
+
     fun setGlucoseValueRangeColorsEnabled(enabled: Boolean) {
         val context = tk.glucodata.Applic.app
         val prefs = context.getSharedPreferences("tk.glucodata_preferences", android.content.Context.MODE_PRIVATE)
         prefs.edit().putBoolean(GLUCOSE_RANGE_COLORS_KEY, enabled).apply()
         _glucoseValueRangeColorsEnabled.value = enabled
         refreshNotificationPredictionSurfaces(context)
+        // Travels with the palette: the watch colours its readings by the same rule.
+        tk.glucodata.GlucoseColorSync.push()
     }
 
     fun setDashboardShowDelta(enabled: Boolean) {
@@ -1405,6 +1899,20 @@ class DashboardViewModel(
         val prefs = context.getSharedPreferences("tk.glucodata_preferences", android.content.Context.MODE_PRIVATE)
         prefs.edit().putBoolean(DASHBOARD_SHOW_DELTA_KEY, enabled).apply()
         _dashboardShowDelta.value = enabled
+    }
+
+    fun setDashboardRowsShowDelta(enabled: Boolean) {
+        val context = tk.glucodata.Applic.app
+        val prefs = context.getSharedPreferences("tk.glucodata_preferences", android.content.Context.MODE_PRIVATE)
+        prefs.edit().putBoolean(DASHBOARD_ROWS_SHOW_DELTA_KEY, enabled).apply()
+        _dashboardRowsShowDelta.value = enabled
+    }
+
+    fun setDashboardShowReadingAge(enabled: Boolean) {
+        val context = tk.glucodata.Applic.app
+        val prefs = context.getSharedPreferences("tk.glucodata_preferences", android.content.Context.MODE_PRIVATE)
+        prefs.edit().putBoolean(DASHBOARD_SHOW_READING_AGE_KEY, enabled).apply()
+        _dashboardShowReadingAge.value = enabled
     }
 
     /**
@@ -1512,29 +2020,72 @@ class DashboardViewModel(
     }
 
     fun setPredictionCarbRatioGramsPerUnit(value: Float) {
-        val normalized = value.roundToStep(1f).coerceIn(3f, 30f)
-        val context = tk.glucodata.Applic.app
-        val prefs = context.getSharedPreferences("tk.glucodata_preferences", android.content.Context.MODE_PRIVATE)
-        prefs.edit().putFloat(PREDICTION_CARB_RATIO_KEY, normalized).apply()
-        _predictionCarbRatioGramsPerUnit.value = normalized
-        refreshNotificationPredictionSurfaces(context)
+        updatePredictionModelBlock(
+            startMinuteOfDay = 0,
+            carbRatioGramsPerUnit = value
+        )
     }
 
     fun setPredictionInsulinSensitivityMgDlPerUnit(value: Float) {
-        val normalized = value.roundToStep(1f).coerceIn(10f, 180f)
+        updatePredictionModelBlock(
+            startMinuteOfDay = 0,
+            insulinSensitivityMgDlPerUnit = value
+        )
+    }
+
+    fun addPredictionModelBlock(startMinuteOfDay: Int) {
+        persistPredictionModelProfile(_predictionModelProfile.value.addBlock(startMinuteOfDay))
+    }
+
+    fun removePredictionModelBlock(startMinuteOfDay: Int) {
+        persistPredictionModelProfile(_predictionModelProfile.value.removeBlock(startMinuteOfDay))
+    }
+
+    fun movePredictionModelBlock(oldStartMinuteOfDay: Int, newStartMinuteOfDay: Int) {
+        persistPredictionModelProfile(
+            _predictionModelProfile.value.moveBlock(oldStartMinuteOfDay, newStartMinuteOfDay)
+        )
+    }
+
+    fun updatePredictionModelBlock(
+        startMinuteOfDay: Int,
+        carbRatioGramsPerUnit: Float? = null,
+        insulinSensitivityMgDlPerUnit: Float? = null,
+        carbAbsorptionGramsPerHour: Float? = null
+    ) {
+        val normalizedCarbRatio = carbRatioGramsPerUnit?.roundToStep(1f)
+        val normalizedSensitivity = insulinSensitivityMgDlPerUnit?.roundToStep(1f)
+        val normalizedAbsorption = carbAbsorptionGramsPerHour?.roundToStep(1f)
+        persistPredictionModelProfile(
+            _predictionModelProfile.value.updateBlock(
+                startMinuteOfDay = startMinuteOfDay,
+                carbRatioGramsPerUnit = normalizedCarbRatio,
+                insulinSensitivityMgDlPerUnit = normalizedSensitivity,
+                carbAbsorptionGramsPerHour = normalizedAbsorption
+            )
+        )
+    }
+
+    private fun persistPredictionModelProfile(profile: PredictionModelProfile) {
+        if (profile == _predictionModelProfile.value) return
         val context = tk.glucodata.Applic.app
         val prefs = context.getSharedPreferences("tk.glucodata_preferences", android.content.Context.MODE_PRIVATE)
-        prefs.edit().putFloat(PREDICTION_INSULIN_SENSITIVITY_KEY, normalized).apply()
-        _predictionInsulinSensitivityMgDlPerUnit.value = normalized
+        PredictionModelProfileStore.save(prefs, profile)
+        _predictionModelProfile.value = profile
+        _predictionModelProfileSaved.value = true
+        val first = profile.blocks.first()
+        _predictionCarbRatioGramsPerUnit.value = first.carbRatioGramsPerUnit
+        _predictionInsulinSensitivityMgDlPerUnit.value = first.insulinSensitivityMgDlPerUnit
+        _predictionCarbAbsorptionGramsPerHour.value = first.carbAbsorptionGramsPerHour
         refreshNotificationPredictionSurfaces(context)
     }
 
-    fun setPredictionCarbAbsorptionGramsPerHour(value: Float) {
-        val normalized = value.roundToStep(1f).coerceIn(10f, 90f)
+    fun setPredictionDoseTargetMgDl(value: Float) {
+        val normalized = value.roundToStep(1f).coerceIn(DoseTarget.MIN_MGDL, DoseTarget.MAX_MGDL)
         val context = tk.glucodata.Applic.app
         val prefs = context.getSharedPreferences("tk.glucodata_preferences", android.content.Context.MODE_PRIVATE)
-        prefs.edit().putFloat(PREDICTION_CARB_ABSORPTION_KEY, normalized).apply()
-        _predictionCarbAbsorptionGramsPerHour.value = normalized
+        prefs.edit().putFloat(PREDICTION_DOSE_TARGET_KEY, normalized).apply()
+        _predictionDoseTargetMgDl.value = normalized
         refreshNotificationPredictionSurfaces(context)
     }
 
@@ -1661,13 +2212,10 @@ class DashboardViewModel(
     }
 
     private fun refreshCurrentDisplayAfterSmoothingChange() {
-        CurrentDisplaySource.resolveCurrent(
-            maxAgeMillis = Notify.glucosetimeout,
-            preferredSensorId = preferredDashboardSensorId()
-        )?.let { resolved ->
-            _currentGlucose.value = resolved.primaryStr
-            _currentRate.value = resolved.rate.takeIf { it.isFinite() } ?: 0f
-        }
+        refreshCurrentDisplaySnapshot()
+        // Every smoothing setter funnels through here, so this is the one place
+        // the watch needs telling; it smooths with the same settings.
+        tk.glucodata.WearPrefsSync.push()
     }
 
     private fun requestHistoryRecoverySync(serial: String, reason: String) {
@@ -1698,27 +2246,29 @@ class DashboardViewModel(
         HistorySync.syncSensorFromNative(serial, forceFull = false)
     }
 
+    /**
+     * [history] must be the **current sensor's own** readings — see
+     * [DashboardHistoryCollectionPolicy.shouldRequestHistoryRecovery], which
+     * holds the logic and the reason.
+     */
     private fun shouldRequestHistoryRecovery(
         startTimeMs: Long,
         history: List<tk.glucodata.ui.GlucosePoint>,
         serial: String?,
         current: CurrentDisplaySource.Snapshot?
     ): Boolean {
-        if (history.isEmpty()) {
-            return true
-        }
-        val oldestTimestamp = history.firstOrNull()?.timestamp ?: return true
-        if (startTimeMs > 0L && oldestTimestamp > (startTimeMs + HISTORY_RECOVERY_TOLERANCE_MS)) {
-            return true
-        }
-        val latestTimestamp = history.lastOrNull()?.timestamp ?: return true
-        if (current == null || current.timeMillis <= 0L || serial.isNullOrBlank()) {
-            return false
-        }
-        if (!current.sensorId.isNullOrBlank() && !SensorIdentity.matches(current.sensorId, serial)) {
-            return false
-        }
-        return current.timeMillis > (latestTimestamp + HISTORY_RECOVERY_TAIL_TOLERANCE_MS)
+        val snapshotIsSameSensor = current != null &&
+            !serial.isNullOrBlank() &&
+            (current.sensorId.isNullOrBlank() || SensorIdentity.matches(current.sensorId, serial))
+        return DashboardHistoryCollectionPolicy.shouldRequestHistoryRecovery(
+            requiredStartMs = startTimeMs,
+            oldestStoredMs = history.firstOrNull()?.timestamp,
+            latestStoredMs = history.lastOrNull()?.timestamp,
+            currentSnapshotTimeMs = current?.timeMillis ?: 0L,
+            snapshotIsSameSensor = snapshotIsSameSensor,
+            coverageToleranceMs = HISTORY_RECOVERY_TOLERANCE_MS,
+            tailToleranceMs = HISTORY_RECOVERY_TAIL_TOLERANCE_MS
+        )
     }
 
     private fun resolveCurrentForHistoryRecovery(serial: String?): CurrentDisplaySource.Snapshot? {

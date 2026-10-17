@@ -7,15 +7,15 @@ import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import tk.glucodata.Applic
 import tk.glucodata.Log
+import tk.glucodata.NightscoutTreatmentImportBridge
 import tk.glucodata.data.HistoryDatabase
 
 @Keep
-object NightscoutJournalFollowerImporter {
+object NightscoutJournalFollowerImporter : NightscoutTreatmentImportBridge {
     private const val LOG_ID = "NightscoutJournalFollowerImporter"
 
-    @JvmStatic
     @Keep
-    fun importTreatments(sensorId: String, treatmentsJson: String): Int = runBlocking {
+    override fun importTreatments(sensorId: String, treatmentsJson: String): Int = runBlocking {
         withContext(Dispatchers.IO) {
             runCatching { importInternal(sensorId, treatmentsJson) }
                 .onFailure { Log.e(LOG_ID, "importTreatments failed: ${Log.stackline(it)}") }
@@ -30,6 +30,7 @@ object NightscoutJournalFollowerImporter {
         if (array.length() == 0) return 0
 
         val repository = JournalRepository()
+        repository.deleteAapsSenderOnlyNotesOnce()
         repository.ensureDefaultInsulinPresets()
         val presets = repository.getInsulinPresetsSnapshot()
         val journalDao = HistoryDatabase.getInstance(Applic.app).journalDao()
@@ -63,8 +64,7 @@ object NightscoutJournalFollowerImporter {
             ) ?: continue
 
             if (parsed.deleteOnly) {
-                repository.deleteEntriesBySourceRecordIds(parsed.candidateSourceRecordIds)
-                deleted += parsed.candidateSourceRecordIds.size
+                deleted += repository.deleteEntriesBySourceRecordIds(parsed.candidateSourceRecordIds)
                 continue
             }
 
@@ -74,8 +74,7 @@ object NightscoutJournalFollowerImporter {
             }
             val importedIds = parsed.inputs.mapNotNull { it.sourceRecordId }.toSet()
             val staleIds = parsed.candidateSourceRecordIds.filterNot { it in importedIds }
-            repository.deleteEntriesBySourceRecordIds(staleIds)
-            deleted += staleIds.size
+            deleted += repository.deleteEntriesBySourceRecordIds(staleIds)
         }
 
         if (imported > 0 || deleted > 0) {

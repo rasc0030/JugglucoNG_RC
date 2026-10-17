@@ -26,6 +26,8 @@ object SibionicsRegistry {
     private const val PREF_START_TIME_PREFIX = "sibionics_managed_start_time_"
     private const val PREF_PROTOCOL_PREFIX = "sibionics_managed_protocol_"
     private const val PREF_VARIANT_PREFIX = "sibionics_managed_variant_"
+    private const val PREF_AUTH_KEY_HINT_PREFIX = "sibionics_managed_auth_key_hint_"
+    private const val PREF_PROBE_CODE_PREFIX = "sibionics_managed_probe_code_"
     private const val PREF_SHORT_CODE_PREFIX = "sibionics_managed_short_code_"
     private const val PREF_LAST_GLUCOSE_MGDL_PREFIX = "sibionics_managed_last_glucose_mgdl_"
     private const val PREF_LAST_RAW_MGDL_PREFIX = "sibionics_managed_last_raw_mgdl_"
@@ -35,10 +37,16 @@ object SibionicsRegistry {
     private const val PREF_RESET_POSTPONED_UNTIL_PREFIX = "sibionics_managed_reset_postponed_until_"
     private const val PREF_RESET_REMINDER_AT_PREFIX = "sibionics_managed_reset_reminder_at_"
     private const val PREF_RESET_REQUESTED_PREFIX = "sibionics_managed_reset_requested_"
+    private const val PREF_AUTO_RESET_NOT_BEFORE_PREFIX = "sibionics_managed_auto_reset_not_before_"
     private const val PREF_CUSTOM_ALGORITHM_PREFIX = "sibionics_managed_custom_algorithm_"
     private const val PREF_ALGORITHM_SELECTION_PREFIX = "sibionics_managed_algorithm_selection_"
+    private const val PREF_ALGORITHM_SENSITIVITY_PREFIX = "sibionics_managed_algorithm_sensitivity_"
     private const val PREF_LOCAL_REBUILD_FINGERPRINT_PREFIX = "sibionics_managed_rebuild_fingerprint_"
     private const val PREF_INTEGRATED_CALIBRATION_BASELINE_PREFIX = "sibionics_managed_calibration_baseline_"
+    private const val SIBIONICS_GTIN_PREFIX = "0697283164"
+    private val SENSOR_QR_PATTERN = Regex(
+        "^\u001D?01(\\d{14})11\\d{6}17\\d{6}10[A-Z0-9]{8,20}\u001D?21([A-Z0-9]{10,20})\u001D?$",
+    )
 
     data class IntegratedCalibrationBaseline(
         val unit: Int,
@@ -68,10 +76,72 @@ object SibionicsRegistry {
         val shortCode: String,
         val bleName: String,
         val qrDerived: Boolean,
+        val probeCode: String = "",
     )
 
     fun prefs(context: Context): SharedPreferences =
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+    internal fun isSupportedQrPayload(source: String?): Boolean {
+        return supportedQrMatch(source) != null
+    }
+
+    internal fun isSupportedQrPayload(
+        source: String?,
+        variant: SibionicsConstants.Variant,
+    ): Boolean {
+        val v120 = qrPayloadIsV120Identity(source) ?: return false
+        return acceptsIdentityForm(variant, v120)
+    }
+
+    /**
+     * Whether a supported QR payload carries the V120 (Sibionics 2) serial form, or null when the
+     * payload is not a Sibionics sensor code at all. Lets setup tell "wrong sensor type selected"
+     * apart from "this is not a Sibionics code".
+     */
+    internal fun qrPayloadIsV120Identity(source: String?): Boolean? {
+        val ai21 = supportedQrMatch(source)?.groupValues?.get(2) ?: return null
+        return isV120IdentityToken(ai21)
+    }
+
+    /**
+     * Same family check for a hand-typed serial, which never carries the GS1 framing the QR gate
+     * validates. Without it, typing a Sibionics 2 serial under a single-piece sensor type (or the
+     * reverse) registers the sensor under the wrong variant, and nothing downstream disagrees.
+     */
+    @JvmStatic
+    fun isManualSerialForVariant(serial: String?, variant: SibionicsConstants.Variant): Boolean {
+        val normalized = SibionicsConstants.normalizeBleName(serial)
+        if (normalized.length !in 10..20) return false
+        return acceptsIdentityForm(variant, isV120IdentityToken(normalized))
+    }
+
+    private fun acceptsIdentityForm(
+        variant: SibionicsConstants.Variant,
+        isV120Identity: Boolean,
+    ): Boolean =
+        when (variant) {
+            SibionicsConstants.Variant.SIBIONICS2 -> isV120Identity
+            SibionicsConstants.Variant.GS3 -> false
+            else -> !isV120Identity
+        }
+
+    private fun isV120IdentityToken(value: String): Boolean =
+        value.startsWith("P") || value.startsWith("XPT")
+
+    private fun supportedQrMatch(source: String?): MatchResult? {
+        val match = SENSOR_QR_PATTERN.matchEntire(cleanQrPayload(source)) ?: return null
+        val gtin = match.groupValues[1]
+        if (!gtin.startsWith(SIBIONICS_GTIN_PREFIX)) return null
+        val body = gtin.dropLast(1)
+        val checksum = body.mapIndexed { index, char ->
+            val digit = char.digitToInt()
+            if ((body.length - index) % 2 == 1) digit * 3 else digit
+        }.sum()
+        if ((10 - checksum % 10) % 10 != gtin.last().digitToInt()) return null
+        if (deriveNativeQrName(source) == null) return null
+        return match
+    }
 
     @JvmStatic
     fun buildIdentity(
@@ -84,13 +154,14 @@ object SibionicsRegistry {
         // The native V120 identity window is defined against the framed QR payload. Keep GS
         // separators here: normalizing first shortens a 65-byte payload and selects the wrong
         // extraction branch, shifting both the leading and trailing identity characters.
-        val framedQrName = deriveNativeQrName(rawInput)
+        val useStructuredV120Serial = variant == SibionicsConstants.Variant.SIBIONICS2
+        val framedQrName = deriveNativeQrName(rawInput, useStructuredV120Serial)
         val source = when {
             normalizedRaw.isNotBlank() -> normalizedRaw
             normalizedBle.isNotBlank() -> normalizedBle
             else -> variant.displayLabel
         }
-        val qrName = framedQrName ?: deriveNativeQrName(source)
+        val qrName = framedQrName ?: deriveNativeQrName(source, useStructuredV120Serial)
         val qrShortView = qrName?.takeLast(11)?.takeIf { it.length == 11 }
         val resolvedBleName = deriveBleName(normalizedBle.takeIf { it.isNotBlank() } ?: source).orEmpty()
         val display = qrShortView ?: deriveDisplayName(source, variant)
@@ -109,10 +180,20 @@ object SibionicsRegistry {
             shortCode = shortCode,
             bleName = resolvedBleName,
             qrDerived = framedQrName != null,
+            probeCode = if (variant == SibionicsConstants.Variant.SIBIONICS2) {
+                supportedQrMatch(rawInput)?.groupValues?.get(2)
+                    ?.takeIf { SibionicsProbeSensitivity.tryDecode(it) != null }.orEmpty()
+            } else "",
         )
     }
 
+    /**
+     * @param variantIsUserChoice true only when the caller is the setup flow acting on a type the
+     *   user just picked. Every other caller inherits the recorded type: nothing the driver
+     *   observes on air may re-type a sensor. See [SibionicsVariantLock].
+     */
     @JvmStatic
+    @JvmOverloads
     fun ensureSensorRecord(
         context: Context,
         rawInput: String?,
@@ -121,18 +202,31 @@ object SibionicsRegistry {
         variant: SibionicsConstants.Variant,
         shortCodeOverride: String? = null,
         bleNameOverride: String? = null,
+        variantIsUserChoice: Boolean = false,
     ): SensorRecord {
-        val identity = buildIdentity(rawInput, bleNameOverride ?: displayName, variant)
+        val records = persistedRecords(context).toMutableList()
+        // The requested variant shapes the identity (only Sibionics 2 uses the structured V120
+        // serial), so resolve the locked variant first and rebuild the identity under it.
+        val probe = locateRecord(records, buildIdentity(rawInput, bleNameOverride ?: displayName, variant))
+        val lockedVariant = SibionicsVariantLock.variantForWrite(
+            existingVariant = records.getOrNull(probe)?.variant,
+            requestedVariant = variant,
+            isUserChoice = variantIsUserChoice,
+        )
+        if (lockedVariant != variant) {
+            Log.w(
+                SibionicsConstants.TAG,
+                "refusing to re-type ${records.getOrNull(probe)?.sensorId} as ${variant.id}; " +
+                    "it stays ${lockedVariant.id} until setup says otherwise",
+            )
+        }
+        val identity = buildIdentity(rawInput, bleNameOverride ?: displayName, lockedVariant)
         val sensorId = identity.sensorId
         val shortCode = shortCodeOverride
             ?.let { SibionicsConstants.normalizeBleName(it) }
             ?.takeIf { it.length == 8 }
             ?: identity.shortCode
-        val records = persistedRecords(context).toMutableList()
-        val idx = records.indexOfFirst {
-            it.matchesId(sensorId) ||
-                (identity.bleName.isNotBlank() && it.matchesId(identity.bleName))
-        }
+        val idx = if (lockedVariant == variant) probe else locateRecord(records, identity)
         val existing = records.getOrNull(idx)
         val normalizedAddress = SibionicsConstants.normalizeBleAddress(address)
             ?: SibionicsConstants.normalizeBleAddress(existing?.address)
@@ -150,20 +244,32 @@ object SibionicsRegistry {
             sensorId = sensorId,
             address = normalizedAddress,
             displayName = visible,
-            variant = variant,
+            variant = lockedVariant,
             shortCode = shortCode,
             bleName = bleName,
             legacyNativeName = existing?.legacyNativeName.orEmpty(),
         )
         if (idx >= 0) records[idx] = record else records.add(record)
         writeRecords(context, records)
-        saveVariant(context, sensorId, variant)
+        saveVariant(context, sensorId, lockedVariant)
         saveShortCode(context, sensorId, shortCode)
+        if (identity.probeCode.isNotEmpty()) {
+            prefs(context).edit().putString(PREF_PROBE_CODE_PREFIX + sensorId, identity.probeCode).apply()
+        } else if (lockedVariant != SibionicsConstants.Variant.SIBIONICS2) {
+            prefs(context).edit().remove(PREF_PROBE_CODE_PREFIX + sensorId).apply()
+        }
         ManagedSensorUiSignals.markDeviceListDirty()
         SensorIdentity.invalidateCaches()
         return record
     }
 
+    private fun locateRecord(records: List<SensorRecord>, identity: SetupIdentity): Int =
+        records.indexOfFirst {
+            it.matchesId(identity.sensorId) ||
+                (identity.bleName.isNotBlank() && it.matchesId(identity.bleName))
+        }
+
+    /** Setup adding a sensor: the one path allowed to state, or restate, what a sensor is. */
     @JvmStatic
     fun addSensorAndStart(
         context: Context,
@@ -180,7 +286,11 @@ object SibionicsRegistry {
             displayName = displayName,
             variant = variant,
             bleNameOverride = bleName,
+            variantIsUserChoice = true,
         )
+        SensorBluetooth.mygatts()?.filterIsInstance<SibionicsBleManager>()
+            ?.filter { record.matchesId(it.SerialNumber) }
+            ?.forEach { it.refreshProbeCalibration(context) }
         runCatching {
             if (tk.glucodata.Natives.getusebluetooth()) {
                 SensorBluetooth.updateDevices()
@@ -269,6 +379,7 @@ object SibionicsRegistry {
                 remove(PREF_PROTOCOL_PREFIX + id)
                 remove(PREF_VARIANT_PREFIX + id)
                 remove(PREF_SHORT_CODE_PREFIX + id)
+                remove(PREF_PROBE_CODE_PREFIX + id)
                 remove(PREF_LAST_GLUCOSE_MGDL_PREFIX + id)
                 remove(PREF_LAST_RAW_MGDL_PREFIX + id)
                 remove(PREF_LAST_READING_TIME_PREFIX + id)
@@ -276,8 +387,12 @@ object SibionicsRegistry {
                 remove(PREF_AUTO_RESET_DAYS_PREFIX + id)
                 remove(PREF_CUSTOM_ALGORITHM_PREFIX + id)
                 remove(PREF_ALGORITHM_SELECTION_PREFIX + id)
+                remove(PREF_ALGORITHM_SENSITIVITY_PREFIX + id)
                 remove(PREF_LOCAL_REBUILD_FINGERPRINT_PREFIX + id)
                 remove(PREF_INTEGRATED_CALIBRATION_BASELINE_PREFIX + id)
+                // Goes with the start date it guards: a re-added sensor that keeps the old
+                // session's start must also keep the backoff after the reset it was sent.
+                remove(PREF_AUTO_RESET_NOT_BEFORE_PREFIX + id)
             }
             // A detached sensor must never execute a stale scheduled reset when
             // it is later re-added, even though its glucose continuation is kept.
@@ -373,6 +488,15 @@ object SibionicsRegistry {
                 ) {
                     return@forEach
                 }
+                // A SIBI: shell with no Kotlin record is not necessarily an orphan: a
+                // sensor mirrored over Clone is exactly that -- the record lives on the
+                // phone wearing it -- and finishing it here retired every mirrored
+                // Sibionics seconds after it arrived.
+                if (tk.glucodata.CloneSensorRegistry.isCloneSensor(nativeId) ||
+                    tk.glucodata.CloneSensorRegistry.isCloneSensor(fullNativeName)
+                ) {
+                    return@forEach
+                }
 
                 // Older builds could delete the Kotlin record while leaving this
                 // direct-stream shell active. Retire it before shared BLE restore
@@ -431,6 +555,30 @@ object SibionicsRegistry {
         }.apply()
     }
 
+    /**
+     * Records a detected sensor restart in one synchronous write: cursor 0, the
+     * reset algorithm state, and no start time or last reading - the state of a
+     * newly added sensor. One edit, committed, because a partial or lost write is
+     * the failure this guards: a cleared start time beside the old cursor and
+     * algorithm restores a session in which the new one's indices sit behind the
+     * old cursor and cannot prove a restart either, so every reading is dropped.
+     */
+    fun saveSessionRestart(context: Context, sensorId: String, state: ByteArray): Boolean =
+        prefs(context).edit().apply {
+            putInt(PREF_LAST_INDEX_PREFIX + sensorId, 0)
+            if (state.isEmpty()) {
+                remove(PREF_ALGORITHM_STATE_PREFIX + sensorId)
+            } else {
+                putString(PREF_ALGORITHM_STATE_PREFIX + sensorId, Base64.getEncoder().encodeToString(state))
+            }
+            remove(PREF_START_TIME_PREFIX + sensorId)
+            remove(PREF_LAST_READING_TIME_PREFIX + sensorId)
+            remove(PREF_LAST_GLUCOSE_MGDL_PREFIX + sensorId)
+            remove(PREF_LAST_RAW_MGDL_PREFIX + sensorId)
+            // The reset that was waiting for this restart has taken.
+            remove(PREF_AUTO_RESET_NOT_BEFORE_PREFIX + sensorId)
+        }.commit()
+
     fun clearAlgorithmState(context: Context, sensorId: String) {
         prefs(context).edit().remove(PREF_ALGORITHM_STATE_PREFIX + sensorId).apply()
     }
@@ -472,6 +620,21 @@ object SibionicsRegistry {
     fun isResetRequested(context: Context, sensorId: String): Boolean =
         prefs(context).getBoolean(PREF_RESET_REQUESTED_PREFIX + sensorId, false)
 
+    fun loadAutoResetNotBeforeMs(context: Context, sensorId: String): Long =
+        prefs(context).getLong(PREF_AUTO_RESET_NOT_BEFORE_PREFIX + sensorId, 0L)
+
+    /**
+     * The backoff after a reset went out. Kept on disk because the start date stays the
+     * old session's until the sensor shows a new one: a process restart in between would
+     * otherwise find a sensor past its deadline and send the reset again at once.
+     * Committed, since the case it guards is a process that dies seconds later.
+     */
+    fun saveAutoResetNotBeforeMs(context: Context, sensorId: String, notBeforeMs: Long) {
+        prefs(context).edit()
+            .putLong(PREF_AUTO_RESET_NOT_BEFORE_PREFIX + sensorId, notBeforeMs.coerceAtLeast(0L))
+            .commit()
+    }
+
     fun clearResetMaintenanceState(context: Context, sensorId: String) {
         prefs(context).edit().apply {
             remove(PREF_RESET_POSTPONED_UNTIL_PREFIX + sensorId)
@@ -492,7 +655,7 @@ object SibionicsRegistry {
         val selectionKey = PREF_ALGORITHM_SELECTION_PREFIX + sensorId
         if (preferences.contains(selectionKey)) {
             return SibionicsAlgorithmSelection.fromStorage(
-                preferences.getInt(selectionKey, SibionicsAlgorithmSelection.STOCK.storageId),
+                preferences.getInt(selectionKey, SibionicsAlgorithmSelection.DEFAULT.storageId),
             )
         }
         val legacyKey = PREF_CUSTOM_ALGORITHM_PREFIX + sensorId
@@ -503,7 +666,7 @@ object SibionicsRegistry {
                 SibionicsAlgorithmSelection.STOCK_CALIBRATED
             }
         } else {
-            SibionicsAlgorithmSelection.STOCK
+            SibionicsAlgorithmSelection.DEFAULT
         }
     }
 
@@ -515,6 +678,25 @@ object SibionicsRegistry {
         prefs(context).edit()
             .putInt(PREF_ALGORITHM_SELECTION_PREFIX + sensorId, selection.storageId)
             .apply()
+    }
+
+    fun loadAlgorithmSensitivityOverride(context: Context, sensorId: String): Float? =
+        prefs(context)
+            .getFloat(PREF_ALGORITHM_SENSITIVITY_PREFIX + sensorId, Float.NaN)
+            .takeIf(SibionicsSensitivity::isSupported)
+
+    fun saveAlgorithmSensitivityOverride(
+        context: Context,
+        sensorId: String,
+        sensitivity: Float?,
+    ) {
+        prefs(context).edit().apply {
+            if (sensitivity == null) {
+                remove(PREF_ALGORITHM_SENSITIVITY_PREFIX + sensorId)
+            } else if (SibionicsSensitivity.isSupported(sensitivity)) {
+                putFloat(PREF_ALGORITHM_SENSITIVITY_PREFIX + sensorId, sensitivity)
+            }
+        }.apply()
     }
 
     fun loadLocalRebuildFingerprint(context: Context, sensorId: String): String =
@@ -603,41 +785,50 @@ object SibionicsRegistry {
         prefs(context).edit().putString(PREF_PROTOCOL_PREFIX + sensorId, mode.name).apply()
     }
 
-    fun loadVariant(context: Context, sensorId: String): SibionicsConstants.Variant =
-        SibionicsConstants.Variant.fromId(
-            prefs(context).getString(PREF_VARIANT_PREFIX + sensorId, null)
-                ?: findRecord(context, sensorId)?.variant?.id,
-        )
+    /**
+     * The type this sensor was set up as. The record written by setup wins over the per-sensor
+     * copy, which older builds rewrote from an authentication guess; a disagreement is that damage
+     * and is healed here, so a sensor that came back as the wrong type after a reconnect returns to
+     * what the user chose.
+     */
+    fun loadVariant(context: Context, sensorId: String): SibionicsConstants.Variant {
+        val record = findRecord(context, sensorId)
+        val cached = variantById(prefs(context).getString(PREF_VARIANT_PREFIX + sensorId, null))
+        val locked = SibionicsVariantLock.lockedVariant(record?.variant, cached)
+        if (record != null && cached != null && cached != locked) {
+            Log.w(
+                SibionicsConstants.TAG,
+                "healing cached variant ${cached.id} back to the recorded ${locked.id} for $sensorId",
+            )
+            saveVariant(context, sensorId, locked)
+            if (!record.sensorId.equals(sensorId, ignoreCase = true)) {
+                saveVariant(context, record.sensorId, locked)
+            }
+        }
+        return locked
+    }
 
     fun saveVariant(context: Context, sensorId: String, variant: SibionicsConstants.Variant) {
         prefs(context).edit().putString(PREF_VARIANT_PREFIX + sensorId, variant.id).apply()
     }
 
-    /**
-     * Persist a variant only after the sensor has accepted that variant's authentication key.
-     * Authentication fallback must never rewrite identity while merely trying candidate keys.
-     */
-    fun confirmAuthenticatedVariant(
-        context: Context,
-        sensorId: String,
-        variant: SibionicsConstants.Variant,
-    ): SensorRecord? {
-        val records = persistedRecords(context).toMutableList()
-        val index = records.indexOfFirst { it.matchesId(sensorId) }
-        val existing = records.getOrNull(index)
-        val updated = existing?.copy(variant = variant)
-        if (index >= 0 && updated != null) records[index] = updated
+    private fun variantById(raw: String?): SibionicsConstants.Variant? {
+        val id = raw?.takeIf { it.isNotBlank() } ?: return null
+        return SibionicsConstants.Variant.entries.firstOrNull { it.id == id }
+    }
 
-        val canonicalId = updated?.sensorId ?: SibionicsConstants.canonicalSensorId(sensorId)
-        val editor = prefs(context).edit()
-            .putString(PREF_VARIANT_PREFIX + canonicalId, variant.id)
-        if (updated != null) {
-            editor.putStringSet(PREF_SENSORS, records.map(::encodeRecord).toSet())
-        }
-        editor.apply()
-        ManagedSensorUiSignals.markDeviceListDirty()
-        SensorIdentity.invalidateCaches()
-        return updated
+    /**
+     * Drop the "key group that last authenticated" hint 1.1.3 recorded. The accept response is
+     * decrypted with the fixed master key and arrives whichever key was sent, so the hint could
+     * pin a sensor to a key its firmware never accepts — authenticating, streaming nothing, and
+     * dropping the link every 30 s. The type decides the key now. See [SibionicsVariantLock].
+     */
+    fun clearAuthKeyHint(context: Context, sensorId: String) {
+        val prefs = prefs(context)
+        val key = PREF_AUTH_KEY_HINT_PREFIX + sensorId
+        if (!prefs.contains(key)) return
+        Log.i(SibionicsConstants.TAG, "dropping stale auth key hint for $sensorId")
+        prefs.edit().remove(key).apply()
     }
 
     fun loadShortCode(context: Context, sensorId: String): String =
@@ -645,6 +836,13 @@ object SibionicsRegistry {
             ?.takeIf { it.isNotBlank() }
             ?: findRecord(context, sensorId)?.shortCode
             ?: SibionicsConstants.Variant.EU.fallbackShortCode
+
+    internal fun loadProbeCode(context: Context, sensorId: String): String? {
+        // A live callback can retain its BLE/manual alias after setup replaces
+        // that record with a QR identity. Calibration belongs to the current record.
+        val canonicalId = findRecord(context, sensorId)?.sensorId ?: sensorId
+        return prefs(context).getString(PREF_PROBE_CODE_PREFIX + canonicalId, null)
+    }
 
     fun saveShortCode(context: Context, sensorId: String, shortCode: String) {
         if (shortCode.isBlank()) return
@@ -762,10 +960,28 @@ object SibionicsRegistry {
         return -1
     }
 
-    private fun deriveNativeQrName(source: String?): String? {
+    private fun deriveNativeQrName(
+        source: String?,
+        useStructuredV120Serial: Boolean = false,
+    ): String? {
         val payload = cleanQrPayload(source)
         val magic = "0697283164"
         if (!payload.contains(magic) || payload.length < 50) return null
+
+        // V120 AI (21) values beginning with P contain the calibration-bearing
+        // serial consumed by the validated local decoder. Some labels use an XPT
+        // probe identifier as the entire AI (21) value instead. Keep its native
+        // identity window; its calibration is decoded separately from the full
+        // probe code, without substituting a different sensor identity.
+        if (useStructuredV120Serial) {
+            deriveGs1V120CalibrationSerial(payload)?.let { serial ->
+                // The legacy/native visible identity excludes the serial check
+                // character: its 16-byte end window consists of the final AI digit
+                // followed by the first 15 serial characters.
+                return "1" + serial.dropLast(1)
+            }
+        }
+
         return if (payload.length < 65) {
             val endLen = payload.length - 49
             val startLen = 16 - endLen
@@ -781,14 +997,48 @@ object SibionicsRegistry {
         }?.let { SibionicsConstants.normalizeBleName(it) }
     }
 
+    private fun deriveGs1V120CalibrationSerial(payload: String): String? {
+        val magicPos = payload.indexOf(SIBIONICS_GTIN_PREFIX)
+        if (magicPos < 0) return null
+
+        val explicitAi21 = payload.indexOf("\u001D21", startIndex = magicPos + 10)
+        val valueStart = if (explicitAi21 >= 0) {
+            explicitAi21 + 3
+        } else {
+            // Some scanners omit FNC1/group separators. In that representation,
+            // locate AI (21) only after the validated variable-length AI (10)
+            // batch field rather than matching an arbitrary "21" in the dates.
+            val ai10 = findBatchAi10(payload)
+            if (ai10 < 0) return null
+            val batchStart = ai10 + 2
+            val ai21 = payload.indexOf("21", startIndex = batchStart + 8)
+            if (ai21 < 0 || ai21 - batchStart !in 8..16) return null
+            ai21 + 2
+        }
+
+        // Only the established P-format V120 serial has a validated sensitivity
+        // token. XPT is a different AI (21) identifier form, not a P serial with
+        // a shifted prefix, so never manufacture calibration data from it.
+        if (payload.length - valueStart < 16) return null
+        return payload.substring(valueStart, valueStart + 16)
+            .takeIf { serial ->
+                serial.startsWith('P') && serial.all(Char::isLetterOrDigit)
+            }
+    }
+
     private fun cleanQrPayload(source: String?): String =
         source.orEmpty()
+            .trim()
             .uppercase(java.util.Locale.US)
+            .removePrefix("]D2")
             .replace("^]", "\u001D")
             .filter { it.isLetterOrDigit() || it == '\u001D' }
+
 }
 
 object SibionicsManagedSensorIdentityAdapter : tk.glucodata.drivers.ManagedSensorIdentityAdapter {
+    override val uiFamily = tk.glucodata.drivers.ManagedSensorUiFamily.SIBIONICS
+
     private fun hasExplicitPrefix(sensorId: String?): Boolean =
         sensorId?.trim()?.startsWith(SibionicsConstants.MANAGED_PREFIX, ignoreCase = true) == true
 
@@ -846,7 +1096,9 @@ object SibionicsManagedSensorIdentityAdapter : tk.glucodata.drivers.ManagedSenso
     override fun isExternallyManagedBleSensor(sensorId: String?): Boolean =
         SibionicsRegistry.findRecord(Applic.app, sensorId) != null
 
-    override fun usesNativeDirectStreamShell(sensorId: String?): Boolean = false
+    override fun usesNativeDirectStreamShell(sensorId: String?): Boolean =
+        resolveCanonicalSensorId(sensorId)
+            ?.let { SibionicsRegistry.findRecord(Applic.app, it) } != null
 
     override fun hasNativeSensorBacking(sensorId: String?): Boolean? {
         SibionicsRegistry.findRecord(Applic.app, sensorId) ?: return null

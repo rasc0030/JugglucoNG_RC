@@ -3,6 +3,7 @@ package tk.glucodata.drivers.ottai
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -122,18 +123,176 @@ class OttaiParserTests {
 
     @Test
     fun chooseRecordSize_confirmedVersionsAreDeterministic() {
-        // Confirmed families trust the version string outright — no structural guessing.
+        // Confirmed E-families trust the version string outright — no structural guessing.
         val nineData = hex("00000000814cffff1f3c34e115ba47c50b" + "00".repeat(15))
         val eightData = hex("000000000a000300" + "05010203401fac0d" + "05010203501fb00d" + "05010203601fb40d")
-        assertEquals(OttaiParser.BLE_RECORD_SIZE_V17, OttaiParser.chooseRecordSize(nineData, "E1.2.3(V1.7.SH2542.1)"))
+        assertEquals(OttaiParser.BLE_RECORD_SIZE_E12, OttaiParser.chooseRecordSize(nineData, "E1.2.3(V1.7.SH2542.1)"))
+        assertEquals(OttaiParser.BLE_RECORD_SIZE_E12, OttaiParser.chooseRecordSize(nineData, "vE1.2.3(V1.7.SH2542.1)"))
         assertEquals(OttaiParser.BLE_RECORD_SIZE, OttaiParser.chooseRecordSize(eightData, "V1.5.S2428.1"))
+    }
+
+    @Test
+    fun chooseRecordSize_e11CanUseNineByteLayout() {
+        // The 2026-08-23 CN V3 sensor reports the same E1.1.4(V1.7.S2530.1) as the older
+        // 8-byte Syai, but its 176-byte history pages advance by 18 and contain 18 nine-byte
+        // records plus six padding bytes. The payload, not E1.1, must select the layout.
+        val nineByteData = ByteArray(176).also { p ->
+            p[4] = 0; p[5] = 0
+            for (i in 0 until 18) {
+                val src = 8 + i * 9
+                p[src] = 0x20; p[src + 1] = 0x1F // current = 7968 LE
+                p[src + 6] = 0x47                // voltage
+                p[src + 7] = 0xAC.toByte(); p[src + 8] = 0x0D // temp = 35.00 C LE
+            }
+        }
+        assertEquals(
+            OttaiParser.BLE_RECORD_SIZE_E12,
+            OttaiParser.chooseRecordSize(nineByteData, "E1.1.4(V1.7.S2530.1)"),
+        )
+        val records = OttaiParser.frameRecords(nineByteData, "E1.1.4(V1.7.S2530.1)")
+        assertEquals(18, records.size)
+        val first = OttaiParser.parseRecord(records.first())
+        assertEquals(7968, first.rawCurrent)
+        assertEquals(35.0, first.temperatureC, 1e-9)
+    }
+
+    @Test
+    fun frameRecords_e11NineByteLiveNotifyIgnoresShortPadding() {
+        // The same CN V3 sensor's live frame is header + one 9-byte record + seven zero bytes.
+        // Its length is also compatible with two 8-byte records, so content must break the tie.
+        val payload = hex("000000007600ffff1f3c34e115ba47c50b" + "00".repeat(7))
+        assertEquals(
+            OttaiParser.BLE_RECORD_SIZE_E12,
+            OttaiParser.chooseRecordSize(payload, "E1.1.4(V1.7.S2530.1)"),
+        )
+        val records = OttaiParser.frameRecords(payload, "E1.1.4(V1.7.S2530.1)")
+        assertEquals(1, records.size)
+        assertEquals(118, OttaiParser.parseRecord(records.single()).dataNo)
+    }
+
+    @Test
+    fun frameRecords_e11SyaiFrameKeepsEveryRecord() {
+        // The older Syai with the SAME E1.1 version remains 8-byte: header + 20 records in
+        // 168 bytes, front=0, and the next frame starts at 20. Structural selection preserves it.
+        val payload = ByteArray(168).also { p ->
+            p[4] = 0; p[5] = 0 // frontDataNo = 0
+            for (i in 0 until 20) {
+                val src = 8 + i * 8
+                p[src] = 5                       // voltage
+                p[src + 4] = 0x0C; p[src + 5] = 0x1E // current = 7692 LE
+                p[src + 6] = 0xA4.toByte(); p[src + 7] = 0x0C // temp = 32.36 C LE
+            }
+        }
+        val recs = OttaiParser.frameRecords(payload, "E1.1.4(V1.7.S2530.1)")
+        assertEquals(20, recs.size)
+        assertEquals(19, OttaiParser.parseRecord(recs.last()).dataNo)
+        val r = OttaiParser.parseRecord(recs[0])
+        assertEquals(7692, r.rawCurrent)
+        assertEquals(32.36, r.temperatureC, 1e-9)
     }
 
     @Test
     fun chooseRecordSize_picksNineForUnknownNineByteFirmware() {
         // A brand-new version string we've never enumerated still works, by structure alone.
         val payload = hex("00000000814cffff1f3c34e115ba47c50b" + "00".repeat(15))
-        assertEquals(OttaiParser.BLE_RECORD_SIZE_V17, OttaiParser.chooseRecordSize(payload, "E9.9.9(V3.1.ZZ0000.0)"))
+        assertEquals(OttaiParser.BLE_RECORD_SIZE_E12, OttaiParser.chooseRecordSize(payload, "E9.9.9(V3.1.ZZ0000.0)"))
+        // Including a bare V1.7 with no E-number: ambiguous by name, decided by the data.
+        assertEquals(OttaiParser.BLE_RECORD_SIZE_E12, OttaiParser.chooseRecordSize(payload, "V1.7.SH2542.1"))
+    }
+
+    /**
+     * The same CN V3 live frame, but with the seven padding bytes carrying leftover data
+     * instead of zeros. Read as two 8-byte records, the second one now falls entirely inside
+     * that padding and passes the vendor gate by accident — so the 8-byte reading ties the
+     * 9-byte one and the tie-break hands it the frame. This is the 2026-08-30 field failure:
+     * 112 of 702 live notifies framed as 8-byte, the padding record was rejected
+     * (`runtime=0 raw=0`), and the real sample went unexamined, costing fourteen consecutive
+     * minutes of a connected sensor.
+     */
+    @Test
+    fun chooseRecordSize_shortLiveNotifyCannotOutvoteALearnedLayout() {
+        val payload = hex("000000007600ffff1f3c34e115ba47c50b" + "000000401fac0d")
+
+        // Left to itself the frame gets it wrong — one record cannot outvote two.
+        assertEquals(
+            OttaiParser.BLE_RECORD_SIZE,
+            OttaiParser.chooseRecordSize(payload, "E1.1.4(V1.7.S2530.1)"),
+        )
+
+        // Given the layout a real page already proved, it does not get a vote.
+        assertEquals(
+            OttaiParser.BLE_RECORD_SIZE_E12,
+            OttaiParser.chooseRecordSize(
+                payload,
+                "E1.1.4(V1.7.S2530.1)",
+                learned = OttaiParser.BLE_RECORD_SIZE_E12,
+            ),
+        )
+
+        val records = OttaiParser.frameRecords(
+            payload,
+            "E1.1.4(V1.7.S2530.1)",
+            learned = OttaiParser.BLE_RECORD_SIZE_E12,
+        )
+        assertEquals(1, records.size)
+        val r = OttaiParser.parseRecord(records.single())
+        assertEquals(118, r.dataNo)
+        assertEquals(15391, r.rawCurrent)
+        assertEquals(30.13, r.temperatureC, 1e-9)
+    }
+
+    @Test
+    fun decisiveRecordSize_isNullForALiveNotify() {
+        // Two candidate records is not evidence, whichever way the padding happens to fall.
+        val tied = hex("000000007600ffff1f3c34e115ba47c50b" + "000000401fac0d")
+        val zeroPadded = hex("000000007600ffff1f3c34e115ba47c50b" + "00".repeat(7))
+        assertNull(OttaiParser.decisiveRecordSize(tied, "E1.1.4(V1.7.S2530.1)"))
+        assertNull(OttaiParser.decisiveRecordSize(zeroPadded, "E1.1.4(V1.7.S2530.1)"))
+    }
+
+    @Test
+    fun decisiveRecordSize_readsAPageThatCanActuallyDecide() {
+        // A polled live read: 96 bytes, nine 9-byte records. Nine valid against three.
+        val nineByteRead = ByteArray(96).also { p ->
+            for (i in 0 until 9) {
+                val src = 8 + i * 9
+                p[src] = 0x20; p[src + 1] = 0x1F              // current = 7968 LE
+                p[src + 6] = 0x47                             // voltage
+                p[src + 7] = 0xAC.toByte(); p[src + 8] = 0x0D // temp = 35.00 C LE
+            }
+        }
+        assertEquals(
+            OttaiParser.BLE_RECORD_SIZE_E12,
+            OttaiParser.decisiveRecordSize(nineByteRead, "E1.1.4(V1.7.S2530.1)"),
+        )
+
+        // The Syai history page under the SAME version string decides the other way.
+        val eightBytePage = ByteArray(168).also { p ->
+            for (i in 0 until 20) {
+                val src = 8 + i * 8
+                p[src] = 5
+                p[src + 4] = 0x0C; p[src + 5] = 0x1E              // current = 7692 LE
+                p[src + 6] = 0xA4.toByte(); p[src + 7] = 0x0C     // temp = 32.36 C LE
+            }
+        }
+        assertEquals(
+            OttaiParser.BLE_RECORD_SIZE,
+            OttaiParser.decisiveRecordSize(eightBytePage, "E1.1.4(V1.7.S2530.1)"),
+        )
+    }
+
+    @Test
+    fun decisiveRecordSize_trustsAConfirmedVersionString() {
+        // A confirmed family is not a guess, so even a one-record frame settles it.
+        val payload = hex("00000000814cffff1f3c34e115ba47c50b" + "00".repeat(15))
+        assertEquals(
+            OttaiParser.BLE_RECORD_SIZE_E12,
+            OttaiParser.decisiveRecordSize(payload, "E1.2.3(V1.7.SH2542.1)"),
+        )
+        assertEquals(
+            OttaiParser.BLE_RECORD_SIZE,
+            OttaiParser.decisiveRecordSize(payload, "V1.5.S2428.1"),
+        )
     }
 
     @Test
@@ -144,5 +303,43 @@ class OttaiParserTests {
         val r = OttaiParser.parseRecord(OttaiParser.frameRecords(payload, "")[0])
         assertEquals(8000, r.rawCurrent)
         assertEquals(35.0, r.temperatureC, 1e-9)
+    }
+
+    @Test
+    fun eightByteHistoryPageBeatsANineByteVersionString() {
+        // 2026-09-26 trace: a sensor whose version maps to the 9-byte family sends 20 8-byte
+        // records per 168-byte page, then 16-byte live notifies (header + one 8-byte record).
+        val version = "E1.2.3(V1.7.SH2542.1)"
+        val page = ByteArray(168).also { p ->
+            for (i in 0 until 20) {
+                val src = 8 + i * 8
+                p[src + 4] = 0x0C; p[src + 5] = 0x1E              // current = 7692 LE
+                p[src + 6] = 0xA4.toByte(); p[src + 7] = 0x0C     // temp = 32.36 C LE
+            }
+        }
+        assertEquals(OttaiParser.BLE_RECORD_SIZE, OttaiParser.decisiveRecordSize(page, version))
+        assertEquals(OttaiParser.BLE_RECORD_SIZE, OttaiParser.chooseRecordSize(page, version))
+        assertEquals(20, OttaiParser.frameRecords(page, version).size)
+
+        // Once learned, the live notify frames as one record instead of none.
+        val live = hex("00000000d067ffff1e18fd54722ef70b")
+        val recs = OttaiParser.frameRecords(live, version, OttaiParser.BLE_RECORD_SIZE)
+        assertEquals(1, recs.size)
+        assertEquals(30.63, OttaiParser.parseRecord(recs[0]).temperatureC, 1e-9)
+    }
+
+    @Test
+    fun sixteenByteLiveNotifyCannotBeFramedAsNineByte() {
+        // First live frame of a fresh sensor: nothing learned, and the version maps to the
+        // 9-byte family. An 8-byte body holds no 9-byte record, so the width must fall to 8.
+        val live = hex("00000000d067ffff1e18fd54722ef70b")
+        val version = "E1.2.3(V1.7.SH2542.1)"
+        assertEquals(OttaiParser.BLE_RECORD_SIZE, OttaiParser.chooseRecordSize(live, version))
+        assertEquals(1, OttaiParser.frameRecords(live, version).size)
+        // A stale learned 9 is ignored for the same reason.
+        assertEquals(
+            OttaiParser.BLE_RECORD_SIZE,
+            OttaiParser.chooseRecordSize(live, version, OttaiParser.BLE_RECORD_SIZE_E12),
+        )
     }
 }

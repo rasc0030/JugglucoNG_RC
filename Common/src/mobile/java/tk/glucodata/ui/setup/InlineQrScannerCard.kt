@@ -1,5 +1,8 @@
 package tk.glucodata.ui.setup
 
+import tk.glucodata.ui.components.IconButtonTooltip
+import androidx.compose.material3.IconButtonDefaults
+import androidx.compose.material3.ButtonDefaults
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
@@ -75,12 +78,26 @@ private fun Context.hasCameraPermission(): Boolean {
     return ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
 }
 
+/** How long the same rejected payload is ignored before it is offered to the caller again. */
+private const val REJECTED_SCAN_COOLDOWN_MS = 4_000L
+
+/** Last payload the caller turned down, so a code held in frame is not re-reported every frame. */
+private class RejectedScan {
+    @Volatile var value: String? = null
+    @Volatile var atMs: Long = 0L
+}
+
+/**
+ * @param onScanResult invoked with a decoded payload; return true if the caller accepted it, which
+ *   stops the camera. Returning false leaves the scanner running — a stray code in frame (a box's
+ *   "app download" QR, a code for a different sensor type) must not be able to end the scan.
+ */
 @Composable
 @SuppressLint("ClickableViewAccessibility")
 fun InlineQrScannerCard(
     modifier: Modifier = Modifier,
     scannerEnabled: Boolean = true,
-    onScanResult: (String) -> Unit,
+    onScanResult: (String) -> Boolean,
     onManualFallback: (() -> Unit)? = null,
     manualFallbackLabel: String? = null,
     onTouchInteractionChanged: ((Boolean) -> Unit)? = null
@@ -102,6 +119,10 @@ fun InlineQrScannerCard(
         mutableStateOf(lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED))
     }
     var previewInstanceNonce by remember { mutableIntStateOf(0) }
+    val rejectedScan = remember { RejectedScan() }
+    // The analyzer closure outlives the recompositions that change what a scan should do (the
+    // selected sensor type, the selected Bluetooth device), so it must not capture the lambda.
+    val onScanResultState = rememberUpdatedState(onScanResult)
     val cameraState = rememberUpdatedState(camera)
     val onTouchInteractionChangedState = rememberUpdatedState(onTouchInteractionChanged)
     val scaleDetector = remember(context) {
@@ -129,7 +150,15 @@ fun InlineQrScannerCard(
             )
             .build()
     }
-    val barcodeScanner = remember { BarcodeScanning.getClient(scannerOptions) }
+    val barcodeScannerResult = remember {
+        runCatching { BarcodeScanning.getClient(scannerOptions) }
+    }
+    val barcodeScanner = barcodeScannerResult.getOrNull()
+    LaunchedEffect(barcodeScannerResult) {
+        barcodeScannerResult.exceptionOrNull()?.let { throwable ->
+            scannerError = throwable.message ?: throwable.javaClass.simpleName
+        }
+    }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
@@ -152,7 +181,7 @@ fun InlineQrScannerCard(
             camera = null
             torchEnabled = false
             analyzerExecutor.shutdown()
-            barcodeScanner.close()
+            barcodeScanner?.close()
         }
     }
 
@@ -179,10 +208,26 @@ fun InlineQrScannerCard(
         }
     }
 
-    DisposableEffect(previewView, hasPermission, lifecycleOwner, consumed, lifecycleResumed, scannerEnabled) {
+    DisposableEffect(
+        previewView,
+        hasPermission,
+        lifecycleOwner,
+        consumed,
+        lifecycleResumed,
+        scannerEnabled,
+        barcodeScanner
+    ) {
         val generation = bindingGeneration.incrementAndGet()
         val targetView = previewView
-        if (!hasPermission || targetView == null || consumed || !lifecycleResumed || !scannerEnabled) {
+        val activeBarcodeScanner = barcodeScanner
+        if (
+            !hasPermission ||
+            targetView == null ||
+            consumed ||
+            !lifecycleResumed ||
+            !scannerEnabled ||
+            activeBarcodeScanner == null
+        ) {
             camera = null
             torchEnabled = false
             onDispose { }
@@ -223,7 +268,7 @@ fun InlineQrScannerCard(
                                         imageProxy.imageInfo.rotationDegrees
                                     )
 
-                                    barcodeScanner.process(inputImage)
+                                    activeBarcodeScanner.process(inputImage)
                                         .addOnSuccessListener(mainExecutor) { barcodes ->
                                             val rawValue = barcodes
                                                 .firstNotNullOfOrNull { barcode ->
@@ -232,8 +277,17 @@ fun InlineQrScannerCard(
                                                         ?.takeIf { value -> value.isNotEmpty() }
                                                 }
                                             if (rawValue != null && !consumed) {
-                                                consumed = true
-                                                onScanResult(rawValue)
+                                                val nowMs = android.os.SystemClock.elapsedRealtime()
+                                                val isRepeatOfRejected = rawValue == rejectedScan.value &&
+                                                    nowMs - rejectedScan.atMs < REJECTED_SCAN_COOLDOWN_MS
+                                                if (!isRepeatOfRejected) {
+                                                    if (onScanResultState.value(rawValue)) {
+                                                        consumed = true
+                                                    } else {
+                                                        rejectedScan.value = rawValue
+                                                        rejectedScan.atMs = nowMs
+                                                    }
+                                                }
                                             }
                                         }
                                         .addOnFailureListener(mainExecutor) { throwable ->
@@ -285,7 +339,7 @@ fun InlineQrScannerCard(
 
     Surface(
         modifier = modifier,
-        shape = RoundedCornerShape(24.dp),
+        shape = RoundedCornerShape(28.dp),
         tonalElevation = 3.dp,
         color = MaterialTheme.colorScheme.surfaceContainerHigh
     ) {
@@ -369,25 +423,28 @@ fun InlineQrScannerCard(
                     modifier = Modifier
                         .align(Alignment.TopStart)
                         .padding(12.dp),
-                    shape = RoundedCornerShape(14.dp),
+                    shape = RoundedCornerShape(12.dp),
                     color = Color.Black.copy(alpha = 0.45f)
                 ) {
-                    IconButton(
-                        onClick = {
-                            val nextTorch = !torchEnabled
-                            try {
-                                camera?.cameraControl?.enableTorch(nextTorch)
-                                torchEnabled = nextTorch
-                            } catch (throwable: Throwable) {
-                                scannerError = throwable.message ?: throwable.javaClass.simpleName
-                            }
+                    IconButtonTooltip(stringResource(R.string.flash)) {
+                        IconButton(
+                            onClick = {
+                                val nextTorch = !torchEnabled
+                                try {
+                                    camera?.cameraControl?.enableTorch(nextTorch)
+                                    torchEnabled = nextTorch
+                                } catch (throwable: Throwable) {
+                                    scannerError = throwable.message ?: throwable.javaClass.simpleName
+                                }
+                            },
+                            shapes = IconButtonDefaults.shapes()
+                        ) {
+                            Icon(
+                                imageVector = if (torchEnabled) Icons.Filled.FlashOn else Icons.Filled.FlashOff,
+                                contentDescription = stringResource(R.string.flash),
+                                tint = Color.White
+                            )
                         }
-                    ) {
-                        Icon(
-                            imageVector = if (torchEnabled) Icons.Filled.FlashOn else Icons.Filled.FlashOff,
-                            contentDescription = stringResource(R.string.flash),
-                            tint = Color.White
-                        )
                     }
                 }
             }
@@ -397,25 +454,28 @@ fun InlineQrScannerCard(
                     modifier = Modifier
                         .align(Alignment.TopEnd)
                         .padding(12.dp),
-                    shape = RoundedCornerShape(14.dp),
+                    shape = RoundedCornerShape(12.dp),
                     color = Color.Black.copy(alpha = 0.45f)
                 ) {
-                    IconButton(onClick = {
-                        if (touchActive) {
-                            touchActive = false
-                            onTouchInteractionChangedState.value?.invoke(false)
+                    IconButtonTooltip(stringResource(R.string.scan_qr_button)) {
+                        IconButton(onClick = {
+                            if (touchActive) {
+                                touchActive = false
+                                onTouchInteractionChangedState.value?.invoke(false)
+                            }
+                            camera = null
+                            torchEnabled = false
+                            previewView = null
+                            previewInstanceNonce++
+                            onManualFallback()
+                        },
+                        shapes = IconButtonDefaults.shapes()) {
+                            Icon(
+                                imageVector = Icons.Filled.OpenInFull,
+                                contentDescription = stringResource(R.string.scan_qr_button),
+                                tint = Color.White
+                            )
                         }
-                        camera = null
-                        torchEnabled = false
-                        previewView = null
-                        previewInstanceNonce++
-                        onManualFallback()
-                    }) {
-                        Icon(
-                            imageVector = Icons.Filled.OpenInFull,
-                            contentDescription = stringResource(R.string.scan_qr_button),
-                            tint = Color.White
-                        )
                     }
                 }
             }
@@ -426,7 +486,7 @@ fun InlineQrScannerCard(
                         .align(Alignment.Center)
                         .padding(20.dp),
                     horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     Text(
                         text = if (!hasPermission) {
@@ -446,12 +506,12 @@ fun InlineQrScannerCard(
                         )
                     }
 
-                    Button(onClick = { permissionLauncher.launch(Manifest.permission.CAMERA) }) {
+                    Button(onClick = { permissionLauncher.launch(Manifest.permission.CAMERA) }, shapes = ButtonDefaults.shapes(), contentPadding = ButtonDefaults.ContentPadding) {
                         Text(stringResource(R.string.permission))
                     }
 
                     if (onManualFallback != null) {
-                        OutlinedButton(onClick = onManualFallback) {
+                        OutlinedButton(onClick = onManualFallback, shapes = ButtonDefaults.shapes(), contentPadding = ButtonDefaults.ContentPadding) {
                             Text(manualFallbackLabel ?: stringResource(R.string.scanname))
                         }
                     }

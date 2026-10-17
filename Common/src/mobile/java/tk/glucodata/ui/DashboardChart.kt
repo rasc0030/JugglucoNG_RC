@@ -1,15 +1,23 @@
 package tk.glucodata.ui
 
+import tk.glucodata.ui.components.IconButtonTooltip
+import tk.glucodata.ui.util.toSharedGlucosePoint
+import androidx.compose.material3.ButtonDefaults
 import android.annotation.SuppressLint
 import android.content.Context
 import android.os.Build
 import android.view.HapticFeedbackConstants
 import android.os.Vibrator
 import android.os.VibrationEffect
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.SizeTransform
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.VectorConverter
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.animateIntAsState
@@ -22,11 +30,17 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
 import androidx.compose.animation.scaleOut
 import androidx.compose.animation.shrinkHorizontally
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.hoverable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsHoveredAsState
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.calculateCentroid
 import androidx.compose.foundation.gestures.calculateCentroidSize
@@ -37,7 +51,6 @@ import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.rememberTransformableState
 import androidx.compose.foundation.gestures.transformable
 import androidx.compose.foundation.horizontalScroll
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
@@ -81,12 +94,15 @@ import androidx.compose.material3.SelectableDates
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.minimumInteractiveComponentSize
+import androidx.compose.material3.Badge
 import androidx.compose.material3.rememberDatePickerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -108,18 +124,36 @@ import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.input.pointer.changedToUp
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.PointerId
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.util.VelocityTracker
 import androidx.compose.ui.input.pointer.util.addPointerInputChange
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.layout.layout
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.runtime.Stable
+import androidx.compose.runtime.Immutable
+import androidx.compose.ui.layout.positionOnScreen
+import androidx.compose.ui.unit.Constraints
+import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.hideFromAccessibility
+import androidx.compose.ui.semantics.onClick
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.text.SpanStyle
@@ -134,7 +168,6 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import tk.glucodata.GlucoseRangeColors
 import tk.glucodata.SensorIdentity
-import tk.glucodata.UiRefreshBus
 import tk.glucodata.R
 import tk.glucodata.DataSmoothing
 import tk.glucodata.data.journal.JournalActiveInsulinSummary
@@ -143,9 +176,14 @@ import tk.glucodata.data.journal.JournalEntryType
 import tk.glucodata.data.prediction.GlucosePredictionPoint
 import tk.glucodata.data.prediction.GlucosePredictionSeries
 import tk.glucodata.data.prediction.GlucosePredictionSeriesKind
+import tk.glucodata.data.prediction.StateDoseHint
+import tk.glucodata.data.prediction.StateDoseHintKind
 import tk.glucodata.ui.getDisplayValues
+import tk.glucodata.ui.journal.journalMarkerAmountText
+import tk.glucodata.ui.util.ExpressiveMotion
 import tk.glucodata.ui.util.GlucoseFormatter
 import tk.glucodata.ui.viewmodel.SensorColors
+import java.text.NumberFormat
 import kotlin.math.abs
 import kotlin.math.ln
 import kotlin.math.roundToInt
@@ -154,7 +192,11 @@ private const val PREVIEW_WINDOW_MODE_EXPANDED_ONLY = 0
 private const val PREVIEW_WINDOW_MODE_ALWAYS = 1
 private const val PREVIEW_WINDOW_MODE_NEVER = 2
 private const val PREVIEW_WINDOW_DURATION_MS = 24L * 60L * 60L * 1000L
+private const val ACTIVE_INSULIN_MAX_WIDTH_FRACTION = 0.46f
+private const val ACTIVE_INSULIN_EXPANDED_MAX_WIDTH_FRACTION = 0.58f
 private val PreviewWindowHeight = 58.dp
+// Band edges soften over this fraction of the preview strip's height.
+private const val PREVIEW_BAND_FADE_FRACTION = 0.025f
 private val PreviewWindowOuterPadding = 12.dp
 
 private data class ChartRangeThresholds(
@@ -164,12 +206,112 @@ private data class ChartRangeThresholds(
     val veryHigh: Float
 )
 
-private data class PeerSensorChartSeries(
+private data class ChartRangePalette(
+    val veryLow: Color,
+    val low: Color,
+    val inRange: Color,
+    val high: Color,
+    val veryHigh: Color
+)
+
+/**
+ * Feeds the dashboard's inputs to the shared builder. The chart's points are in
+ * display units with the recorded value already converted alongside; the
+ * builder's point type is the shared one, so they are mapped once here, per
+ * data change, and never per frame.
+ */
+private fun buildDashboardChartModel(
+    renderData: List<GlucosePoint>,
+    peers: List<PeerSensorChartSeries>,
+    primarySerial: String?,
+    primaryColorArgb: Int,
+    viewMode: Int,
+    ownership: tk.glucodata.chart.MainSensorOwnership,
+    hasCalibration: Boolean,
+    hideInitialWhenCalibrated: Boolean,
+): tk.glucodata.chart.HistoryChartModel {
+    fun toShared(point: GlucosePoint) = point.toSharedGlucosePoint()
+    val primary = primarySerial?.trim()?.takeIf { it.isNotEmpty() }
+        ?: renderData.lastOrNull()?.sensorSerial
+        ?: return tk.glucodata.chart.HistoryChartModel.EMPTY
+    val inputs = ArrayList<tk.glucodata.chart.HistoryChartModelBuilder.SeriesInput>(peers.size + 1)
+    inputs.add(
+        tk.glucodata.chart.HistoryChartModelBuilder.SeriesInput(
+            sensorId = primary,
+            isPrimary = true,
+            viewMode = viewMode,
+            colorArgb = primaryColorArgb,
+            points = renderData.map(::toShared),
+        )
+    )
+    peers.forEach { peer ->
+        val peerIsRaw = peer.viewMode == 1 || peer.viewMode == 3
+        inputs.add(
+            tk.glucodata.chart.HistoryChartModelBuilder.SeriesInput(
+                sensorId = peer.sensorId,
+                isPrimary = false,
+                viewMode = peer.viewMode,
+                colorArgb = peer.color.toArgb(),
+                points = peer.points.map(::toShared),
+                hasCalibration = tk.glucodata.data.calibration.CalibrationManager.hasActiveCalibration(peerIsRaw, peer.sensorId),
+            )
+        )
+    }
+    // One resolved calibration per (lane, sensor) for the whole build, not one
+    // lookup per point: the builder asks twice for every point of the whole
+    // timeline, and answering each from scratch is what made a rebuild cost
+    // seconds once the store outgrew the per-value cache. Same numbers as
+    // getCalibratedValue — see SeriesCalibrator.
+    val calibrators = HashMap<Pair<Boolean, String>, tk.glucodata.data.calibration.SeriesCalibrator?>()
+    val calibration = tk.glucodata.chart.HistoryChartModelBuilder.Calibration { base, timestamp, isRaw, sensorId ->
+        val calibrator = calibrators.getOrPut(isRaw to sensorId) {
+            if (tk.glucodata.data.calibration.CalibrationManager.hasActiveCalibration(isRaw, sensorId)) {
+                tk.glucodata.data.calibration.CalibrationManager.seriesCalibrator(isRaw, sensorId)
+            } else {
+                null
+            }
+        } ?: return@Calibration null
+        calibrator.calibrate(base, timestamp)
+    }
+    return tk.glucodata.chart.HistoryChartModelBuilder.build(
+        inputs, ownership, calibration,
+        hasCalibration = hasCalibration,
+        hideInitialWhenCalibrated = hideInitialWhenCalibrated,
+    )
+}
+
+internal data class PeerSensorChartSeries(
     val sensorId: String,
     val viewMode: Int,
     val color: Color,
     val points: List<GlucosePoint>
 )
+
+/** The whole data-to-model pipeline, in one place so it can run on any thread. */
+internal fun resolveDashboardChart(inputs: ChartResolutionInputs): ChartResolution {
+    val renderData = buildSmoothedChartData(inputs.safeData, inputs.graphSmoothingMinutes, inputs.collapseSmoothedData)
+    val peerChartSeries = inputs.multiSensorDisplay.series.mapNotNull { series ->
+        if (series.points.size < 2) return@mapNotNull null
+        PeerSensorChartSeries(
+            sensorId = series.sensorId,
+            viewMode = series.viewMode,
+            color = Color(series.colorArgb),
+            points = buildSmoothedChartData(series.points, inputs.graphSmoothingMinutes, inputs.collapseSmoothedData)
+        )
+    }
+    val chartModel = buildDashboardChartModel(
+        renderData = renderData,
+        peers = peerChartSeries,
+        primarySerial = inputs.primarySerial,
+        primaryColorArgb = inputs.primaryColorArgb,
+        viewMode = inputs.viewMode,
+        ownership = inputs.mainSensorOwnership,
+        hasCalibration = inputs.hasCalibration,
+        hideInitialWhenCalibrated = inputs.hideInitialWhenCalibrated,
+    )
+    chartModel.series.forEach { it.prepareLookups() }
+    return ChartResolution(renderData, peerChartSeries, chartModel)
+}
 
 private fun chartRangeThresholds(
     isMmol: Boolean,
@@ -193,6 +335,29 @@ private fun chartRangeThresholds(
     )
 }
 
+// The five band colors a glucose trace is stroked with. The dashboard resolves
+// this once and hands it to the preview navigator, so the strip cannot drift
+// from the trace above it.
+//
+// [lowTintBase] / [highTintBase] are the out-of-range tones used when the
+// app-range-color setting is off. They are parameters rather than
+// GlucoseRangeColors lookups because the caller owns them: today the dashboard
+// happens to define them as exactly that, but retuning them there must move
+// both surfaces, not silently split them.
+private fun chartRangePalette(
+    isDark: Boolean,
+    appChartRangeColors: Boolean,
+    primaryColor: Color,
+    lowTintBase: Color,
+    highTintBase: Color
+): ChartRangePalette = ChartRangePalette(
+    veryLow = Color(GlucoseRangeColors.veryLow(isDark)),
+    low = if (appChartRangeColors) Color(GlucoseRangeColors.low(isDark)) else lowTintBase,
+    inRange = if (appChartRangeColors) Color(GlucoseRangeColors.inRange(isDark)) else primaryColor,
+    high = if (appChartRangeColors) Color(GlucoseRangeColors.high(isDark)) else highTintBase,
+    veryHigh = Color(GlucoseRangeColors.veryHigh(isDark))
+)
+
 internal fun coerceChartYToDrawableRange(
     value: Float,
     chartHeight: Float,
@@ -209,6 +374,28 @@ internal fun coerceChartYToDrawableRange(
     } else {
         value.coerceIn(0f, safeHeight)
     }
+}
+
+/** First index whose timestamp is at or after [timestamp]; the points ascend in time. */
+internal fun List<tk.glucodata.chart.ChartPointModel>.firstIndexAtOrAfter(timestamp: Long): Int {
+    var low = 0
+    var high = size
+    while (low < high) {
+        val mid = (low + high) ushr 1
+        if (this[mid].timestamp < timestamp) low = mid + 1 else high = mid
+    }
+    return low
+}
+
+/** First index whose timestamp is after [timestamp]; the points ascend in time. */
+internal fun List<tk.glucodata.chart.ChartPointModel>.firstIndexAfter(timestamp: Long): Int {
+    var low = 0
+    var high = size
+    while (low < high) {
+        val mid = (low + high) ushr 1
+        if (this[mid].timestamp <= timestamp) low = mid + 1 else high = mid
+    }
+    return low
 }
 
 internal fun previewCenterTimeForWindowEnd(windowEndTime: Long): Long {
@@ -237,207 +424,39 @@ internal fun previewCenterTimeContainingViewport(
     }
 }
 
-private fun smoothChartSeries(
-    points: List<GlucosePoint>,
-    halfWindowMs: Long,
-    selector: (GlucosePoint) -> Float
-): FloatArray {
-    val size = points.size
-    val prefixSums = DoubleArray(size + 1)
-    val prefixCounts = IntArray(size + 1)
-
-    for (index in 0 until size) {
-        val value = selector(points[index])
-        val valid = value.isFinite() && value >= 0.1f
-        prefixSums[index + 1] = prefixSums[index] + if (valid) value.toDouble() else 0.0
-        prefixCounts[index + 1] = prefixCounts[index] + if (valid) 1 else 0
-    }
-
-    val result = FloatArray(size)
-    var windowStart = 0
-    var windowEndExclusive = 0
-
-    for (index in 0 until size) {
-        val original = selector(points[index])
-        if (!original.isFinite() || original < 0.1f) {
-            result[index] = original
-            continue
-        }
-
-        val timestamp = points[index].timestamp
-        val minTime = timestamp - halfWindowMs
-        val maxTime = timestamp + halfWindowMs
-
-        while (windowStart < size && points[windowStart].timestamp < minTime) {
-            windowStart++
-        }
-        while (windowEndExclusive < size && points[windowEndExclusive].timestamp <= maxTime) {
-            windowEndExclusive++
-        }
-
-        val count = prefixCounts[windowEndExclusive] - prefixCounts[windowStart]
-        result[index] = if (count > 0) {
-            ((prefixSums[windowEndExclusive] - prefixSums[windowStart]) / count).toFloat()
-        } else {
-            original
-        }
-    }
-
-    return result
-}
-
 private fun buildSmoothedChartData(
     points: List<GlucosePoint>,
     smoothingMinutes: Int,
     collapseIntoChunks: Boolean
-): List<GlucosePoint> {
-    if (smoothingMinutes <= 0 || points.size < 3) return points
-
-    val halfWindowMs = (smoothingMinutes * 60_000L) / 2L
-    if (halfWindowMs <= 0L) return points
-
-    val collapsedInterval = DataSmoothing.collapseIntervalMinutes(smoothingMinutes)
-    val result = ArrayList<GlucosePoint>(points.size)
-
-    GlucosePointSegments.split(points).forEach { segment ->
-        val smoothedSegment = if (segment.size < 3) {
-            segment
-        } else {
-            val smoothedAuto = smoothChartSeries(segment, halfWindowMs) { it.value }
-            val smoothedRaw = smoothChartSeries(segment, halfWindowMs) { it.rawValue }
-
-            ArrayList<GlucosePoint>(segment.size).apply {
-                segment.indices.forEach { index ->
-                    val point = segment[index]
-                    add(
-                        point.copy(
-                            value = smoothedAuto[index],
-                            rawValue = smoothedRaw[index]
-                        )
-                    )
-                }
-            }
-        }
-
-        if (collapseIntoChunks) {
-            result.addAll(collapseSmoothedChartData(smoothedSegment, collapsedInterval))
-        } else {
-            result.addAll(smoothedSegment)
-        }
+): List<GlucosePoint> = tk.glucodata.GlucoseSmoothing.smooth(
+    points = points,
+    smoothingMinutes = smoothingMinutes,
+    collapseIntoChunks = collapseIntoChunks,
+    timestamp = { it.timestamp },
+    value = { it.value },
+    rawValue = { it.rawValue },
+    sensorSerial = { it.sensorSerial },
+    // The band follows the value it describes; smoothing displaces the line but
+    // does not make the sensor more certain, so the width is preserved.
+    withValues = { point, auto, raw ->
+        point.copy(
+            value = auto,
+            rawValue = raw,
+            uncertainty = point.uncertainty?.shifted(auto - point.value),
+        )
     }
+)
 
-    return result
-}
-
-private fun collapseSmoothedChartData(
-    points: List<GlucosePoint>,
-    smoothingMinutes: Int
-): List<GlucosePoint> {
-    if (points.isEmpty() || smoothingMinutes <= 0) return points
-    val bucketDurationMs = smoothingMinutes * 60_000L
-    val openBucket = System.currentTimeMillis() / bucketDurationMs
-    val collapsed = ArrayList<GlucosePoint>()
-    var activeBucket = Long.MIN_VALUE
-    var pending: GlucosePoint? = null
-
-    points.forEach { point ->
-        val bucket = point.timestamp / bucketDurationMs
-        if (bucket != activeBucket) {
-            if (activeBucket < openBucket) {
-                pending?.let(collapsed::add)
-            }
-            activeBucket = bucket
-        }
-        pending = point
-    }
-
-    if (activeBucket < openBucket) {
-        pending?.let(collapsed::add)
-    }
-    return when {
-        collapsed.isNotEmpty() -> collapsed
-        points.isNotEmpty() -> listOf(points.last())
-        else -> points
-    }
-}
-
-private class CalibratedValueResolver(private val points: List<GlucosePoint>) {
-    private val rawComputed = BooleanArray(points.size)
-    private val autoComputed = BooleanArray(points.size)
-    private val rawValues = FloatArray(points.size)
-    private val autoValues = FloatArray(points.size)
-    private val rawCalibrationActive = HashMap<String?, Boolean>()
-    private val autoCalibrationActive = HashMap<String?, Boolean>()
-
-    fun hasCalibration(isRawMode: Boolean, sensorId: String? = null): Boolean {
-        if (tk.glucodata.data.calibration.CalibrationManager.shouldOverwriteSensorValues()) {
-            return false
-        }
-        val cache = if (isRawMode) rawCalibrationActive else autoCalibrationActive
-        return cache.getOrPut(sensorId) {
-            tk.glucodata.data.calibration.CalibrationManager.hasActiveCalibration(isRawMode, sensorId)
-        }
-    }
-
-    fun valueAt(index: Int, isRawMode: Boolean): Float {
-        if (index !in points.indices) return Float.NaN
-        val computed = if (isRawMode) rawComputed else autoComputed
-        val values = if (isRawMode) rawValues else autoValues
-        if (computed[index]) {
-            return values[index]
-        }
-        val point = points[index]
-        val baseValue = if (isRawMode) point.rawValue else point.value
-        val resolved = if (
-            baseValue.isFinite() &&
-            baseValue > 0.1f &&
-            hasCalibration(isRawMode, point.sensorSerial)
-        ) {
-            tk.glucodata.data.calibration.CalibrationManager.getCalibratedValue(
-                baseValue,
-                point.timestamp,
-                isRawMode,
-                sensorIdOverride = point.sensorSerial
-            )
-        } else {
-            baseValue
-        }
-        values[index] = resolved
-        computed[index] = true
-        return resolved
-    }
-
-    fun valueForPoint(point: GlucosePoint, isRawMode: Boolean): Float {
-        val pointIndex = points.indexOf(point)
-        return if (pointIndex >= 0) valueAt(pointIndex, isRawMode) else {
-            val baseValue = if (isRawMode) point.rawValue else point.value
-            if (
-                baseValue.isFinite() &&
-                baseValue > 0.1f &&
-                hasCalibration(isRawMode, point.sensorSerial)
-            ) {
-                tk.glucodata.data.calibration.CalibrationManager.getCalibratedValue(
-                    baseValue,
-                    point.timestamp,
-                    isRawMode,
-                    sensorIdOverride = point.sensorSerial
-                )
-            } else {
-                baseValue
-            }
-        }
-    }
-}
 
 @Composable
 private fun PreviewWindowNavigator(
     modifier: Modifier = Modifier,
     renderData: List<GlucosePoint>,
-    calibratedValueResolver: CalibratedValueResolver,
+    chartModel: tk.glucodata.chart.HistoryChartModel,
     previewCenterTime: Long,
     viewMode: Int,
-    targetLow: Float,
-    targetHigh: Float,
+    rangeThresholds: ChartRangeThresholds,
+    rangePalette: ChartRangePalette,
     isMmol: Boolean,
     currentCenterTime: Long,
     currentVisibleDuration: Long
@@ -446,23 +465,23 @@ private fun PreviewWindowNavigator(
     val previewHalfDuration = previewDuration / 2
     val previewStart = previewCenterTime - previewHalfDuration
     val previewEnd = previewCenterTime + previewHalfDuration
-    val lineColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.88f)
     val secondaryLineColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.55f)
-    val targetBandColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.1f)
+    val isDark = tk.glucodata.ui.isAppInDarkTheme()
+    val paletteRevision = GlucosePaletteState.revision
+    val targetBandColor = remember(isDark, paletteRevision) {
+        Color(GlucoseRangeColors.targetBackground(isDark)).copy(alpha = 0.12f)
+    }
     val windowFillColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.11f)
     val windowStrokeColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.65f)
     val surfaceColor = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.92f)
     val minimumWindowWidthPx = with(LocalDensity.current) { 12.dp.toPx() }
     val isRawMode = viewMode == 1 || viewMode == 3
-    val hasCalibration = calibratedValueResolver.hasCalibration(isRawMode)
 
+    // The main-line value is the model's, resolved once; nothing here derives.
     fun activeValue(index: Int): Float {
-        return if (hasCalibration) {
-            calibratedValueResolver.valueAt(index, isRawMode)
-        } else {
-            val renderPoint = renderData[index]
-            if (isRawMode) renderPoint.rawValue else renderPoint.value
-        }
+        val renderPoint = renderData[index]
+        return chartModel.primary?.valueAt(renderPoint.timestamp)
+            ?: if (isRawMode) renderPoint.rawValue else renderPoint.value
     }
 
     fun windowBoundsPx(width: Float): Pair<Float, Float> {
@@ -476,7 +495,7 @@ private fun PreviewWindowNavigator(
 
     Surface(
         modifier = modifier.zIndex(2f),
-        shape = RoundedCornerShape(18.dp),
+        shape = RoundedCornerShape(16.dp),
         color = surfaceColor,
         tonalElevation = 2.dp,
         shadowElevation = 0.dp
@@ -489,7 +508,7 @@ private fun PreviewWindowNavigator(
             Canvas(
                 modifier = Modifier
                     .fillMaxSize()
-                    .padding(horizontal = 10.dp, vertical = 8.dp)
+                    .padding(horizontal = 12.dp, vertical = 8.dp)
             ) {
                 if (renderData.isEmpty()) return@Canvas
 
@@ -500,8 +519,8 @@ private fun PreviewWindowNavigator(
                     .let { if (it < 0) -it else it + 1 }
                     .coerceIn(startIdx + 1, renderData.size)
 
-                var minValue = targetLow
-                var maxValue = targetHigh
+                var minValue = rangeThresholds.low
+                var maxValue = rangeThresholds.high
                 for (index in startIdx until endExclusive) {
                     val value = activeValue(index)
                     if (value.isFinite() && value > 0.1f) {
@@ -527,8 +546,37 @@ private fun PreviewWindowNavigator(
                 fun valueToY(value: Float): Float =
                     heightPx - (((value - minValue) / yRange) * heightPx)
 
-                val bandTop = valueToY(targetHigh).coerceIn(0f, heightPx)
-                val bandBottom = valueToY(targetLow).coerceIn(0f, heightPx)
+                // Same band geometry as the main chart, so the preview reads as a
+                // miniature of the trace above it instead of a flat primary line.
+                // GlucoseChartBands fades a band into the in-range tone over a
+                // fixed pixel distance, tuned for the full-height chart. This
+                // strip squeezes the same value span into ~42.dp, where 18px is
+                // most of a mmol/L: the low tone would start bleeding in around
+                // 4.5 on a 3.5 target, which reads as the preview ignoring the
+                // target range. Fade over a slice of the strip instead.
+                val previewFadePx = (heightPx * PREVIEW_BAND_FADE_FRACTION)
+                    .coerceIn(1f, GlucoseChartBands.DEFAULT_FADE_PX)
+                val rangeStops = GlucoseChartBands.verticalStops(
+                    veryHigh = rangePalette.veryHigh,
+                    high = rangePalette.high,
+                    inRange = rangePalette.inRange,
+                    low = rangePalette.low,
+                    veryLow = rangePalette.veryLow,
+                    yVeryHigh = valueToY(rangeThresholds.veryHigh),
+                    yHigh = valueToY(rangeThresholds.high),
+                    yLow = valueToY(rangeThresholds.low),
+                    yVeryLow = valueToY(rangeThresholds.veryLow),
+                    chartHeightPx = heightPx,
+                    fadePx = previewFadePx
+                )
+                val rangeBrush = Brush.verticalGradient(
+                    *rangeStops.toTypedArray(),
+                    startY = 0f,
+                    endY = heightPx
+                )
+
+                val bandTop = valueToY(rangeThresholds.high).coerceIn(0f, heightPx)
+                val bandBottom = valueToY(rangeThresholds.low).coerceIn(0f, heightPx)
                 drawRoundRect(
                     color = targetBandColor,
                     topLeft = Offset(0f, minOf(bandTop, bandBottom)),
@@ -540,11 +588,13 @@ private fun PreviewWindowNavigator(
                 var started = false
                 var lastTimestamp = 0L
                 var lastSensorSerial: String? = null
-                val gapThreshold = 15 * 60 * 1000L
+                val gapThreshold = ChartGap.THRESHOLD_MS
+                val previewRun = ChartLineRun()
                 for (index in startIdx until endExclusive) {
                     val value = activeValue(index)
                     if (!value.isFinite() || value < 0.1f) {
-                        started = false
+                        // No value in the active lane is not a hole in it — the gap check
+                        // below still measures elapsed time. See the main chart's AUTO branch.
                         continue
                     }
                     val timestamp = renderData[index].timestamp
@@ -557,18 +607,25 @@ private fun PreviewWindowNavigator(
                         sensorSerial != lastSensorSerial
                     if (!started || (timestamp - lastTimestamp) > gapThreshold || sensorChanged) {
                         previewPath.moveTo(x, y)
+                        previewRun.begin(x, y)
                         started = true
                     } else {
                         previewPath.lineTo(x, y)
+                        previewRun.extend()
                     }
                     lastTimestamp = timestamp
                     lastSensorSerial = sensorSerial
                 }
+                previewRun.flush()
+                val previewStroke = 2.5.dp.toPx()
                 drawPath(
                     path = previewPath,
-                    color = lineColor,
-                    style = Stroke(width = 2.5.dp.toPx(), cap = StrokeCap.Round, join = StrokeJoin.Round)
+                    brush = rangeBrush,
+                    style = Stroke(width = previewStroke, cap = StrokeCap.Round, join = StrokeJoin.Round)
                 )
+                previewRun.isolatedPoints.forEach { point ->
+                    drawCircle(brush = rangeBrush, radius = previewStroke / 2f, center = point)
+                }
 
                 val currentStart = currentCenterTime - currentVisibleDuration / 2
                 val currentEnd = currentCenterTime + currentVisibleDuration / 2
@@ -611,6 +668,19 @@ private fun PreviewWindowNavigator(
     }
 }
 
+/**
+ * Above this posterior artifact probability the tooltip mentions the
+ * possibility. Chosen so the notice appears when the artifact hypothesis is a
+ * genuine competitor, not whenever it is merely non-zero.
+ */
+private const val ARTIFACT_NOTICE_PROBABILITY = 0.25f
+
+/** Below this confidence the tooltip says so rather than leaving the wide band unexplained. */
+private const val LOW_CONFIDENCE_NOTICE = 0.45f
+
+/** The whole timeline's first and last reading, for a chart handed only a window of it. */
+data class ChartDataBounds(val earliestMs: Long, val latestMs: Long)
+
 data class ChartViewportSnapshot(
     val startMillis: Long,
     val endMillis: Long,
@@ -618,11 +688,50 @@ data class ChartViewportSnapshot(
     val selectedPoint: GlucosePoint?
 )
 
+/**
+ * Where the chart draws the tapped time's dot, on screen, for the journal menu to grow from. It
+ * follows the dot through scrolling and panning, and keeps its last place once the dot goes,
+ * so the menu can close where it was.
+ */
+@Stable
+class ChartActionAnchor {
+    var dotOnScreen by mutableStateOf<Offset?>(null)
+        internal set
+    /** The plot's top. */
+    var ceilingOnScreen by mutableStateOf(0f)
+        internal set
+    /** The top of the tapped time's chip at the plot's foot. */
+    var floorOnScreen by mutableStateOf(0f)
+        internal set
+    /** Past the middle, where the newest readings are, the menu opens to the dot's left. */
+    var opensLeft by mutableStateOf(false)
+        internal set
+    /**
+     * The finger from the long press that opened the menu, on screen; null if its gesture was
+     * cancelled. The menu takes the slide onto an item and the lift there as picking it, so a
+     * lift stays, with where it happened, until the next long press.
+     */
+    var heldFinger by mutableStateOf<HeldFinger?>(null)
+        internal set
+}
+
+/** Where the long-pressing finger is on screen, or where it [lifted]. */
+@Immutable
+data class HeldFinger(val onScreen: Offset, val lifted: Boolean)
+
 data class ChartTimelineTapSuggestion(
     val timestamp: Long,
     val suggestedDisplayGlucose: Float? = null,
     val normalizedYFraction: Float? = null,
     val forceMenu: Boolean = false
+)
+
+/** A peer's row in the scrub tooltip: its smoothed point, and what its line drew there when that is not the point's own value. */
+private class TooltipPeerRow(
+    val viewMode: Int,
+    val color: Color,
+    val point: GlucosePoint,
+    val calibratedValue: Float?,
 )
 
 private fun List<GlucosePoint>.sliceByTimestampRange(startMillis: Long, endMillis: Long): List<GlucosePoint> {
@@ -641,9 +750,13 @@ fun DashboardChartSection(
     modifier: Modifier,
     glucoseHistory: List<GlucosePoint>,
     multiSensorDisplay: MultiSensorDisplayData = MultiSensorDisplayData.EMPTY,
+    mainSensorOwnership: tk.glucodata.chart.MainSensorOwnership = tk.glucodata.chart.MainSensorOwnership.NONE,
     peerPredictionSeries: Map<String, List<GlucosePredictionSeries>> = emptyMap(),
     journalMarkers: List<JournalChartMarker> = emptyList(),
     activeInsulinSummary: JournalActiveInsulinSummary? = null,
+    activeCarbsGrams: Float? = null,
+    stateDoseHint: StateDoseHint? = null,
+    activeInsulinFromRemote: Boolean = false,
     showEiob: Boolean = true,
     appChartRangeColors: Boolean = false,
     predictionPoints: List<GlucosePredictionPoint> = emptyList(),
@@ -671,22 +784,34 @@ fun DashboardChartSection(
     onTimelineTap: ((ChartTimelineTapSuggestion) -> Unit)? = null,
     journalActionTimestamp: Long? = null,
     journalActionDisplayValue: Float? = null,
+    journalActionAnchor: ChartActionAnchor? = null,
     onDismissJournalAction: (() -> Unit)? = null,
     onJournalMarkerClick: ((Long) -> Unit)? = null,
     chartBoostProgress: Float = 0f,
     resetToLatestOnResume: Boolean = true,
-    onViewportSnapshotChanged: ((ChartViewportSnapshot) -> Unit)? = null
+    onViewportSnapshotChanged: ((ChartViewportSnapshot) -> Unit)? = null,
+    dataBounds: ChartDataBounds? = null,
+    onVisibleRangeChanged: ((startMs: Long, endMs: Long) -> Unit)? = null
 ) {
     val chartContent: @Composable () -> Unit = {
         Column(modifier = Modifier.padding(bottom = 0.dp)) {
              Box(modifier = Modifier.weight(1f)) {
-                if (glucoseHistory.isNotEmpty()) {
+                // With bounds the chart composes before its window has loaded:
+                // it has to, since it is the chart's viewport that says which
+                // window to load.
+                if (glucoseHistory.isNotEmpty() || dataBounds != null) {
                     InteractiveGlucoseChart(
                         fullData = glucoseHistory,
+                        dataBounds = dataBounds,
+                        onVisibleRangeChanged = onVisibleRangeChanged,
                         multiSensorDisplay = multiSensorDisplay,
+                        mainSensorOwnership = mainSensorOwnership,
                         peerPredictionSeries = peerPredictionSeries,
                         journalMarkers = journalMarkers,
                         activeInsulinSummary = activeInsulinSummary,
+                        activeCarbsGrams = activeCarbsGrams,
+                        stateDoseHint = stateDoseHint,
+                        activeInsulinFromRemote = activeInsulinFromRemote,
                         showEiob = showEiob,
                         appChartRangeColors = appChartRangeColors,
                         predictionPoints = predictionPoints,
@@ -714,6 +839,7 @@ fun DashboardChartSection(
                         onTimelineTap = onTimelineTap,
                         journalActionTimestamp = journalActionTimestamp,
                         journalActionDisplayValue = journalActionDisplayValue,
+                        journalActionAnchor = journalActionAnchor,
                         onDismissJournalAction = onDismissJournalAction,
                         onJournalMarkerClick = onJournalMarkerClick,
                         chartBoostProgress = chartBoostProgress,
@@ -727,7 +853,9 @@ fun DashboardChartSection(
         }
     }
     val safeExpandedProgress = expandedProgress.coerceIn(0f, 1f)
-    val collapseVisualProgress = (((1f - safeExpandedProgress) - 0.06f) / 0.94f).coerceIn(0f, 1f)
+    // No dead zone: the 6% one meant the colour and the corner radius sat still while
+    // the card was already pulling in from the edges, so the shape led the paint.
+    val collapseVisualProgress = 1f - safeExpandedProgress
     val containerColor = androidx.compose.ui.graphics.lerp(
         MaterialTheme.colorScheme.background,
         MaterialTheme.colorScheme.surfaceContainerHigh,
@@ -738,21 +866,29 @@ fun DashboardChartSection(
         modifier = modifier,
         shape = RoundedCornerShape(cornerRadius),
         color = containerColor,
-        tonalElevation = 2.dp * collapseVisualProgress,
+        // Deliberately no tonalElevation. Material's Surface only applies it when the
+        // colour is exactly colorScheme.surface, so with a lerped colour it switches on
+        // and off at whichever endpoint happens to match in the current scheme — a tint
+        // that pops at the end of the animation in some themes and never appears in
+        // others. surfaceContainerHigh is already the elevated tone, so the lerp alone
+        // carries the intent.
         shadowElevation = 0.dp
     ) {
         chartContent()
     }
 }
 
-@SuppressLint("UnusedBoxWithConstraintsScope")
 @Composable
 fun InteractiveGlucoseChart(
     fullData: List<GlucosePoint>,
     multiSensorDisplay: MultiSensorDisplayData = MultiSensorDisplayData.EMPTY,
+    mainSensorOwnership: tk.glucodata.chart.MainSensorOwnership = tk.glucodata.chart.MainSensorOwnership.NONE,
     peerPredictionSeries: Map<String, List<GlucosePredictionSeries>> = emptyMap(),
     journalMarkers: List<JournalChartMarker> = emptyList(),
     activeInsulinSummary: JournalActiveInsulinSummary? = null,
+    activeCarbsGrams: Float? = null,
+    stateDoseHint: StateDoseHint? = null,
+    activeInsulinFromRemote: Boolean = false,
     showEiob: Boolean = true,
     appChartRangeColors: Boolean = false,
     predictionPoints: List<GlucosePredictionPoint> = emptyList(),
@@ -781,30 +917,46 @@ fun InteractiveGlucoseChart(
     onTimelineTap: ((ChartTimelineTapSuggestion) -> Unit)? = null,
     journalActionTimestamp: Long? = null,
     journalActionDisplayValue: Float? = null,
+    journalActionAnchor: ChartActionAnchor? = null,
     onDismissJournalAction: (() -> Unit)? = null,
     onJournalMarkerClick: ((Long) -> Unit)? = null,
     chartBoostProgress: Float = 0f,
     resetToLatestOnResume: Boolean = true,
-    onViewportSnapshotChanged: ((ChartViewportSnapshot) -> Unit)? = null
+    onViewportSnapshotChanged: ((ChartViewportSnapshot) -> Unit)? = null,
+    /**
+     * Where the whole timeline begins and ends, when [fullData] is only the
+     * stretch of it on screen. Without it the ends of the list are taken to be
+     * the ends of the data, which is what every caller that still passes the
+     * whole list gets.
+     */
+    dataBounds: ChartDataBounds? = null,
+    /** Reports the viewport as it moves, so the owner of [fullData] can load around it. */
+    onVisibleRangeChanged: ((startMs: Long, endMs: Long) -> Unit)? = null
 ) {
     // --- THEME & PAINTS ---
-    val isDark = isSystemInDarkTheme()
+    val isDark = tk.glucodata.ui.isAppInDarkTheme()
     // Observe the glucose palette so target band / band tints recompute live
     // when the user switches presets or edits a band colour (no restart).
     val glucosePaletteRevision = GlucosePaletteState.revision
     // User requested stronger dark mode lines ("oddly pale").
     // Standard M3 dark primary is pastel. We use a more saturated blue for data.
     val primaryColor = MaterialTheme.colorScheme.primary
-    val secondaryColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f)
+    val secondaryColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.72f)
     val tertiaryColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.45f) // Lighter shade for 3rd line
     val pointColor = MaterialTheme.colorScheme.onSurface
     val gridColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.125f)
-    // Target band inherits the active in-range band colour (was a hardcoded
-    // Material green). Keep the 0.12f container-level opacity.
-    val targetBandColor = Color(GlucoseRangeColors.inRange(isDark)).copy(alpha = 0.12f)
+    // A dedicated override may replace the in-range hue; without one, the band
+    // follows IN_RANGE. The 0.12 alpha restores the original target-band weight.
+    val targetBandColor =
+        Color(GlucoseRangeColors.targetBackground(isDark)).copy(alpha = 0.12f)
 //    val targetBandColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.2f)
     val hoverLineColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
     val minMaxLineColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f)
+    // Axis labels were android.graphics.Color.GRAY and the min/max labels DKGRAY, which is
+    // near-invisible on a dark surface. Theme roles instead: quiet for the axis, full
+    // contrast for the min/max values that are actually being called out.
+    val axisTextColorArgb = MaterialTheme.colorScheme.onSurfaceVariant.toArgb()
+    val indicatorTextColorArgb = MaterialTheme.colorScheme.onSurface.toArgb()
     val safeExpandedProgress = expandedProgress.coerceIn(0f, 1f)
     val chartUnderlayBottomDp = expandedUnderlayBottom * safeExpandedProgress
     val chartUnderlayBottomPx = with(LocalDensity.current) { chartUnderlayBottomDp.toPx() }
@@ -833,6 +985,23 @@ fun InteractiveGlucoseChart(
     // Adjusting alpha for visibility on graph background
     val lowOutOfRangeTintBase = TirLowColor
     val highOutOfRangeTintBase = TirHighColor
+    // Resolved once for the trace and the preview strip below it.
+    val chartBandPalette = remember(
+        isDark,
+        appChartRangeColors,
+        primaryColor,
+        lowOutOfRangeTintBase,
+        highOutOfRangeTintBase,
+        glucosePaletteRevision
+    ) {
+        chartRangePalette(
+            isDark,
+            appChartRangeColors,
+            primaryColor,
+            lowOutOfRangeTintBase,
+            highOutOfRangeTintBase
+        )
+    }
     // Neutral target for desaturating peer (secondary sensor) traces — theme
     // token so it adapts to light/dark and dynamic color.
     val peerNeutralBase = MaterialTheme.colorScheme.onSurfaceVariant
@@ -886,18 +1055,21 @@ fun InteractiveGlucoseChart(
     }
 
     // Paints
-    val axisTextPaint = remember(graphFont) {
+    // In sp, so the axis follows the system font size like every other label (it was a fixed
+    // 10dp); 11sp is the smallest step of the M3 type scale.
+    val axisLabelTextPx = with(LocalDensity.current) { 11.sp.toPx() }
+    val axisTextPaint = remember(graphFont, axisLabelTextPx) {
         android.graphics.Paint().apply {
             color = android.graphics.Color.GRAY
-            textSize = 10f * density
+            textSize = axisLabelTextPx
             textAlign = android.graphics.Paint.Align.LEFT
             typeface = graphFont
         }
     }
-    val xTextPaint = remember(graphFont) {
+    val xTextPaint = remember(graphFont, axisLabelTextPx) {
         android.graphics.Paint().apply {
             color = android.graphics.Color.GRAY
-            textSize = 10f * density
+            textSize = axisLabelTextPx
             textAlign = android.graphics.Paint.Align.CENTER
             typeface = graphFont
         }
@@ -909,44 +1081,75 @@ fun InteractiveGlucoseChart(
     val safeData = remember(fullData) {
         if (fullData is java.util.RandomAccess) fullData else ArrayList(fullData)
     }
-    val renderData = remember(safeData, graphSmoothingMinutes, collapseSmoothedData) {
-        buildSmoothedChartData(safeData, graphSmoothingMinutes, collapseSmoothedData)
-    }
-    val peerChartSeries = remember(
-        multiSensorDisplay,
-        graphSmoothingMinutes,
-        collapseSmoothedData
-    ) {
-        multiSensorDisplay.series.mapNotNull { series ->
-            if (series.points.size < 2) return@mapNotNull null
-            PeerSensorChartSeries(
-                sensorId = series.sensorId,
-                viewMode = series.viewMode,
-                color = Color(series.colorArgb),
-                points = buildSmoothedChartData(series.points, graphSmoothingMinutes, collapseSmoothedData)
-            )
-        }
-    }
-    val peerPointsByBucket = multiSensorDisplay.bucketLookup
-    // serial (normalized to logical id) -> draw attributes; O(1) lookups in the
-    // cursor/tooltip hot paths instead of SensorIdentity.matches per frame.
-    val peerDrawAttrs = remember(multiSensorDisplay) {
-        multiSensorDisplay.series.associate { series ->
-            series.sensorId to (Color(series.colorArgb) to series.viewMode)
-        }
-    }
     val primarySerial = fullData.lastOrNull()?.sensorSerial
     val primaryIdentityColor = remember(primarySerial) {
         val logical = SensorIdentity.resolveAppSensorId(primarySerial) ?: primarySerial
         SensorColors.getColor(logical.orEmpty())
     }
+    // A colour the user picked for a sensor replaces the range colouring of its own trace.
+    // Automatic (hash-assigned) colours deliberately do not, or every trace would lose the
+    // low/high banding by default.
+    val primaryPickedColor = tk.glucodata.SensorVisuals.colorOverrideArgb(primarySerial)
+        ?.let { Color(it) }
+    val calibrationRevision by tk.glucodata.data.calibration.CalibrationManager.revision.collectAsStateWithLifecycle()
+    val isRawModeChart = viewMode == 1 || viewMode == 3
+    // A fact, not a decision: whether a calibration applies to the primary lane.
+    val hasCalibration = remember(calibrationRevision, isRawModeChart, primarySerial) {
+        tk.glucodata.data.calibration.CalibrationManager.hasActiveCalibration(isRawModeChart, primarySerial)
+    }
+    // The preference applies to every calibrated series, including peers when
+    // the current primary has no calibration of its own.
+    val hideInitialWhenCalibrated =
+        tk.glucodata.data.calibration.CalibrationManager.shouldHideInitialWhenCalibrated()
+
+    // The resolved chart. Every decision — the value each point draws, who is
+    // main at each minute, which lanes exist, where runs break — is made here,
+    // once, by the same builder the notification uses. Everything below paints
+    // what this says; nothing below decides.
+    //
+    // Resolved off the main thread once the chart is up: smoothing and the
+    // builder are each a pass over the whole timeline, and the timeline is the
+    // whole store. See rememberChartResolution.
+    val resolutionInputs = remember(
+        safeData, multiSensorDisplay, graphSmoothingMinutes, collapseSmoothedData,
+        mainSensorOwnership, calibrationRevision, viewMode, hasCalibration,
+        hideInitialWhenCalibrated, primarySerial, primaryIdentityColor,
+    ) {
+        ChartResolutionInputs(
+            safeData = safeData,
+            multiSensorDisplay = multiSensorDisplay,
+            graphSmoothingMinutes = graphSmoothingMinutes,
+            collapseSmoothedData = collapseSmoothedData,
+            mainSensorOwnership = mainSensorOwnership,
+            calibrationRevision = calibrationRevision,
+            viewMode = viewMode,
+            hasCalibration = hasCalibration,
+            hideInitialWhenCalibrated = hideInitialWhenCalibrated,
+            primarySerial = primarySerial,
+            primaryColorArgb = primaryIdentityColor.toArgb(),
+        )
+    }
+    val resolution = rememberChartResolution(resolutionInputs, ::resolveDashboardChart)
+    val renderData = resolution.renderData
+    val peerChartSeries = resolution.peerChartSeries
+    val chartModel = resolution.chartModel
+    // Whether a calibration applies to each peer's own lane: the tooltip leads
+    // with the calibrated number exactly as it does for the primary.
+    val peerHasCalibration = remember(calibrationRevision, peerChartSeries) {
+        peerChartSeries.associate { peer ->
+            val peerIsRaw = peer.viewMode == 1 || peer.viewMode == 3
+            peer.sensorId to tk.glucodata.data.calibration.CalibrationManager.hasActiveCalibration(peerIsRaw, peer.sensorId)
+        }
+    }
     val interactionData = remember(safeData, renderData, graphSmoothingMinutes) {
         if (graphSmoothingMinutes > 0) renderData else safeData
     }
-    val uiRefreshRevision by UiRefreshBus.revision.collectAsState()
-    val calibrationRevision = tk.glucodata.CalibrationAccess.getRevision()
-    val calibratedValueResolver = remember(renderData, calibrationRevision, uiRefreshRevision) {
-        CalibratedValueResolver(renderData)
+    val calibrationIsRawMode = viewMode == 1 || viewMode == 3
+    val visibleCalibrations = remember(calibrationRevision, calibrationIsRawMode, primarySerial) {
+        tk.glucodata.data.calibration.CalibrationManager.getVisibleCalibrations(
+            calibrationIsRawMode,
+            primarySerial
+        )
     }
 
     // --- FORMATTERS & TOOLS (Hoisted for Performance) ---
@@ -954,7 +1157,15 @@ fun InteractiveGlucoseChart(
     val formatDate = remember { java.text.SimpleDateFormat("EEE dd", java.util.Locale.getDefault()) }
 
     // Reusable objects to avoid allocation on every frame
+    // The ribbon is a display preference, and it is also gated on the data
+    // actually carrying intervals: after switching away from Adaptive V2 the
+    // stored bands are cleared, so a chart holding a stale list must not keep
+    // drawing them. Re-read on every refresh rather than remembered once,
+    // because the setting lives in the sensor sheet, not here.
+    val uncertaintyRibbonEnabled = GlucoseUncertaintyDisplay.isRibbonEnabled()
+
     val reusablePath = remember { Path() }
+    val reusableDemotedPath = remember { Path() }
     val reusablePeerPath = remember { Path() }
     val reusableRawPath = remember { Path() }
     val reusableAutoPath = remember { Path() }
@@ -986,10 +1197,21 @@ fun InteractiveGlucoseChart(
 
     // --- VIEWPORT STATE ---
     val now = System.currentTimeMillis()
-    val latestDataTimestamp = safeData.lastOrNull()?.timestamp ?: 0L
-    val earliestDataTimestamp = safeData.firstOrNull()?.timestamp ?: 0L
-    val dataSeriesSignature = remember(earliestDataTimestamp, latestDataTimestamp, safeData.size) {
-        "$earliestDataTimestamp:$latestDataTimestamp:${safeData.size}"
+    // The whole timeline's ends. From the bounds when the list is a window of
+    // it, from the list when the list is all of it — "latest" must be the store's
+    // newest reading either way, or back-to-now and the auto-scroll follow a
+    // stale edge.
+    val latestDataTimestamp = dataBounds?.latestMs ?: safeData.lastOrNull()?.timestamp ?: 0L
+    val earliestDataTimestamp = dataBounds?.earliestMs ?: safeData.firstOrNull()?.timestamp ?: 0L
+    // With bounds, the list's size is a matter of what is loaded and must not
+    // count as a new series — but its first arrival must, since the effects
+    // keyed on this wait for data before they centre the viewport.
+    val dataSeriesSignature = remember(earliestDataTimestamp, latestDataTimestamp, dataBounds, safeData.size) {
+        if (dataBounds != null) {
+            "$earliestDataTimestamp:$latestDataTimestamp:${safeData.isEmpty()}"
+        } else {
+            "$earliestDataTimestamp:$latestDataTimestamp:${safeData.size}"
+        }
     }
     val resolvedPredictionSeries = remember(predictionPoints, predictionSeries) {
         when {
@@ -1120,24 +1342,19 @@ fun InteractiveGlucoseChart(
         }
     }
 
-    // TRACKING INACTIVITY FOR GRAPH RESET
     var lastActiveTime by rememberSaveable { mutableLongStateOf(System.currentTimeMillis()) }
     val currentLatestDataTimestamp by rememberUpdatedState(latestDataTimestamp)
     val currentSelectedTimeRange by rememberUpdatedState(selectedTimeRange)
+    val currentResetToLatestOnResume by rememberUpdatedState(resetToLatestOnResume)
 
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 isResumed = true
-
                 val currentTime = System.currentTimeMillis()
-                val latestTimestamp = currentLatestDataTimestamp
-                // Bound how long the chart may keep a frozen viewport. After 5 min away,
-                // anchor the view to "now" even if the data flow has not re-emitted yet
-                // (cold start / process death restore). Clearing lastAutoScrolledTimestamp
-                // lets the dataSeriesSignature path re-snap on the next emission.
-                if (currentTime - lastActiveTime > 5 * 60 * 1000L) {
+                if (currentResetToLatestOnResume && currentTime - lastActiveTime > 5 * 60 * 1000L) {
                     visibleDuration = (currentSelectedTimeRange?.hours?.toLong() ?: 3L) * 60 * 60 * 1000
+                    val latestTimestamp = currentLatestDataTimestamp
                     val targetCenter = if (latestTimestamp > 0L) {
                         liveCenterTimeFor(latestTimestamp, visibleDuration)
                     } else {
@@ -1147,10 +1364,9 @@ fun InteractiveGlucoseChart(
                     previewCenterTime = previewCenterTimeForWindowEnd(targetCenter + visibleDuration / 2L)
                     lastAutoScrolledTimestamp = 0L
                 }
-            }
-            else if (event == Lifecycle.Event.ON_PAUSE) {
+            } else if (event == Lifecycle.Event.ON_PAUSE) {
                 isResumed = false
-                lastActiveTime = System.currentTimeMillis() // Save time on pause
+                lastActiveTime = System.currentTimeMillis()
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -1291,10 +1507,16 @@ fun InteractiveGlucoseChart(
     )
     val minYAxisSpan = if (isMmol) 6f else 108f
 
-    val isRawModeChart = viewMode == 1 || viewMode == 3
-    val hasCalibration = calibratedValueResolver.hasCalibration(isRawModeChart)
-    val hideInitialWhenCalibrated = hasCalibration &&
-        tk.glucodata.data.calibration.CalibrationManager.shouldHideInitialWhenCalibrated()
+    fun predictionBand(series: GlucosePredictionSeries): tk.glucodata.chart.PredictionBand {
+        val first = series.points.first()
+        val isRawLane = series.kind == GlucosePredictionSeriesKind.RAW ||
+            (series.kind == GlucosePredictionSeriesKind.CALIBRATED && (viewMode == 1 || viewMode == 3))
+        val sourceLane = series.kind == GlucosePredictionSeriesKind.AUTO &&
+            (hasCalibration || viewMode == 3)
+        val interval = if (uncertaintyRibbonEnabled) chartModel.primary
+            ?.uncertaintyAt(first.timestamp, isRawLane, sourceLane) else null
+        return tk.glucodata.chart.PredictionBand(first.value, first.confidence, interval, first.timestamp)
+    }
 
     val visibleValueRange = remember(
         renderData,
@@ -1306,7 +1528,9 @@ fun InteractiveGlucoseChart(
         viewMode,
         hasCalibration,
         hideInitialWhenCalibrated,
-        calibratedValueResolver
+        chartModel,
+        uncertaintyRibbonEnabled,
+        isMmol
     ) {
         val viewportStart = centerTime - visibleDuration / 2L
         val viewportEnd = centerTime + visibleDuration / 2L
@@ -1320,48 +1544,75 @@ fun InteractiveGlucoseChart(
             }
         }
 
-        fun visibleIndices(points: List<GlucosePoint>): IntRange? {
-            if (points.isEmpty()) return null
-            val start = points.binarySearchBy(viewportStart) { it.timestamp }
-                .let { if (it >= 0) it else -it - 1 }
-            val endExclusive = points.binarySearchBy(viewportEnd) { it.timestamp }
-                .let { if (it >= 0) it + 1 else -it - 1 }
-                .coerceAtMost(points.size)
-            return if (start < endExclusive) start until endExclusive else null
-        }
+        val (modelMin, modelMax) = chartModel.visibleValueRange(viewportStart, viewportEnd, uncertaintyRibbonEnabled)
+        modelMin?.let(::include)
+        modelMax?.let(::include)
 
-        val drawRaw = !hideInitialWhenCalibrated && (viewMode == 1 || viewMode == 2 || viewMode == 3)
-        val drawAuto = !hideInitialWhenCalibrated && (viewMode == 0 || viewMode == 2 || viewMode == 3)
-        visibleIndices(renderData)?.forEach { index ->
-            val point = renderData[index]
-            if (drawRaw) include(point.rawValue)
-            if (drawAuto) include(point.value)
-            if (hasCalibration) include(calibratedValueResolver.valueAt(index, isRawModeChart))
-        }
-
-        peerChartSeries.forEach { series ->
-            val drawRawPeer = series.viewMode == 1 || series.viewMode == 2 || series.viewMode == 3
-            val drawAutoPeer = series.viewMode == 0 || series.viewMode == 2 || series.viewMode == 3
-            visibleIndices(series.points)?.forEach { index ->
-                val point = series.points[index]
-                if (drawRawPeer) include(point.rawValue)
-                if (drawAutoPeer) include(point.value)
-            }
-        }
-
-        fun includePredictions(series: List<GlucosePredictionSeries>) {
+        fun includePredictions(series: List<GlucosePredictionSeries>, drawBands: Boolean = true) {
             series.forEach { prediction ->
+                if (prediction.points.isEmpty()) return@forEach
+                val band = predictionBand(prediction)
+                val main = prediction.kind == GlucosePredictionSeriesKind.CALIBRATED ||
+                    (prediction.kind == GlucosePredictionSeriesKind.RAW && (viewMode == 1 || viewMode == 3)) ||
+                    (prediction.kind == GlucosePredictionSeriesKind.AUTO && (viewMode == 0 || viewMode == 2))
                 prediction.points.forEach { point ->
-                    if (point.timestamp in viewportStart..viewportEnd) include(point.value)
+                    if (point.timestamp in viewportStart..viewportEnd) {
+                        include(point.value)
+                        if (drawBands && (main || band.isAnchored)) {
+                            val bounds = band.bounds(point.value, point.confidence, isMmol)
+                            include(bounds.lower); include(bounds.upper)
+                        }
+                    }
                 }
             }
         }
         includePredictions(resolvedPredictionSeries)
         peerChartSeries.forEach { peer ->
-            includePredictions(peerPredictionSeries[peer.sensorId].orEmpty())
+            includePredictions(peerPredictionSeries[peer.sensorId].orEmpty(), drawBands = false)
         }
 
         visibleMin.takeIf { it.isFinite() } to visibleMax.takeIf { it.isFinite() }
+    }
+
+    // Record the main value for the minutes actually on screen.
+    //
+    // Keyed on the viewport rather than on the data, and gated on the chart being
+    // resumed, because the record's claim is "this was presented" — see
+    // PresentedMinuteRecorder for why a query, a prefetch or a point held
+    // off-screen does not count. The settle delay is what separates a stretch the
+    // user stopped to read from one a fling swept past.
+    val presentedRecorderRepository = remember(context) { tk.glucodata.data.HistoryRepository(context) }
+    val isMmolForRecord = remember(unit) { GlucoseFormatter.isMmol(unit) }
+    LaunchedEffect(
+        isResumed,
+        centerTime,
+        visibleDuration,
+        viewMode,
+        chartModel,
+    ) {
+        if (!isResumed || renderData.isEmpty()) return@LaunchedEffect
+        kotlinx.coroutines.delay(PresentedMinuteRecorder.SETTLE_MS)
+
+        val viewportStart = centerTime - visibleDuration / 2L
+        val viewportEnd = centerTime + visibleDuration / 2L
+        val nowMs = System.currentTimeMillis()
+        // A minute inside its grace window can still change, so let it be
+        // resubmitted; the database decides whether the revision lands.
+        PresentedMinuteRecorder.releaseUnsealed(
+            nowMs - tk.glucodata.data.ReadingDisplay.DISPLAY_SEAL_GRACE_MS
+        )
+
+        val visible = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
+            chartModel.presentedMainValues(viewportStart, viewportEnd).map { p ->
+                tk.glucodata.data.HistoryRepository.PresentedMinute(
+                    minuteMs = p.minuteMs,
+                    displayMgdl = if (isMmolForRecord) GlucoseFormatter.mmolToMg(p.value) else p.value,
+                    sensorSerial = p.sensorId,
+                    viewMode = p.viewMode,
+                )
+            }
+        }
+        PresentedMinuteRecorder.recordVisible(presentedRecorderRepository, visible)
     }
 
     // Manual scaling establishes the baseline; visible outliers may temporarily expand it.
@@ -1529,12 +1780,29 @@ fun InteractiveGlucoseChart(
         suppressDoubleTapUntil = now + 450L
     }
 
+    // Zooms in on a stretch of time, for a pile of journal chips too crowded to spread apart at
+    // the current zoom: closer in, its chips have room.
+    fun zoomChartOnto(startMillis: Long, endMillis: Long) {
+        val duration = ((endMillis - startMillis) * 3L)
+            .coerceIn(minDuration, (visibleDuration / 2L).coerceAtLeast(minDuration))
+        val center = ((startMillis + endMillis) / 2L).coerceAtMost(maxAllowedCenterTime(duration))
+        preZoomDuration = 0L
+        visibleDuration = duration
+        centerTime = center
+        previewCenterTime = previewCenterTimeContainingViewport(
+            previewCenterTime = previewCenterTime,
+            viewportCenterTime = center,
+            visibleDuration = duration
+        )
+        markProgrammaticViewportChange()
+    }
+
     // --- DATA CAPTURE FOR GESTURES ---
     // Use rememberUpdatedState to ensure the running gesture coroutine always sees the latest data
     val currentSafeData by rememberUpdatedState(safeData)
     val currentInteractionData by rememberUpdatedState(interactionData)
     val currentViewMode by rememberUpdatedState(viewMode)
-    val currentCalibratedValueResolver by rememberUpdatedState(calibratedValueResolver)
+    val currentChartModel by rememberUpdatedState(chartModel)
     val currentRenderedYMin by rememberUpdatedState(renderedYMin)
     val currentRenderedYMax by rememberUpdatedState(renderedYMax)
     // The pointerInput lambda below is keyed on previewWindowReservedIntPx and otherwise
@@ -1604,6 +1872,11 @@ fun InteractiveGlucoseChart(
         }
     }
 
+    // Cheap and unconditional: the owner of the data sizes what it loads by this.
+    LaunchedEffect(centerTime, visibleDuration, onVisibleRangeChanged) {
+        onVisibleRangeChanged?.invoke(centerTime - visibleDuration / 2, centerTime + visibleDuration / 2)
+    }
+
     LaunchedEffect(interactionData, centerTime, visibleDuration, selectedPoint, onViewportSnapshotChanged) {
         val callback = onViewportSnapshotChanged ?: return@LaunchedEffect
         val viewportStart = centerTime - visibleDuration / 2
@@ -1630,15 +1903,22 @@ fun InteractiveGlucoseChart(
         }
     }
 
+    val activeJournalMarkerPointers = remember { mutableSetOf<PointerId>() }
+    // A chip in the overlap group spread open by a tap; any touch on the chart outside the
+    // chips settles it back.
+    var expandedJournalChipId by remember { mutableStateOf<Long?>(null) }
 
 
 
 
+    // Where the gesture surface sits on screen, to hand the held finger to the journal menu.
+    var gestureSurfaceOnScreen by remember { mutableStateOf(Offset.Zero) }
     Column(modifier = Modifier.fillMaxSize()) {
         BoxWithConstraints(
             modifier = Modifier
                 .fillMaxWidth()
                 .weight(1f)
+                .onGloballyPositioned { gestureSurfaceOnScreen = it.positionOnScreen() }
                 .pointerInput(previewWindowReservedIntPx) {
                     // Manual Gesture Handler for:
                     // 1. Pan / Inertia
@@ -1664,6 +1944,8 @@ fun InteractiveGlucoseChart(
                             // FIX: Use requireUnconsumed = true (default) to respect z-order.
                             // This prevents the chart from hijacking touches meant for the floating buttons.
                             val down = awaitFirstDown()
+                            val startedOnJournalMarker = down.id in activeJournalMarkerPointers
+                            if (!startedOnJournalMarker) expandedJournalChipId = null
                             val gestureStartTime = System.currentTimeMillis()
                             lastInteractionTimestamp = gestureStartTime
                             cancelAutoScroll()
@@ -1787,7 +2069,8 @@ fun InteractiveGlucoseChart(
                             // 1. Previous gesture was a tap (not a scroll)
                             // 2. Short duration since then (<300ms)
                             // 3. Close spatial proximity (<100px)
-                            val isDoubleTapStart = gestureStartTime >= suppressDoubleTapUntil &&
+                            val isDoubleTapStart = !startedOnJournalMarker &&
+                                    gestureStartTime >= suppressDoubleTapUntil &&
                                     lastGestureWasTap &&
                                     (gestureStartTime - lastTapTime < 300) &&
                                     (down.position - lastTapPos).getDistance() < 100.dp.toPx()
@@ -1849,7 +2132,9 @@ fun InteractiveGlucoseChart(
                             var yGestureStartMax = 0f
                             var yGestureAdjustsMax = false
                             var lastPointerCount = 1
-                            val longPressJob = if (onTimelineTap != null && !isDoubleTapStart) {
+                            val longPressJob = if (
+                                onTimelineTap != null && !isDoubleTapStart && !startedOnJournalMarker
+                            ) {
                                 coroutineScope.launch {
                                     kotlinx.coroutines.delay(viewConfiguration.longPressTimeoutMillis.toLong())
                                     if (!longPressTriggered && totalDragDistance < viewConfiguration.touchSlop) {
@@ -1859,6 +2144,8 @@ fun InteractiveGlucoseChart(
                                             selectedPoint = null
                                             onTimelineTap.invoke(suggestion)
                                             longPressTriggered = true
+                                            journalActionAnchor?.heldFinger =
+                                                HeldFinger(gestureSurfaceOnScreen + latestTouchPosition, lifted = false)
                                         }
                                     }
                                 }
@@ -1867,19 +2154,16 @@ fun InteractiveGlucoseChart(
                             }
 
                             // Only allow scrubbing if purely single tap start (not double tap sequence)
-                            isScrubbing = if (pointAtTouch != null && !isOneFingerZoom) {
+                            isScrubbing = if (
+                                !startedOnJournalMarker && pointAtTouch != null && !isOneFingerZoom
+                            ) {
                                 val timeDiff = timeAtTouch - pointAtTouch.timestamp
                                 if (timeDiff > 15 * 60 * 1000) false else {
                                     // When calibration is on and is primary, use calibrated value for touch target
                                     val isRawMode = currentViewMode == 1 || currentViewMode == 3
-                                    val hasCalibration = currentCalibratedValueResolver.hasCalibration(isRawMode)
-                                    val v = if (hasCalibration) {
-                                        currentCalibratedValueResolver.valueForPoint(pointAtTouch, isRawMode)
-                                    } else if (isRawMode) {
-                                        pointAtTouch.rawValue
-                                    } else {
-                                        pointAtTouch.value
-                                    }
+                                    // The touch target is the main line, which is the model's.
+                                    val v = currentChartModel.primary?.valueAt(pointAtTouch.timestamp)
+                                        ?: if (isRawMode) pointAtTouch.rawValue else pointAtTouch.value
                                     val liveYMin = currentRenderedYMin
                                     val liveYMax = currentRenderedYMax
                                     val dataY =
@@ -1902,6 +2186,12 @@ fun InteractiveGlucoseChart(
                                 val newChange = event.changes.firstOrNull { it.pressed }
                                     ?: event.changes.firstOrNull() ?: break
                                 latestTouchPosition = newChange.position
+                                if (longPressTriggered) {
+                                    journalActionAnchor?.heldFinger = HeldFinger(
+                                        gestureSurfaceOnScreen + newChange.position,
+                                        lifted = pointerCount == 0 || newChange.changedToUp()
+                                    )
+                                }
                                 if (pointerCount == 0 || newChange.changedToUp()) break
                                 if (pointerCount != lastPointerCount) {
                                     longPressJob?.cancel()
@@ -2037,7 +2327,8 @@ fun InteractiveGlucoseChart(
                             }
 
                             // ON UP
-                            val wasTap = totalDragDistance < viewConfiguration.touchSlop
+                            val wasTap = !startedOnJournalMarker &&
+                                totalDragDistance < viewConfiguration.touchSlop
                             longPressJob?.cancel()
                             lastGestureWasTap = wasTap && !isOneFingerZoom && !isScrubbing && !longPressTriggered
 
@@ -2134,6 +2425,10 @@ fun InteractiveGlucoseChart(
                                 }
                             }
                         } finally {
+                            // A lift is kept for the menu to pick on; anything else is a cancel.
+                            if (journalActionAnchor?.heldFinger?.lifted == false) {
+                                journalActionAnchor.heldFinger = null
+                            }
                             isYAxisAdjusting = false
                             isUserInteracting = false
                             lastInteractionTimestamp = System.currentTimeMillis()
@@ -2141,6 +2436,7 @@ fun InteractiveGlucoseChart(
                     }
                 }
         ) {
+            android.os.Trace.beginSection("DashboardPlot.compose")
             // Smooth zoom animation (DO NOT TOUCH)
             val animatedVisibleDuration by animateFloatAsState(
                 targetValue = visibleDuration.toFloat(),
@@ -2178,24 +2474,54 @@ fun InteractiveGlucoseChart(
             // Multi-sensor: the primary trace carries a subtle identity tint so
             // it pairs with its (tinted) values, like the peer traces do.
             val primaryLineTintFraction = if (peerChartSeries.isNotEmpty()) 0.22f else 0f
-            val appTrafficDark = isSystemInDarkTheme()
+            val appRangeDark = tk.glucodata.ui.isAppInDarkTheme()
             val gradientBrush = remember(
                 limitYVeryHigh,
                 limitYHigh,
                 limitYLow,
                 limitYVeryLow,
                 chartHeightPx,
-                primaryColor,
-                highOutOfRangeTintBase,
-                lowOutOfRangeTintBase,
+                chartBandPalette,
                 primaryLineTintFraction,
                 primaryIdentityColor,
                 appChartRangeColors,
-                appTrafficDark,
+                appRangeDark,
+                primaryPickedColor,
+                peerNeutralBase,
                 glucosePaletteRevision
             ) {
                 if (chartHeightPx <= 0f) {
                     Brush.linearGradient(listOf(Color.Transparent, Color.Transparent))
+                } else if (primaryPickedColor != null) {
+                    // A picked colour is applied the way a peer trace is: the identity colour
+                    // toned toward the neutral token, re-tinted at each band so a low still
+                    // reads as a low. Blended less than a peer because this is the main trace.
+                    val base = androidx.compose.ui.graphics.lerp(
+                        primaryPickedColor,
+                        peerNeutralBase,
+                        tk.glucodata.SensorVisuals.PRIMARY_TEXT_BLEND,
+                    )
+                    val stops = GlucoseChartBands.verticalStops(
+                        veryHigh = androidx.compose.ui.graphics.lerp(
+                            base, Color(GlucoseRangeColors.veryHigh(appRangeDark)), 0.58f,
+                        ),
+                        high = androidx.compose.ui.graphics.lerp(base, highOutOfRangeTintBase, 0.48f),
+                        inRange = base,
+                        low = androidx.compose.ui.graphics.lerp(base, lowOutOfRangeTintBase, 0.48f),
+                        veryLow = androidx.compose.ui.graphics.lerp(
+                            base, Color(GlucoseRangeColors.veryLow(appRangeDark)), 0.58f,
+                        ),
+                        yVeryHigh = limitYVeryHigh,
+                        yHigh = limitYHigh,
+                        yLow = limitYLow,
+                        yVeryLow = limitYVeryLow,
+                        chartHeightPx = chartHeightPx,
+                    )
+                    Brush.verticalGradient(
+                        *stops.toTypedArray(),
+                        startY = 0f,
+                        endY = chartHeightPx,
+                    )
                 } else {
                     fun identityTinted(color: Color): Color =
                         if (primaryLineTintFraction > 0f) {
@@ -2204,46 +2530,30 @@ fun InteractiveGlucoseChart(
                             color
                         }
 
-                    // Traffic mode swaps the muted tints for the same palette
-                    // the value/notification coloring uses, incl. green in range.
-                    val veryHighTint = identityTinted(
-                        if (appChartRangeColors) Color(GlucoseRangeColors.valueOut(appTrafficDark))
-                        else Color(GlucoseRangeColors.veryHigh(isDark))
+                    // Range-color mode uses the same five effective colors shown
+                    // in settings, including every per-band override.
+                    val veryHighTint = identityTinted(chartBandPalette.veryHigh)
+                    val highTint = identityTinted(chartBandPalette.high)
+                    val lowTint = identityTinted(chartBandPalette.low)
+                    val veryLowTint = identityTinted(chartBandPalette.veryLow)
+                    val inRangeTint = identityTinted(chartBandPalette.inRange)
+                    // Stop geometry lives in GlucoseChartBands so the watch's
+                    // curve bands on the same lines this one does.
+                    val stops = GlucoseChartBands.verticalStops(
+                        veryHigh = veryHighTint,
+                        high = highTint,
+                        inRange = inRangeTint,
+                        low = lowTint,
+                        veryLow = veryLowTint,
+                        yVeryHigh = limitYVeryHigh,
+                        yHigh = limitYHigh,
+                        yLow = limitYLow,
+                        yVeryLow = limitYVeryLow,
+                        chartHeightPx = chartHeightPx
                     )
-                    val highTint = identityTinted(
-                        if (appChartRangeColors) Color(GlucoseRangeColors.valueBorderline(appTrafficDark))
-                        else highOutOfRangeTintBase
-                    )
-                    val lowTint = identityTinted(
-                        if (appChartRangeColors) Color(GlucoseRangeColors.valueBorderline(appTrafficDark))
-                        else lowOutOfRangeTintBase
-                    )
-                    val veryLowTint = identityTinted(
-                        if (appChartRangeColors) Color(GlucoseRangeColors.valueOut(appTrafficDark))
-                        else Color(GlucoseRangeColors.veryLow(isDark))
-                    )
-                    val inRangeTint = identityTinted(
-                        if (appChartRangeColors) Color(GlucoseRangeColors.valueInRange(appTrafficDark))
-                        else primaryColor
-                    )
-                    val fadePx = 18f
-                    val stops = mutableListOf<Pair<Float, Color>>()
-
-                    fun addStop(y: Float, color: Color) {
-                        stops += (y / chartHeightPx).coerceIn(0f, 1f) to color
-                    }
-
-                    addStop(0f, veryHighTint)
-                    addStop(limitYVeryHigh, veryHighTint)
-                    addStop(limitYHigh, highTint)
-                    addStop(limitYHigh + fadePx, inRangeTint)
-                    addStop(limitYLow - fadePx, inRangeTint)
-                    addStop(limitYLow, lowTint)
-                    addStop(limitYVeryLow, veryLowTint)
-                    addStop(chartHeightPx, veryLowTint)
 
                     Brush.verticalGradient(
-                        *stops.sortedBy { it.first }.toTypedArray(),
+                        *stops.toTypedArray(),
                         startY = 0f,
                         endY = chartHeightPx
                     )
@@ -2308,6 +2618,8 @@ fun InteractiveGlucoseChart(
                             androidx.compose.ui.graphics.CompositingStrategy.ModulateAlpha
                     }
             ) {
+                android.os.Trace.beginSection("DashboardPlot.draw")
+                try {
                 val width = size.width
                 val rightPaddingPx = if (hasPredictionOverlay) 0f else (16.dp.toPx() * safeExpandedProgress)
                 val dataWidth = (width - rightPaddingPx).coerceAtLeast(1f)
@@ -2372,6 +2684,39 @@ fun InteractiveGlucoseChart(
                     return (normalized * cYRange) + cYMin
                 }
 
+                // Min/max of the visible series, found before the axis is drawn: the min/max
+                // labels sit in the axis label column, and an axis label at nearly the same
+                // height ("3,8" over "4") has to step aside rather than print underneath.
+                var minPoint: GlucosePoint? = null
+                var maxPoint: GlucosePoint? = null
+                var minVal = Float.MAX_VALUE
+                var maxVal = Float.MIN_VALUE
+                if (endIdx > startIdx) {
+                    // Single fast pass for min/max
+                    for (i in startIdx until endIdx) {
+                        val p = renderData[i]
+                        // Determine value based on mode commonality
+                        // If showing Raw (Mode 1) or Raw-Primary (Mode 3), prioritize Raw
+                        val useRaw = viewMode == 1 || viewMode == 3
+                        val v = if (hasCalibration && hideInitialWhenCalibrated) {
+                            chartModel.primary?.valueAt(p.timestamp) ?: Float.NaN
+                        } else {
+                            if (useRaw) p.rawValue else p.value
+                        }
+
+                        if (v.isNaN() || v < 0.1f) continue
+
+                        if (v < minVal) { minVal = v; minPoint = p }
+                        if (v > maxVal) { maxVal = v; maxPoint = p }
+                    }
+                }
+                val hasMaxIndicator = maxPoint != null
+                val hasMinIndicator = minPoint != null && minVal != maxVal
+                val indicatorLabelYs = buildList {
+                    if (hasMaxIndicator) add(valToY(maxVal))
+                    if (hasMinIndicator) add(valToY(minVal))
+                }
+
                 // --- 1. DRAW Y-AXIS GRID ---
                 val yStep = if (cYRange < 25) 2f else 50f
                 var yVal = (kotlin.math.ceil(cYMin / yStep) * yStep).toInt() // integer steps
@@ -2382,7 +2727,13 @@ fun InteractiveGlucoseChart(
                         drawLine(gridColor, Offset(0f, y), Offset(width, y), 1f)
                         // Text - Vertically centered with grid line, 4dp left padding
                         val labelText = yVal.toString()
+                        axisTextPaint.color = axisTextColorArgb
                         axisTextPaint.getTextBounds(labelText, 0, labelText.length, axisLabelBounds)
+                        val labelClearance = axisLabelBounds.height() + 8f * density
+                        if (indicatorLabelYs.any { abs(it - y) < labelClearance }) {
+                            yVal += yStep.toInt()
+                            continue
+                        }
                         val centeredY = y + (axisLabelBounds.height() / 2f)
                         val labelPadding = 16f * density
                         val textWidth = axisTextPaint.measureText(labelText)
@@ -2408,6 +2759,7 @@ fun InteractiveGlucoseChart(
                 }
 
                 // --- 2. DRAW X-AXIS GRID ---
+                xTextPaint.color = axisTextColorArgb
                 // Intervals: 5m, 15m, 30m, 1h, 2h, 4h, 8h, 12h, 24h
                 // Pick interval keeping labels ~120px apart
                 val pxPerMs = width / animDur
@@ -2441,10 +2793,13 @@ fun InteractiveGlucoseChart(
                                     reusableDate.time = tGrid
                                     formatDate.format(reusableDate)
                                 }
-                                drawContext.canvas.nativeCanvas.drawText(
-                                    dateLabel, x, contentHeight - labelsLiftPx - 25f,
-                                    xTextPaint.apply { typeface = graphFontBold }
-                                )
+                                xTextPaint.typeface = graphFontBold
+                                val halfDateLabel = xTextPaint.measureText(dateLabel) / 2f
+                                if (x - halfDateLabel >= 0f && x + halfDateLabel <= width) {
+                                    drawContext.canvas.nativeCanvas.drawText(
+                                        dateLabel, x, contentHeight - labelsLiftPx - 25f, xTextPaint
+                                    )
+                                }
                                 xTextPaint.typeface = graphFont
                             } else {
                                 // Time Line
@@ -2454,329 +2809,246 @@ fun InteractiveGlucoseChart(
                                     val mm = if (m < 10) "0$m" else m.toString()
                                     "$hh:$mm"
                                 }
-                                drawContext.canvas.nativeCanvas.drawText(timeLabel, x, contentHeight - labelsLiftPx - 28f, xTextPaint)
+                                // A label centred on a line near either edge would be cut in half
+                                // (":15", "19:"); keep the line, drop the half-label.
+                                val halfLabel = xTextPaint.measureText(timeLabel) / 2f
+                                if (x - halfLabel >= 0f && x + halfLabel <= width) {
+                                    drawContext.canvas.nativeCanvas.drawText(timeLabel, x, contentHeight - labelsLiftPx - 28f, xTextPaint)
+                                }
                             }
                         }
                         tGrid += gridInterval
                     }
                 }
 
-                if (peerChartSeries.isNotEmpty()) {
-                    val peerGapThreshold = 900000L // 15 mins
-                    val peerStroke = 2.dp.toPx()
-                    fun drawPeerSeriesLine(
-                        series: PeerSensorChartSeries,
-                        useRaw: Boolean,
-                        alpha: Float,
-                        strokeWidth: Float
-                    ) {
-                        val points = series.points
-                        if (points.size < 2) return
-                        val peerStartIdx = points.binarySearchBy(searchStart) { it.timestamp }
-                            .let { if (it < 0) -it - 2 else it }
-                            .coerceIn(0, points.size)
-                        val peerEndIdx = points.binarySearchBy(searchEnd) { it.timestamp }
-                            .let { if (it < 0) -it else it + 1 }
-                            .coerceIn(peerStartIdx, points.size)
-                        if (peerEndIdx <= peerStartIdx) return
-
-                        reusablePeerPath.rewind()
-                        var first = true
-                        var hasPath = false
-                        var lastTimestamp = 0L
-                        for (i in peerStartIdx until peerEndIdx) {
-                            val point = points[i]
-                            val value = if (useRaw) point.rawValue else point.value
-                            if (!value.isFinite() || value <= 0.1f) {
-                                first = true
-                                continue
-                            }
-                            val px = timeToDataX(point.timestamp)
-                            val py = valToY(value)
-                            if (!px.isFinite() || !py.isFinite()) {
-                                first = true
-                                continue
-                            }
-                            if (!first && point.timestamp - lastTimestamp > peerGapThreshold) {
-                                first = true
-                            }
-                            if (first) {
-                                reusablePeerPath.moveTo(px, py)
-                                first = false
-                            } else {
-                                reusablePeerPath.lineTo(px, py)
-                            }
-                            hasPath = true
-                            lastTimestamp = point.timestamp
-                        }
-                        if (!hasPath) return
-                        val brush = peerBrushes[series.sensorId]
-                        if (brush != null) {
-                            drawPath(
-                                path = reusablePeerPath,
-                                brush = brush,
-                                alpha = alpha,
-                                style = Stroke(
-                                    width = strokeWidth,
-                                    cap = StrokeCap.Round,
-                                    join = StrokeJoin.Round
+                // Sensor intervals belong to Auto, including a secondary Auto
+                // lane in Raw+Auto. The model has already shifted their bounds.
+                if (uncertaintyRibbonEnabled) {
+                    chartModel.series.forEach { series ->
+                        val color = if (series.isPrimary) primaryColor else Color(series.colorArgb)
+                        val runs = series.runs + series.secondaryLanes
+                            .filter { it.kind == tk.glucodata.chart.ChartLaneKind.AUTO }.flatMap { it.runs }
+                        runs.forEach { run ->
+                            val from = (run.points.firstIndexAtOrAfter(viewportStart) - 1).coerceAtLeast(0)
+                            val to = (run.points.firstIndexAfter(viewportEnd) + 1).coerceAtMost(run.points.size)
+                            with(GlucoseUncertaintyRibbon) {
+                                drawUncertaintyRibbon(
+                                    renderData = run.points, startIndex = from, endIndex = to,
+                                    viewportStartMs = viewportStart, timeScale = dataWidth / animDur,
+                                    chartHeight = chartHeight, yMin = cYMin,
+                                    yScale = if (cYRange < 0.001f) 0f else chartHeight / cYRange,
+                                    gapThresholdMs = ChartGap.THRESHOLD_MS, color = color,
                                 )
-                            )
-                        } else {
-                            drawPath(
-                                path = reusablePeerPath,
-                                color = androidx.compose.ui.graphics.lerp(series.color, peerNeutralBase, 0.46f).copy(alpha = 0.5f * alpha),
-                                style = Stroke(
-                                    width = strokeWidth,
-                                    cap = StrokeCap.Round,
-                                    join = StrokeJoin.Round
-                                )
-                            )
-                        }
-                    }
-                    peerChartSeries.forEach { series ->
-                        val drawRawPeer = series.viewMode == 1 || series.viewMode == 2 || series.viewMode == 3
-                        val drawAutoPeer = series.viewMode == 0 || series.viewMode == 2 || series.viewMode == 3
-                        when {
-                            drawRawPeer && drawAutoPeer -> {
-                                drawPeerSeriesLine(series, useRaw = true, alpha = 0.68f, strokeWidth = peerStroke * 0.84f)
-                                drawPeerSeriesLine(series, useRaw = false, alpha = 0.88f, strokeWidth = peerStroke)
                             }
-                            drawRawPeer -> drawPeerSeriesLine(series, useRaw = true, alpha = 0.88f, strokeWidth = peerStroke)
-                            drawAutoPeer -> drawPeerSeriesLine(series, useRaw = false, alpha = 0.88f, strokeWidth = peerStroke)
                         }
                     }
                 }
 
-                // --- 3. DATA LINES (Unified & Optimized) ---
-                if (endIdx > startIdx) {
-                    val gapThreshold = 900000L // 15 mins
-                    
-                    val hideRawSource = hideInitialWhenCalibrated && isRawModeChart
-                    val hideAutoSource = hideInitialWhenCalibrated && !isRawModeChart
-                    val drawRaw = !hideRawSource && (viewMode == 1 || viewMode == 2 || viewMode == 3)
-                    val drawAuto = !hideAutoSource && (viewMode == 0 || viewMode == 2 || viewMode == 3)
-
-                    // Only tint the main/active line using gradient. No density check as requested.
-                    val doTintRaw = !hasCalibration && (viewMode == 1 || viewMode == 3)
-                    val doTintAuto = !hasCalibration && (viewMode == 0 || viewMode == 2)
-                    val doTintCal = hasCalibration
-                    
-                    val needsGradient = doTintRaw || doTintAuto || doTintCal
-                    
-                    // Colors
-                    val rawColor = when {
-                        hasCalibration && viewMode == 2 -> tertiaryColor
-                        hasCalibration || viewMode == 2 -> secondaryColor
-                        else -> primaryColor // Used if not tinted
+                // --- PEER LINES (from the resolved model) ---
+                if (chartModel.peers.isNotEmpty()) {
+                    val peerStroke = 2.dp.toPx()
+                    val mainStroke = 3.dp.toPx()
+                    val cullMargin = ChartGap.THRESHOLD_MS
+                    for (series in chartModel.peers) {
+                        val color = Color(series.colorArgb)
+                        val brush = peerBrushes[series.sensorId]
+                        // The peer's other lane first, under its main run: the
+                        // same subtle treatment, a touch fainter and thinner so
+                        // the two lanes of one sensor still read as one sensor.
+                        for (lane in series.secondaryLanes) {
+                            if (lane.kind == tk.glucodata.chart.ChartLaneKind.CALIBRATION_PREVIEW) continue
+                            for (run in lane.runs) {
+                                reusablePeerPath.rewind()
+                                var first = true
+                                var hasPath = false
+                                val points = run.points
+                                val fromIndex = points.firstIndexAtOrAfter(searchStart - cullMargin)
+                                val toIndex = points.firstIndexAfter(searchEnd + cullMargin)
+                                for (index in fromIndex until toIndex) {
+                                    val point = points[index]
+                                    val px = timeToDataX(point.timestamp)
+                                    val py = valToY(point.value)
+                                    if (!px.isFinite() || !py.isFinite()) { first = true; continue }
+                                    if (first) { reusablePeerPath.moveTo(px, py); first = false } else reusablePeerPath.lineTo(px, py)
+                                    hasPath = true
+                                }
+                                if (!hasPath) continue
+                                val style = Stroke(width = peerStroke * 0.84f, cap = StrokeCap.Round, join = StrokeJoin.Round)
+                                if (brush != null) {
+                                    drawPath(path = reusablePeerPath, brush = brush, alpha = 0.68f, style = style)
+                                } else {
+                                    drawPath(
+                                        path = reusablePeerPath,
+                                        color = androidx.compose.ui.graphics.lerp(color, peerNeutralBase, 0.46f).copy(alpha = 0.5f * 0.68f),
+                                        style = style
+                                    )
+                                }
+                            }
+                        }
+                        for (run in series.runs) {
+                            reusablePeerPath.rewind()
+                            val peerRun = ChartLineRun()
+                            var hasPath = false
+                            var first = true
+                            val points = run.points
+                            val fromIndex = points.firstIndexAtOrAfter(searchStart - cullMargin)
+                            val toIndex = points.firstIndexAfter(searchEnd + cullMargin)
+                            for (index in fromIndex until toIndex) {
+                                val point = points[index]
+                                val px = timeToDataX(point.timestamp)
+                                val py = valToY(point.value)
+                                if (!px.isFinite() || !py.isFinite()) { first = true; continue }
+                                if (first) { reusablePeerPath.moveTo(px, py); peerRun.begin(px, py); first = false }
+                                else { reusablePeerPath.lineTo(px, py); peerRun.extend() }
+                                hasPath = true
+                            }
+                            if (!hasPath) continue
+                            peerRun.flush()
+                            if (run.look == tk.glucodata.chart.ChartLook.MAIN) {
+                                // The main look, exactly as the primary line gets it.
+                                val style = Stroke(width = mainStroke, cap = StrokeCap.Round, join = StrokeJoin.Round)
+                                drawPath(path = reusablePeerPath, brush = gradientBrush, style = style)
+                                peerRun.isolatedPoints.forEach { dot -> drawCircle(color = primaryColor, radius = mainStroke / 2f, center = dot) }
+                            } else {
+                                val alpha = 0.88f
+                                val style = Stroke(width = peerStroke, cap = StrokeCap.Round, join = StrokeJoin.Round)
+                                val dotColor = androidx.compose.ui.graphics.lerp(color, peerNeutralBase, 0.46f).copy(alpha = 0.5f * alpha)
+                                peerRun.isolatedPoints.forEach { dot -> drawCircle(color = dotColor, radius = peerStroke / 2f, center = dot) }
+                                if (brush != null) {
+                                    drawPath(path = reusablePeerPath, brush = brush, alpha = alpha, style = style)
+                                } else {
+                                    drawPath(path = reusablePeerPath, color = dotColor, style = style)
+                                }
+                            }
+                        }
                     }
-                    val autoColor = when {
-                        hasCalibration && viewMode == 3 -> tertiaryColor
-                        hasCalibration || viewMode == 3 -> secondaryColor
-                        else -> primaryColor // Used if not tinted
-                    }
-                    
-                    // Stroke Widths
-                    val rawStrokeWidth = if (hasCalibration || viewMode == 2) 2.dp.toPx() else 3.dp.toPx()
-                    val autoStrokeWidth = if (hasCalibration || viewMode == 3) 2.dp.toPx() else 3.dp.toPx()
-                    val calStrokeWidth = 3.dp.toPx()
+                }
 
-                    // Reset Paths
-                    if (drawRaw) {
-                        reusableRawPath.rewind()
-                    }
-                    if (drawAuto) {
-                        reusableAutoPath.rewind()
-                    }
-                    if (hasCalibration) {
-                        reusablePath.rewind()
-                    }
-
-                    // Unified Loop State
-                    var rawFirst = true
-                    var rawLastX = -10000f
-                    var rawLastY = -10000f // Track Y for spike detection
-                    var rawLastTimestamp = 0L
-
-                    var autoFirst = true
-                    var autoLastX = -10000f
-                    var autoLastY = -10000f
-                    var autoLastTimestamp = 0L
-                    
-                    var calFirst = true
-                    var calLastX = -10000f
-                    var calLastY = -10000f
-                    var calLastTimestamp = 0L
-                    var lastSensorSerial: String? = null
-
-                    // Optimization: Pre-calculate scaling factors to avoid repeated division in valToY/timeToDataX
-                    val timeScale = dataWidth / animDur
-                    val yScale = if (cYRange < 0.001f) 0f else chartHeight / cYRange
-                    
-                    // Use Round caps/joins for better visuals
+                // --- 3. DATA LINES (from the resolved model) ---
+                //
+                // Nothing here resolves a value or decides a look. The model's
+                // runs already carry both; this maps them to pixels and strokes.
+                run {
+                    val primarySeries = chartModel.primary ?: return@run
+                    if (primarySeries.isEmpty) return@run
                     val strokeCap = StrokeCap.Round
                     val strokeJoin = StrokeJoin.Round
+                    val timeScale = dataWidth / animDur
+                    val yScale = if (cYRange < 0.001f) 0f else chartHeight / cYRange
+                    val cullMargin = ChartGap.THRESHOLD_MS
 
-                    for (i in startIdx until endIdx) {
-                        val renderPoint = renderData[i]
-                        val sensorChanged = lastSensorSerial != null &&
-                            renderPoint.sensorSerial != null &&
-                            renderPoint.sensorSerial != lastSensorSerial
-                        if (sensorChanged) {
-                            rawFirst = true
-                            autoFirst = true
-                            calFirst = true
-                        }
-                        // X is shared for all lines at this timestamp
-                        val px = (renderPoint.timestamp - viewportStart) * timeScale
-                        
-                        if (!px.isFinite()) continue
+                    val mainStroke = 3.dp.toPx()
+                    val laneStroke = 2.dp.toPx()
+                    val doTintMain = true
+                    // Lane colours: the other signal beside the main line. The
+                    // theme greys when the primary is the only sensor and has no
+                    // picked colour — as before — and otherwise the same greys
+                    // nudged toward the sensor's own colour, so a sensor's lanes
+                    // read as that sensor's without competing with its main
+                    // line. A tinted lane reads louder than a grey one, so it
+                    // gets a touch less alpha. The tertiary lane is the fainter
+                    // of the two either way.
+                    val laneIdentity = primaryPickedColor
+                        ?: primaryIdentityColor.takeIf { chartModel.peers.isNotEmpty() }
+                    fun laneColor(tertiary: Boolean): Color {
+                        val grey = if (tertiary) tertiaryColor else secondaryColor
+                        if (laneIdentity == null) return grey
+                        return androidx.compose.ui.graphics.lerp(
+                            grey,
+                            laneIdentity,
+                            tk.glucodata.SensorVisuals.LANE_IDENTITY_TINT,
+                        ).copy(alpha = if (tertiary) 0.4f else 0.62f)
+                    }
+                    val rawLaneColor = laneColor(tertiary = hasCalibration && viewMode == 2)
+                    val autoLaneColor = laneColor(tertiary = hasCalibration && viewMode == 3)
+                    // The primary drawn where it is not main: its own identity
+                    // colour, thin, faded — the same treatment a peer gets.
+                    val demotedColor = androidx.compose.ui.graphics.lerp(
+                        Color(primarySeries.colorArgb),
+                        peerNeutralBase,
+                        0.46f
+                    ).copy(alpha = 0.44f)
 
-                        // --- RAW LINE ---
-                        if (drawRaw) {
-                            // FAST PATH DECIMATION: Check X proximity first
-                            if (!rawFirst && kotlin.math.abs(px - rawLastX) < 0.8f) {
-                                // If horizontally close, check vertical spike using CHEAP value (raw/auto)
-                                val rawV = renderPoint.rawValue
-                                val rawY = chartHeight - ((rawV - cYMin) * yScale)
-                                if (kotlin.math.abs(rawY - rawLastY) < 1.0f) {
-                                    continue // SKIP drawing this point
-                                }
-                            }
-
-                            val v = renderPoint.rawValue
-                            if (v.isNaN() || v < 0.1f) {
-                                rawFirst = true
+                    fun addRun(path: Path, run: tk.glucodata.chart.ChartRun, lineRun: ChartLineRun) {
+                        var first = true
+                        var lastX = -10000f
+                        var lastY = -10000f
+                        // A run covers the whole timeline; only the stretch under the
+                        // viewport is walked. Points inside a run ascend in time, so
+                        // the window is two binary searches rather than a test per
+                        // point per frame over every reading ever stored.
+                        val points = run.points
+                        val cullStart = viewportStart - cullMargin
+                        val cullEnd = viewportEnd + cullMargin
+                        val fromIndex = points.firstIndexAtOrAfter(cullStart)
+                        val toIndex = points.firstIndexAfter(cullEnd)
+                        for (index in fromIndex until toIndex) {
+                            val point = points[index]
+                            val px = (point.timestamp - viewportStart) * timeScale
+                            val py = (chartHeight - ((point.value - cYMin) * yScale)).coerceIn(-2000f, chartHeight + 2000f)
+                            if (!px.isFinite() || !py.isFinite()) { first = true; continue }
+                            // Decimation: nothing to see between two points that
+                            // land on the same pixel.
+                            if (!first && kotlin.math.abs(px - lastX) < 0.8f && kotlin.math.abs(py - lastY) < 1.0f) continue
+                            if (first) {
+                                path.moveTo(px, py); lineRun.begin(px, py); first = false
                             } else {
-                                val rawY = chartHeight - ((v - cYMin) * yScale)
-                                val py = rawY.coerceIn(-2000f, chartHeight + 2000f)
-                                
-                                if (!py.isFinite()) {
-                                    rawFirst = true
-                                } else {
-                                    if (!rawFirst && (renderPoint.timestamp - rawLastTimestamp) > gapThreshold) {
-                                        rawFirst = true
-                                    }
-                                    
-                                    if (rawFirst) {
-                                        reusableRawPath.moveTo(px, py)
-                                        rawFirst = false
-                                    } else {
-                                        reusableRawPath.lineTo(px, py)
-                                    }
-                                    rawLastX = px
-                                    rawLastY = py
-                                    rawLastTimestamp = renderPoint.timestamp
-                                }
+                                path.lineTo(px, py); lineRun.extend()
                             }
-                        }
-
-                        // --- AUTO LINE ---
-                        if (drawAuto) {
-                            if (!autoFirst && kotlin.math.abs(px - autoLastX) < 0.8f) {
-                                val autoV = renderPoint.value
-                                val autoY = chartHeight - ((autoV - cYMin) * yScale)
-                                if (kotlin.math.abs(autoY - autoLastY) < 1.0f) {
-                                    continue
-                                }
-                            }
-
-                            val v = renderPoint.value
-                            if (v.isNaN() || v < 0.1f) {
-                                autoFirst = true
-                            } else {
-                                val autoY = chartHeight - ((v - cYMin) * yScale)
-                                val py = autoY.coerceIn(-2000f, chartHeight + 2000f)
-                                
-                                if (!py.isFinite()) {
-                                    autoFirst = true
-                                } else {
-                                    if (!autoFirst && (renderPoint.timestamp - autoLastTimestamp) > gapThreshold) {
-                                        autoFirst = true
-                                    }
-                                    
-                                    if (autoFirst) {
-                                        reusableAutoPath.moveTo(px, py)
-                                        autoFirst = false
-                                    } else {
-                                        reusableAutoPath.lineTo(px, py)
-                                    }
-                                    autoLastX = px
-                                    autoLastY = py
-                                    autoLastTimestamp = renderPoint.timestamp
-                                }
-                            }
-                        }
-                        
-                        // --- CALIBRATION LINE ---
-                        if (hasCalibration) {
-                            val baseV = if (isRawModeChart) renderPoint.rawValue else renderPoint.value
-                            if (!baseV.isFinite() || baseV <= 0.1f) {
-                                calFirst = true
-                                continue
-                            }
-                            if (!calFirst && kotlin.math.abs(px - calLastX) < 0.8f) {
-                                val proxyY = chartHeight - ((baseV - cYMin) * yScale)
-                                if (kotlin.math.abs(proxyY - calLastY) < 1.0f) {
-                                     continue
-                                }
-                            }
-
-                            val v = calibratedValueResolver.valueAt(i, isRawModeChart)
-                            
-                            if (v.isNaN() || v < 0.1f) {
-                                calFirst = true
-                            } else {
-                                val calY = chartHeight - ((v - cYMin) * yScale)
-                                val py = calY.coerceIn(-2000f, chartHeight + 2000f)
-                                
-                                if (!py.isFinite()) {
-                                    calFirst = true
-                                } else {
-                                    if (!calFirst && (renderPoint.timestamp - calLastTimestamp) > gapThreshold) {
-                                        calFirst = true
-                                    }
-                                    
-                                    if (calFirst) {
-                                        reusablePath.moveTo(px, py)
-                                        calFirst = false
-                                    } else {
-                                        reusablePath.lineTo(px, py)
-                                    }
-                                    calLastX = px
-                                    calLastY = py
-                                    calLastTimestamp = renderPoint.timestamp
-                                }
-                            }
-                        }
-
-                        lastSensorSerial = renderPoint.sensorSerial
-                    }
-
-                    // --- DRAW PATHS ---
-                    // Using Gradient Brush for primary/active lines for smooth transition
-
-                    if (drawRaw) {
-                        if (doTintRaw) {
-                            drawPath(reusableRawPath, brush = gradientBrush, style = Stroke(width = rawStrokeWidth, cap = strokeCap, join = strokeJoin))
-                        } else {
-                            drawPath(reusableRawPath, rawColor, style = Stroke(width = rawStrokeWidth, cap = strokeCap, join = strokeJoin))
+                            lastX = px; lastY = py
                         }
                     }
-                    if (drawAuto) {
-                        if (doTintAuto) {
-                            drawPath(reusableAutoPath, brush = gradientBrush, style = Stroke(width = autoStrokeWidth, cap = strokeCap, join = strokeJoin))
-                        } else {
-                            drawPath(reusableAutoPath, autoColor, style = Stroke(width = autoStrokeWidth, cap = strokeCap, join = strokeJoin))
+                    fun drawIsolated(run: ChartLineRun, color: Color, strokeWidth: Float) {
+                        run.isolatedPoints.forEach { point -> drawCircle(color = color, radius = strokeWidth / 2f, center = point) }
+                    }
+
+                    // Secondary lanes first, under everything.
+                    for (lane in primarySeries.secondaryLanes) {
+                        val path = when (lane.kind) {
+                            tk.glucodata.chart.ChartLaneKind.RAW -> reusableRawPath
+                            tk.glucodata.chart.ChartLaneKind.AUTO -> reusableAutoPath
+                            tk.glucodata.chart.ChartLaneKind.CALIBRATION_PREVIEW -> reusableDemotedPath
+                        }
+                        path.rewind()
+                        val lineRun = ChartLineRun()
+                        lane.runs.forEach { addRun(path, it, lineRun) }
+                        lineRun.flush()
+                        when (lane.kind) {
+                            tk.glucodata.chart.ChartLaneKind.CALIBRATION_PREVIEW -> {
+                                // A question, not a record: faint and thin, so
+                                // it can never read as the value.
+                                val previewColor = primaryColor.copy(alpha = 0.45f)
+                                val previewStroke = 1.dp.toPx()
+                                drawPath(path, previewColor, style = Stroke(width = previewStroke, cap = strokeCap, join = strokeJoin))
+                                drawIsolated(lineRun, previewColor, previewStroke)
+                            }
+                            else -> {
+                                val color = if (lane.kind == tk.glucodata.chart.ChartLaneKind.RAW) rawLaneColor else autoLaneColor
+                                drawPath(path, color, style = Stroke(width = laneStroke, cap = strokeCap, join = strokeJoin))
+                                drawIsolated(lineRun, color, laneStroke)
+                            }
                         }
                     }
-                    if (hasCalibration) {
-                        if (doTintCal) {
-                            drawPath(reusablePath, brush = gradientBrush, style = Stroke(width = calStrokeWidth, cap = strokeCap, join = strokeJoin))
-                        } else {
-                            drawPath(reusablePath, primaryColor, style = Stroke(width = calStrokeWidth, cap = strokeCap, join = strokeJoin))
-                        }
+
+                    // Then the primary where it is not main, then where it is.
+                    reusableDemotedPath.rewind()
+                    reusablePath.rewind()
+                    val demotedRun = ChartLineRun()
+                    val mainRun = ChartLineRun()
+                    for (run in primarySeries.runs) {
+                        if (run.look == tk.glucodata.chart.ChartLook.MAIN) addRun(reusablePath, run, mainRun)
+                        else addRun(reusableDemotedPath, run, demotedRun)
                     }
+                    demotedRun.flush()
+                    mainRun.flush()
+                    drawPath(reusableDemotedPath, demotedColor, style = Stroke(width = laneStroke, cap = strokeCap, join = strokeJoin))
+                    drawIsolated(demotedRun, demotedColor, laneStroke)
+                    if (doTintMain) {
+                        drawPath(reusablePath, brush = gradientBrush, style = Stroke(width = mainStroke, cap = strokeCap, join = strokeJoin))
+                    } else {
+                        drawPath(reusablePath, primaryColor, style = Stroke(width = mainStroke, cap = strokeCap, join = strokeJoin))
+                    }
+                    drawIsolated(mainRun, primaryColor, mainStroke)
                 }
 
                 fun addSmoothedPredictionOffsets(path: Path, samples: List<Offset>, moveToFirst: Boolean) {
@@ -2804,23 +3076,14 @@ fun InteractiveGlucoseChart(
                     path.lineTo(last.x, last.y)
                 }
 
-                fun predictionUncertainty(point: GlucosePredictionPoint): Float {
-                    val uncertainty = 1f - point.confidence.coerceIn(0f, 1f)
-                    return if (isMmol) {
-                        0.18f + (uncertainty * 1.3f)
-                    } else {
-                        3.2f + (uncertainty * 24f)
-                    }
-                }
-
                 val predictionRawColor = when {
-                    calibratedValueResolver.hasCalibration(viewMode == 1 || viewMode == 3) && viewMode == 2 -> tertiaryColor
-                    calibratedValueResolver.hasCalibration(viewMode == 1 || viewMode == 3) || viewMode == 2 -> secondaryColor
+                    hasCalibration && viewMode == 2 -> tertiaryColor
+                    hasCalibration || viewMode == 2 -> secondaryColor
                     else -> primaryColor
                 }
                 val predictionAutoColor = when {
-                    calibratedValueResolver.hasCalibration(viewMode == 1 || viewMode == 3) && viewMode == 3 -> tertiaryColor
-                    calibratedValueResolver.hasCalibration(viewMode == 1 || viewMode == 3) || viewMode == 3 -> secondaryColor
+                    hasCalibration && viewMode == 3 -> tertiaryColor
+                    hasCalibration || viewMode == 3 -> secondaryColor
                     else -> primaryColor
                 }
 
@@ -2856,26 +3119,31 @@ fun InteractiveGlucoseChart(
                     }
                     if (lineSamples.size < 2) return@forEach
 
+                    val band = predictionBand(series)
                     val upperSamples = visiblePredictionPoints.mapNotNull { point ->
                         val x = timeToDataX(point.timestamp)
-                        val y = valToY(point.value + predictionUncertainty(point))
+                        val y = valToY(band.bounds(point.value, point.confidence, isMmol).upper)
                         if (x.isFinite() && y.isFinite()) Offset(x, y) else null
                     }
                     val lowerSamples = visiblePredictionPoints.asReversed().mapNotNull { point ->
                         val x = timeToDataX(point.timestamp)
-                        val y = valToY(point.value - predictionUncertainty(point))
+                        val y = valToY(band.bounds(point.value, point.confidence, isMmol).lower)
                         if (x.isFinite() && y.isFinite()) Offset(x, y) else null
                     }
-                    if (isPrimaryPrediction && upperSamples.size >= 2 && lowerSamples.size >= 2) {
+                    if ((isPrimaryPrediction || band.isAnchored) && upperSamples.size >= 2 && lowerSamples.size >= 2) {
                         val bandPath = Path().apply {
                             addSmoothedPredictionOffsets(this, upperSamples, moveToFirst = true)
                             addSmoothedPredictionOffsets(this, lowerSamples, moveToFirst = false)
                             close()
                         }
-                        drawPath(
-                            path = bandPath,
-                            color = predictionTint.copy(alpha = 0.055f)
-                        )
+                        if (band.isAnchored) {
+                            drawPath(bandPath, Brush.horizontalGradient(
+                                colors = listOf(predictionTint.copy(alpha = tk.glucodata.chart.UncertaintyBands.FILL_ALPHA),
+                                    predictionTint.copy(alpha = tk.glucodata.chart.UncertaintyBands.FORECAST_ALPHA)),
+                                startX = timeToDataX(series.points.first().timestamp),
+                                endX = timeToDataX(series.points.first().timestamp + tk.glucodata.chart.UncertaintyBands.FORECAST_FADE_MS),
+                            ))
+                        } else drawPath(bandPath, predictionTint.copy(alpha = tk.glucodata.chart.UncertaintyBands.FORECAST_ALPHA))
                     }
                     val predictionPath = Path().apply {
                         addSmoothedPredictionOffsets(this, lineSamples, moveToFirst = true)
@@ -2955,29 +3223,6 @@ fun InteractiveGlucoseChart(
 
                 // --- 4. MIN/MAX INDICATORS (Restored & Optimized) ---
                 if (endIdx > startIdx) {
-                    var minPoint = renderData[startIdx]
-                    var maxPoint = renderData[startIdx]
-                    var minVal = Float.MAX_VALUE
-                    var maxVal = Float.MIN_VALUE
-
-                    // Single fast pass for min/max
-                    for (i in startIdx until endIdx) {
-                        val p = renderData[i]
-                        // Determine value based on mode commonality
-                        // If showing Raw (Mode 1) or Raw-Primary (Mode 3), prioritize Raw
-                        val useRaw = viewMode == 1 || viewMode == 3
-                        val v = if (hideInitialWhenCalibrated) {
-                            calibratedValueResolver.valueAt(i, useRaw)
-                        } else {
-                            if (useRaw) p.rawValue else p.value
-                        }
-
-                        if (v.isNaN() || v < 0.1f) continue
-
-                        if (v < minVal) { minVal = v; minPoint = p }
-                        if (v > maxVal) { maxVal = v; maxPoint = p }
-                    }
-
                     // Helper to draw
                     fun drawIndicator(point: GlucosePoint, valToDraw: Float) {
                         val y = valToY(valToDraw)
@@ -2994,7 +3239,7 @@ fun InteractiveGlucoseChart(
 
                             drawContext.canvas.nativeCanvas.drawText(
                                 label, indicatorPadding, centeredY,
-                                axisTextPaint.apply { color = android.graphics.Color.DKGRAY } // Dark Gray for visibility
+                                axisTextPaint.apply { color = indicatorTextColorArgb }
                             )
                             // Guide line - starts after text
                             val lineStartX = indicatorPadding + textWidth + 8f * density
@@ -3006,12 +3251,12 @@ fun InteractiveGlucoseChart(
                                 pathEffect = dashEffect
                             )
                             // Restore paint color (axisTextPaint is shared)
-                            axisTextPaint.color = android.graphics.Color.GRAY
+                            axisTextPaint.color = axisTextColorArgb
                         }
                     }
 
-                    if (maxVal > Float.MIN_VALUE) drawIndicator(maxPoint, maxVal)
-                    if (minVal < Float.MAX_VALUE && minVal != maxVal) drawIndicator(minPoint, minVal)
+                    maxPoint?.let { drawIndicator(it, maxVal) }
+                    if (hasMinIndicator) minPoint?.let { drawIndicator(it, minVal) }
                 }
 
                 // --- 5. TARGET RANGE ---
@@ -3024,11 +3269,8 @@ fun InteractiveGlucoseChart(
 
                 // --- 6. CALIBRATION MARKERS ---
                 // Draw permanent vertical lines for calibration points in visible range (respects mode)
-                val isRawModeMarkers = viewMode == 1 || viewMode == 3
-                val calibrations = tk.glucodata.data.calibration.CalibrationManager.getVisibleCalibrations(isRawModeMarkers)
-                val visibleCalibrations = calibrations.filter { it.timestamp in viewportStart..viewportEnd }
-
                 visibleCalibrations.forEach { cal ->
+                    if (cal.timestamp !in viewportStart..viewportEnd) return@forEach
                     val calX = timeToDataX(cal.timestamp)
                     if (calX in 0f..width) {
                         // Draw vertical line with opacity
@@ -3261,63 +3503,37 @@ fun InteractiveGlucoseChart(
 
                     selectedPoint?.let { p ->
                         val dotRadius = 5.dp.toPx()
-                        val isRawModeDot = viewMode == 1 || viewMode == 3
-                        val hasCalibrationDot = calibratedValueResolver.hasCalibration(isRawModeDot)
-                        val hideRawDot = hideInitialWhenCalibrated && isRawModeDot
-                        val hideAutoDot = hideInitialWhenCalibrated && !isRawModeDot
-
-                        // Draw dots for active lines (demoted when calibration active)
-                         if (!hideRawDot && (viewMode == 1 || viewMode == 2 || viewMode == 3) && p.rawValue > 0.1f) {
-                              val color = if (hasCalibrationDot) secondaryColor else if (viewMode == 1 || viewMode == 3) primaryColor else secondaryColor
-                              val py = valToY(p.rawValue)
-                              if (py.isFinite()) drawCircle(color, dotRadius, Offset(cursorX, py))
-                          }
-                         if (!hideAutoDot && (viewMode == 0 || viewMode == 2 || viewMode == 3)) {
-                             val color = if (hasCalibrationDot) secondaryColor else if (viewMode == 0 || viewMode == 2) primaryColor else secondaryColor
-                             val py = valToY(p.value)
-                             if (py.isFinite()) drawCircle(color, dotRadius, Offset(cursorX, py))
-                         }
-
-                         // Draw calibrated dot on top (primary when active)
-                         if (hasCalibrationDot) {
-                             val calibratedV = calibratedValueResolver.valueForPoint(p, isRawModeDot)
-                             if (calibratedV.isFinite() && calibratedV > 0.1f) {
-                                 val py = valToY(calibratedV)
-                                 if (py.isFinite()) drawCircle(primaryColor, dotRadius, Offset(cursorX, py))
-                             }
-                         }
-
-                         peerPointsByBucket[MultiSensorDisplay.bucketKeyForTimestamp(p.timestamp)]
-                             .orEmpty()
-                             .forEach { peer ->
-                                 val attrs = peerDrawAttrs[peer.sensorSerial]
-                                 val peerMode = attrs?.second ?: viewMode
-                                 val peerColor = attrs?.first ?: SensorColors.getColor(peer.sensorSerial.orEmpty())
-                                 val drawPeerRaw = peerMode == 1 || peerMode == 2 || peerMode == 3
-                                 val drawPeerAuto = peerMode == 0 || peerMode == 2 || peerMode == 3
-                                 if (drawPeerRaw && peer.rawValue.isFinite() && peer.rawValue > 0.1f) {
-                                     val py = valToY(peer.rawValue)
-                                     if (py.isFinite()) {
-                                         drawCircle(
-                                             color = peerColor.copy(alpha = if (drawPeerAuto) 0.32f else 0.46f),
-                                             radius = dotRadius * 0.7f,
-                                             center = Offset(cursorX, py)
-                                         )
-                                     }
-                                 }
-                                 if (drawPeerAuto && peer.value.isFinite() && peer.value > 0.1f) {
-                                     val py = valToY(peer.value)
-                                     if (py.isFinite()) {
-                                         drawCircle(
-                                             color = peerColor.copy(alpha = 0.46f),
-                                             radius = dotRadius * 0.75f,
-                                             center = Offset(cursorX, py)
-                                         )
-                                     }
-                                 }
-                             }
+                        // Every dot is read from the resolved model — the same points the
+                        // lines were stroked from — so a dot cannot sit on a line that was
+                        // not drawn: an uncalibrated source, an unsmoothed peer, a lane the
+                        // "hide source values" setting removed.
+                        fun dot(value: Float, color: Color, radius: Float) {
+                            if (!value.isFinite() || value <= 0.1f) return
+                            val py = valToY(value)
+                            if (py.isFinite()) drawCircle(color, radius, Offset(cursorX, py))
+                        }
+                        chartModel.primary?.cursorAt(p.timestamp)?.let { cursor ->
+                            cursor.lanes.forEach { lane -> dot(lane.value, secondaryColor, dotRadius) }
+                            cursor.line?.let { line ->
+                                val color = if (line.look == tk.glucodata.chart.ChartLook.MAIN) primaryColor else secondaryColor
+                                dot(line.value, color, dotRadius)
+                            }
+                        }
+                        for (series in chartModel.peers) {
+                            val cursor = series.cursorAt(p.timestamp) ?: continue
+                            val peerColor = Color(series.colorArgb)
+                            cursor.lanes.forEach { lane -> dot(lane.value, peerColor.copy(alpha = 0.32f), dotRadius * 0.7f) }
+                            cursor.line?.let { line ->
+                                if (line.look == tk.glucodata.chart.ChartLook.MAIN) {
+                                    dot(line.value, primaryColor, dotRadius)
+                                } else {
+                                    dot(line.value, peerColor.copy(alpha = 0.46f), dotRadius * 0.75f)
+                                }
+                            }
+                        }
                     }
                 }
+                } finally { android.os.Trace.endSection() }
             }
 
             // --- INFO CARD ---
@@ -3331,10 +3547,9 @@ fun InteractiveGlucoseChart(
             val overlayDurationMillis = overlayDuration.toLong()
             val overlayViewportStart = centerTime - overlayDurationMillis / 2
             val overlayViewportEnd = centerTime + overlayDurationMillis / 2
-            val journalChipLaneStepPx = with(LocalDensity.current) { 30.dp.toPx() }
             val journalChipMinTopPx = with(LocalDensity.current) { 8.dp.toPx() }
-            val journalChipMinGapPx = with(LocalDensity.current) { 90.dp.toPx() }
             val journalActionChipYOffsetPx = with(LocalDensity.current) { (chartHeightPx - 34.dp.toPx()).coerceAtLeast(12.dp.toPx()) }
+            val journalActionDotInsetPx = with(LocalDensity.current) { 12.dp.toPx() }
             val overlayValueToY: (Float) -> Float = { value ->
                 val range = (renderedYMax - renderedYMin).takeIf { it > 0.001f } ?: 1f
                 (chartHeightPx - ((value - renderedYMin) / range) * chartHeightPx).coerceIn(0f, chartHeightPx)
@@ -3348,41 +3563,6 @@ fun InteractiveGlucoseChart(
                         ?.takeIf { it.isFinite() }
                         ?.coerceIn(0f, chartHeightPx)
             }
-            fun laneAssignments(markers: List<Pair<JournalChartMarker, Float>>): Map<Long, Int> {
-                val laneEndXs = mutableListOf<Float>()
-                val assignments = mutableMapOf<Long, Int>()
-                markers.sortedBy { it.second }.forEach { (marker, markerX) ->
-                    val laneIndex = laneEndXs.indexOfFirst { markerX - it >= journalChipMinGapPx }
-                    val resolvedLane = if (laneIndex >= 0) laneIndex else laneEndXs.size.also {
-                        laneEndXs.add(Float.NEGATIVE_INFINITY)
-                    }
-                    laneEndXs[resolvedLane] = markerX
-                    assignments[marker.entryId] = resolvedLane
-                }
-                return assignments
-            }
-            val visibleOverlayMarkers = journalMarkers.filter { marker ->
-                marker.timestamp in overlayViewportStart..overlayViewportEnd
-            }
-            val markerXById = visibleOverlayMarkers.associate { marker ->
-                val xFraction = (marker.timestamp - overlayViewportStart).toFloat() / overlayDuration
-                marker.entryId to (overlayDataWidthPx * xFraction).coerceIn(0f, overlayDataWidthPx)
-            }
-            val fingerstickLanes = laneAssignments(
-                visibleOverlayMarkers
-                    .filter { it.type == JournalEntryType.FINGERSTICK }
-                    .mapNotNull { marker -> markerXById[marker.entryId]?.let { marker to it } }
-            )
-            val insulinLanes = laneAssignments(
-                visibleOverlayMarkers
-                    .filter { it.type == JournalEntryType.INSULIN }
-                    .mapNotNull { marker -> markerXById[marker.entryId]?.let { marker to it } }
-            )
-            val eventLanes = laneAssignments(
-                visibleOverlayMarkers
-                    .filter { it.type != JournalEntryType.INSULIN && it.type != JournalEntryType.FINGERSTICK }
-                    .mapNotNull { marker -> markerXById[marker.entryId]?.let { marker to it } }
-            )
             val fingerstickLiftPx = with(LocalDensity.current) { 48.dp.toPx() }
             val journalChipSideOffsetPx = with(LocalDensity.current) { 10.dp.toPx() }
             val eventBaseTopPx = (chartHeightPx - with(LocalDensity.current) { 44.dp.toPx() }).coerceAtLeast(journalChipMinTopPx)
@@ -3405,47 +3585,345 @@ fun InteractiveGlucoseChart(
             }
             val journalChipMaxTopPx = (chartHeightPx - with(LocalDensity.current) { 34.dp.toPx() }).coerceAtLeast(journalChipMinTopPx)
             val connectorStrokePx = with(LocalDensity.current) { 0.85.dp.toPx() }
-            val connectorLabelCenterOffsetPx = with(LocalDensity.current) { 16.dp.toPx() }
             val connectorUnderlapPx = with(LocalDensity.current) { 8.dp.toPx() }
             val insulinConnectorY = chartHeightPx - with(LocalDensity.current) { 1.dp.toPx() }
+
+            // Chip geometry, measured rather than assumed: the label pill, and the touch-sized
+            // box it is centred in.
+            val journalChipTextStyle = MaterialTheme.typography.labelMedium
+            val journalChipTextMeasurer = rememberTextMeasurer()
+            val journalChipDensity = LocalDensity.current
+            val journalChipWidthCache = remember(journalChipTextStyle, journalChipDensity) { HashMap<String, Float>() }
+            fun journalChipTextWidth(text: String): Float = journalChipWidthCache.getOrPut(text) {
+                if (journalChipWidthCache.size > 256) journalChipWidthCache.clear()
+                journalChipTextMeasurer.measure(text, style = journalChipTextStyle, maxLines = 1).size.width.toFloat()
+            }
+            val journalChipPillHeightPx = remember(journalChipTextStyle, journalChipDensity) {
+                journalChipTextMeasurer.measure("0", style = journalChipTextStyle, maxLines = 1).size.height +
+                    with(journalChipDensity) { 10.dp.toPx() }
+            }
+            val journalChipTouchPx = with(LocalDensity.current) { 48.dp.toPx() }
+            val journalChipPillInsetYPx = ((journalChipTouchPx - journalChipPillHeightPx) / 2f).coerceAtLeast(0f)
+            val journalChipChromePx = with(LocalDensity.current) { (8.dp + 14.dp + 6.dp + 8.dp).toPx() }
+            val journalChipMaxTextPx = with(LocalDensity.current) { 88.dp.toPx() }
+            val journalChipGapPx = with(LocalDensity.current) { 4.dp.toPx() }
+            val journalChipNudgePx = with(LocalDensity.current) { 12.dp.toPx() }
+            val journalChipDotClearPx = with(LocalDensity.current) { 5.dp.toPx() }
+            val journalChipLayoutSpec = JournalChipLayout.Spec(
+                chipHeight = journalChipPillHeightPx,
+                sideOffset = journalChipSideOffsetPx,
+                rowStep = journalChipPillHeightPx + journalChipGapPx,
+                nudgeStep = journalChipNudgePx,
+                gap = journalChipGapPx,
+                minX = 0f,
+                maxX = overlayDataWidthPx,
+                minTop = journalChipMinTopPx + journalChipPillInsetYPx,
+                maxTop = journalChipMaxTopPx + journalChipPillInsetYPx,
+                peek = with(LocalDensity.current) { 12.dp.toPx() },
+                repeatReach = journalChipChromePx + journalChipMaxTextPx
+            )
+
+            // Entries just past either edge keep their chips, so a chip glides off the screen
+            // with the chart instead of vanishing the moment its entry's time leaves the view.
+            val journalChipReachPx = journalChipSideOffsetPx + journalChipChromePx + journalChipMaxTextPx +
+                journalChipLayoutSpec.maxNudge * journalChipNudgePx
+            val journalChipReachMillis = (journalChipReachPx * overlayDuration / overlayDataWidthPx).toLong()
+            val chipMarkers = journalMarkers
+                .filter { marker ->
+                    marker.timestamp in (overlayViewportStart - journalChipReachMillis)..(overlayViewportEnd + journalChipReachMillis)
+                }
+                .sortedWith(compareBy({ it.timestamp }, { it.entryId }))
+            val chipAnchorXs = chipMarkers.map { marker ->
+                overlayDataWidthPx * ((marker.timestamp - overlayViewportStart).toFloat() / overlayDuration)
+            }
+            fun journalChipBaseTop(marker: JournalChartMarker): Float = when (marker.type) {
+                JournalEntryType.FINGERSTICK ->
+                    ((marker.chartGlucoseValue?.let(overlayValueToY) ?: eventBaseTopPx) - fingerstickLiftPx)
+                        .coerceIn(journalChipMinTopPx, journalChipMaxTopPx)
+                JournalEntryType.INSULIN ->
+                    (chartHeightPx - insulinCurveHeightFor(marker.amount) - insulinLabelGapPx)
+                        .coerceAtLeast(journalChipMinTopPx)
+                else ->
+                    ((markerOverlayY(marker) ?: eventBaseTopPx) - fingerstickLiftPx)
+                        .coerceIn(journalChipMinTopPx, journalChipMaxTopPx)
+            }
+
+            // Each chip takes the cheapest free spot near its entry: its own height to the right
+            // first, then the other side, a row up or down, or nudged further out. A chip keeps
+            // last frame's spot while it stays free, so panning never reshuffles them. Those
+            // spots are forgotten once a zoom settles, so the layout then tidies up for the
+            // new scale in one animated step.
+            var journalChipLayoutZoom by remember { mutableLongStateOf(visibleDuration) }
+            LaunchedEffect(visibleDuration) {
+                kotlinx.coroutines.delay(350L)
+                journalChipLayoutZoom = visibleDuration
+            }
+            val journalChipLastSlots = remember(journalChipLayoutZoom) { HashMap<Long, JournalChipSlot>() }
+            // Which chip's pile each chip joined, so fronts and layers hold still from frame to frame.
+            val journalChipLastTucks = remember(journalChipLayoutZoom) { HashMap<Long, Long>() }
+            // How wide each pile front's total was last frame, so it is laid out with room for it.
+            val journalChipLastTotalWidths = remember(journalChipLayoutZoom) { HashMap<Long, Float>() }
+            val chipLabels = chipMarkers.map { marker -> marker.detailText.ifBlank { marker.title.take(10) } }
+            val chipWidths = chipLabels.map { label ->
+                // A pixel of slack so a chip laid out at its measured width never ellipsizes.
+                journalChipChromePx + journalChipTextWidth(label).coerceAtMost(journalChipMaxTextPx) + 1f
+            }
+            // Entries showing the same thing closer together than a few dp can't be told apart on
+            // screen, as with a loop's equal doses on a wide zoom; the later ones fold behind the
+            // first instead of each claiming a spot. A different value never folds, so every
+            // dose stays readable. The steps are fixed in time, so panning never regroups them,
+            // except that an entry still on screen never folds into one that has left it.
+            val journalChipFoldMillis = (with(LocalDensity.current) { 4.dp.toPx() } * journalChipLayoutZoom / overlayDataWidthPx.coerceAtLeast(1f))
+                .toLong()
+                .coerceAtLeast(1L)
+            val chipFoldInto = arrayOfNulls<Int>(chipMarkers.size)
+            run {
+                val firstInStep = HashMap<Triple<JournalEntryType, String, Long>, Int>()
+                chipMarkers.forEachIndexed { index, marker ->
+                    val step = Triple(marker.type, chipLabels[index], Math.floorDiv(marker.timestamp, journalChipFoldMillis))
+                    val first = firstInStep[step]
+                    if (first == null || (chipAnchorXs[first] < 0f && chipAnchorXs[index] >= 0f)) {
+                        firstInStep[step] = index
+                    } else {
+                        chipFoldInto[index] = first
+                    }
+                }
+            }
+            val chipIndexOfEntry = HashMap<Long, Int>(chipMarkers.size * 2)
+            chipMarkers.forEachIndexed { index, marker -> chipIndexOfEntry[marker.entryId] = index }
+            val chipPlacements = JournalChipLayout.place(
+                chipMarkers.mapIndexed { index, marker ->
+                    JournalChipRequest(
+                        anchorX = chipAnchorXs[index],
+                        baseTop = journalChipBaseTop(marker) + journalChipPillInsetYPx,
+                        width = maxOf(chipWidths[index], journalChipLastTotalWidths[marker.entryId] ?: 0f),
+                        previous = journalChipLastSlots[marker.entryId],
+                        // Chips showing the same thing may tuck behind one another.
+                        stackKey = marker.type to chipLabels[index],
+                        foldInto = chipFoldInto[index],
+                        previousTuck = journalChipLastTucks[marker.entryId]
+                            ?.let(chipIndexOfEntry::get)
+                            ?.let(::JournalChipTuck),
+                        // Insulin never piles with carbs or a note, so a pile always reads as one thing.
+                        kind = marker.type
+                    )
+                },
+                journalChipLayoutSpec,
+                // Chips keep off the entries' own dots, so none hides a marker.
+                obstacles = chipMarkers.indices.mapNotNull { index ->
+                    val marker = chipMarkers[index]
+                    if (marker.type == JournalEntryType.INSULIN) return@mapNotNull null
+                    val dotY = markerOverlayY(marker) ?: eventRailOverlayY
+                    val x = chipAnchorXs[index]
+                    JournalChipBox(x - journalChipDotClearPx, dotY - journalChipDotClearPx, x + journalChipDotClearPx, dotY + journalChipDotClearPx)
+                }
+            )
+            if (journalChipLastSlots.size + journalChipLastTucks.size > chipMarkers.size * 2 + 64) {
+                journalChipLastSlots.clear()
+                journalChipLastTucks.clear()
+            }
+            chipMarkers.forEachIndexed { index, marker ->
+                val placement = chipPlacements[index]
+                val tuck = placement.tuck
+                when {
+                    placement.folded -> Unit
+                    tuck != null -> {
+                        journalChipLastTucks[marker.entryId] = chipMarkers[tuck.front].entryId
+                        journalChipLastSlots.remove(marker.entryId)
+                    }
+                    else -> {
+                        journalChipLastSlots[marker.entryId] = placement.slot
+                        journalChipLastTucks.remove(marker.entryId)
+                    }
+                }
+            }
+            val chipBoxes = chipPlacements.map { it.box }
+
+            // Where chips pile up, a repeat behind its twin or a chip with no free spot, the
+            // pile's front shows how many chips it holds. The pile spreads apart while tapped or
+            // hovered, each chip the way it already peeks out.
+            val chipGroups = JournalChipLayout.piles(
+                chipPlacements,
+                minOverlapX = with(LocalDensity.current) { 12.dp.toPx() },
+                minOverlapY = with(LocalDensity.current) { 8.dp.toPx() }
+            )
+            val chipGroupOf = HashMap<Long, IntArray>()
+            chipGroups.forEach { group -> group.forEach { chipGroupOf[chipMarkers[it].entryId] = group } }
+
+            // Hover opens a group like a tap does; a short grace keeps it open while the
+            // pointer crosses from one chip to the next.
+            var hoveredJournalChipId by remember { mutableStateOf<Long?>(null) }
+            var hoverOpenJournalChipId by remember { mutableStateOf<Long?>(null) }
+            LaunchedEffect(hoveredJournalChipId) {
+                val hovered = hoveredJournalChipId
+                if (hovered != null) {
+                    hoverOpenJournalChipId = hovered
+                } else {
+                    kotlinx.coroutines.delay(160L)
+                    hoverOpenJournalChipId = null
+                }
+            }
+            // A hovered pile opens even while another is open from a tap; leaving it falls back
+            // to the tapped one.
+            val openChipPile = (hoverOpenJournalChipId?.let(chipGroupOf::get) ?: expandedJournalChipId?.let(chipGroupOf::get))
+            // Only the top of a huge pile spreads; the rest stay counted on its front.
+            val journalChipMaxSpread = 24
+            fun spreadablePart(group: IntArray) = if (group.size > journalChipMaxSpread) group.copyOf(journalChipMaxSpread) else group
+            val openChipGroup = openChipPile?.let(::spreadablePart)
+            val journalChipSpreadRadiusPx = with(LocalDensity.current) { 160.dp.toPx() }
+            // A peek only shows the way a chip will go, so it looks for room close by and more
+            // coarsely: it is worked out for every pile on every frame, and a full chart has
+            // none to find.
+            val journalChipPeekRadiusPx = with(LocalDensity.current) { 96.dp.toPx() }
+            val journalChipPeekStepPx = with(LocalDensity.current) { 8.dp.toPx() }
+            // Where each chip went the last time its pile spread, peeking or open, so a pile
+            // spreads the same way from frame to frame while that room stays clear.
+            val journalChipLastShifts = remember(journalChipLayoutZoom) { HashMap<Long, FloatArray>() }
+            if (journalChipLastShifts.size > chipMarkers.size * 2 + 64) journalChipLastShifts.clear()
+            fun spreadOf(group: IntArray, keep: Boolean = false, peeking: Boolean = false): JournalChipSpread {
+                val members = spreadablePart(group)
+                // A pile whose entries have all left the screen keeps peeking as it rides off.
+                val offScreen = peeking && members.all { chipAnchorXs[it] !in 0f..overlayDataWidthPx }
+                val spread = JournalChipLayout.spread(
+                    boxes = chipBoxes,
+                    members = members,
+                    minX = if (offScreen) -overlayDataWidthPx else 0f,
+                    maxX = if (offScreen) overlayDataWidthPx * 2f else overlayDataWidthPx,
+                    minTop = journalChipLayoutSpec.minTop,
+                    maxTop = journalChipLayoutSpec.maxTop,
+                    gapPx = journalChipGapPx,
+                    ringStepPx = if (peeking) journalChipPeekStepPx else journalChipGapPx,
+                    maxRadiusPx = if (peeking) journalChipPeekRadiusPx else journalChipSpreadRadiusPx,
+                    preferred = Array(members.size) { journalChipLastShifts[chipMarkers[members[it]].entryId] }
+                )
+                if (keep) {
+                    members.forEachIndexed { slot, index ->
+                        val id = chipMarkers[index].entryId
+                        if (spread.stuck[slot]) journalChipLastShifts.remove(id) else journalChipLastShifts[id] = spread.shifts[slot]
+                    }
+                }
+                return spread
+            }
+            // A pile too crowded to spread out here zooms in on its entries instead, while the
+            // chart can still zoom; there they have room.
+            val canZoomOntoChips = visibleDuration > minDuration
+            fun zoomOntoPile(group: IntArray) {
+                zoomChartOnto(
+                    group.minOf { chipMarkers[it].timestamp },
+                    group.maxOf { chipMarkers[it].timestamp }
+                )
+            }
+            val chipSpreads = Array(chipMarkers.size) { Offset.Zero }
+            // How many chips of the open pile found no clear spot, or were past the top of it,
+            // so its front still counts them.
+            var openChipGroupStuck = 0
+            if (openChipPile != null && openChipGroup != null) {
+                val spread = spreadOf(openChipPile, keep = true)
+                openChipGroupStuck = spread.stuckCount + (openChipPile.size - openChipGroup.size)
+                openChipGroup.forEachIndexed { slot, index ->
+                    chipSpreads[index] = Offset(spread.shifts[slot][0], spread.shifts[slot][1])
+                }
+            }
+
+            // While a pile is closed, the chips behind its front peek out dimmed, part of the way
+            // toward where they go when it opens, so the pile shows which way it will spread.
+            // A folded chip can't be told apart from its front, so it stays wholly behind.
+            val chipPeeks = JournalChipLayout.peeks(
+                chipBoxes,
+                chipGroups.filter { openChipGroup == null || it[0] != openChipGroup[0] },
+                journalChipLayoutSpec.visibleLayers,
+                journalChipLayoutSpec.peek,
+                mayPeek = { !chipPlacements[it].folded }
+            ) { spreadOf(it, keep = true, peeking = true) }
+            val chipPilePosition = IntArray(chipMarkers.size)
+            chipGroups.forEach { group -> group.forEachIndexed { position, index -> chipPilePosition[index] = position } }
+
+            // A closed pile of one insulin's doses, or of carbs, shows their total on its front
+            // beside the count, so 2 U and 2 U read "4 U ×2". The front is laid out at last
+            // frame's total width; a total wider than that, new this frame, grows away from the
+            // entry, staying on the chart, until the next frame makes room for it.
+            fun pileTotal(group: IntArray): String? {
+                val lead = chipMarkers[group[0]]
+                if (lead.type != JournalEntryType.INSULIN && lead.type != JournalEntryType.CARBS) return null
+                var total = 0.0
+                for (index in group) {
+                    val marker = chipMarkers[index]
+                    if (marker.type != lead.type) return null
+                    if (lead.type == JournalEntryType.INSULIN && (marker.title != lead.title || marker.accentColor != lead.accentColor)) return null
+                    total += marker.amount ?: return null
+                }
+                return journalMarkerAmountText(lead.type, total.toFloat())
+            }
+            val chipShownLabels = chipLabels.toTypedArray()
+            val chipShownWidths = FloatArray(chipMarkers.size) { chipBoxes[it].right - chipBoxes[it].left }
+            val chipShownLefts = FloatArray(chipMarkers.size) { chipBoxes[it].left }
+            val chipTotalWidths = HashMap<Long, Float>()
+            chipGroups.forEach { group ->
+                val front = group[0]
+                val total = pileTotal(group) ?: return@forEach
+                val width = journalChipChromePx + journalChipTextWidth(total).coerceAtMost(journalChipMaxTextPx) + 1f
+                chipTotalWidths[chipMarkers[front].entryId] = width
+                // Open, the front shows its own value again, in the room kept for the total.
+                if (openChipGroup?.contains(front) == true) return@forEach
+                val laidOut = chipShownWidths[front]
+                var left = chipShownLefts[front]
+                if (width > laidOut && chipPlacements[front].slot.side < 0) left -= width - laidOut
+                val shown = maxOf(width, laidOut)
+                if (chipAnchorXs[front] in 0f..overlayDataWidthPx) left = left.coerceIn(0f, (overlayDataWidthPx - shown).coerceAtLeast(0f))
+                chipShownLabels[front] = total
+                chipShownWidths[front] = shown
+                chipShownLefts[front] = left
+            }
+            journalChipLastTotalWidths.clear()
+            journalChipLastTotalWidths.putAll(chipTotalWidths)
+
+            // Every chip rests in the chart's own frame: x relative to its entry, so panning
+            // moves it with the chart at once.
+            val chipTargets = chipMarkers.indices.map { index ->
+                val peek = chipPeeks[index]?.takeIf { openChipGroup?.contains(index) != true }
+                Offset(chipShownLefts[index] - chipAnchorXs[index], chipBoxes[index].top) + chipSpreads[index] +
+                    (peek?.let { Offset(it[0], it[1]) } ?: Offset.Zero)
+            }
+            // A chip springs only when it is given a new spot: another slot or layer, or another
+            // way to peek or spread. The chart rescaling under it, or a pan's rounding, moves
+            // the spot itself, and the chip follows that exactly instead of chasing it.
+            val chipSpots = chipMarkers.indices.map { index ->
+                val placement = chipPlacements[index]
+                val shift = chipTargets[index] - Offset(chipShownLefts[index] - chipAnchorXs[index], chipBoxes[index].top)
+                JournalChipSpot(placement.slot, chipMarkers[placement.front].entryId, placement.depth, shift.x.roundToInt(), shift.y.roundToInt())
+            }
+            // A chip that was not on the chart last frame starts at its resting spot rather than
+            // flying in from wherever it was when it left.
+            val chipMotion = remember { HashMap<Long, JournalChipMotion>() }
+            val chipShownLastFrame = remember { HashSet<Long>() }
+            val chipMotions = chipMarkers.mapIndexed { index, marker ->
+                if (marker.entryId !in chipShownLastFrame) chipMotion.remove(marker.entryId)
+                chipMotion.getOrPut(marker.entryId) { JournalChipMotion(chipSpots[index], chipTargets[index]) }
+                    .also { it.moveTo(chipSpots[index], chipTargets[index]) }
+            }
+            chipShownLastFrame.clear()
+            chipMarkers.mapTo(chipShownLastFrame) { it.entryId }
+            chipMotion.keys.retainAll(chipShownLastFrame)
+            // A chip wholly hidden behind its pile's front shows only as the front's
+            // count, so it is left out until its pile opens; one still springing back after its
+            // pile closes stays until it lands. Any chip that still shows is always there.
+            val chipComposed = BooleanArray(chipMarkers.size) { index ->
+                chipPilePosition[index] == 0 || chipPeeks[index] != null ||
+                    openChipGroup?.contains(index) == true ||
+                    !chipMotions[index].isSettled
+            }
 
             Canvas(
                 modifier = Modifier
                     .fillMaxSize()
                     .zIndex(1.35f)
             ) {
-                visibleOverlayMarkers.forEach { marker ->
-                    val markerX = markerXById[marker.entryId] ?: return@forEach
-                    val preferLeadingAnchor = markerX > (overlayDataWidthPx * 0.58f)
-                    val markerTop = when (marker.type) {
-                        JournalEntryType.FINGERSTICK -> {
-                            val lane = fingerstickLanes[marker.entryId] ?: 0
-                            (
-                                (marker.chartGlucoseValue?.let(overlayValueToY) ?: eventBaseTopPx) -
-                                    fingerstickLiftPx -
-                                    (lane * journalChipLaneStepPx)
-                                ).coerceIn(journalChipMinTopPx, journalChipMaxTopPx)
-                        }
-
-                        JournalEntryType.INSULIN -> {
-                            val lane = insulinLanes[marker.entryId] ?: 0
-                            (
-                                chartHeightPx -
-                                    insulinCurveHeightFor(marker.amount) -
-                                    insulinLabelGapPx -
-                                    (lane * journalChipLaneStepPx)
-                                ).coerceAtLeast(journalChipMinTopPx)
-                        }
-
-                        else -> {
-                            val lane = eventLanes[marker.entryId] ?: 0
-                            (
-                                (markerOverlayY(marker) ?: eventBaseTopPx) -
-                                    fingerstickLiftPx -
-                                    (lane * journalChipLaneStepPx)
-                                ).coerceIn(journalChipMinTopPx, journalChipMaxTopPx)
-                        }
-                    }
+                chipMarkers.forEachIndexed { index, marker ->
+                    if (!chipComposed[index]) return@forEachIndexed
+                    val anchorX = chipAnchorXs[index]
+                    val position = chipMotions[index].position
+                    val chipLeft = anchorX + position.x
+                    val chipRight = chipLeft + chipShownWidths[index]
                     val sourceY = when (marker.type) {
                         JournalEntryType.FINGERSTICK -> marker.chartGlucoseValue
                             ?.let(overlayValueToY)
@@ -3454,74 +3932,99 @@ fun InteractiveGlucoseChart(
                         JournalEntryType.INSULIN -> insulinConnectorY
                         else -> markerOverlayY(marker) ?: eventRailOverlayY
                     }
-                    val labelEdgeX = if (preferLeadingAnchor) {
-                        markerX - journalChipSideOffsetPx - connectorUnderlapPx
+                    // The line tucks under the chip's near edge, whichever side of its entry
+                    // the chip is on right now.
+                    val edgeX = if (chipLeft + chipShownWidths[index] / 2f >= anchorX) {
+                        chipLeft + connectorUnderlapPx
                     } else {
-                        markerX + journalChipSideOffsetPx + connectorUnderlapPx
-                    }.coerceIn(0f, size.width)
-                    val labelCenterY = (markerTop + connectorLabelCenterOffsetPx).coerceIn(0f, chartHeightPx)
+                        chipRight - connectorUnderlapPx
+                    }
                     drawLine(
                         color = Color(marker.accentColor).copy(alpha = 0.22f),
-                        start = Offset(markerX, sourceY.coerceIn(0f, chartHeightPx)),
-                        end = Offset(labelEdgeX, labelCenterY),
+                        start = Offset(anchorX, sourceY.coerceIn(0f, chartHeightPx)),
+                        end = Offset(edgeX, (position.y + journalChipPillHeightPx / 2f).coerceIn(0f, chartHeightPx)),
                         strokeWidth = connectorStrokePx,
                         cap = StrokeCap.Round
                     )
                 }
             }
 
-            visibleOverlayMarkers.forEach { marker ->
-                val markerX = markerXById[marker.entryId] ?: return@forEach
-                val preferLeadingAnchor = markerX > (overlayDataWidthPx * 0.58f)
-                val markerTop = when (marker.type) {
-                    JournalEntryType.FINGERSTICK -> {
-                        val lane = fingerstickLanes[marker.entryId] ?: 0
-                        (
-                            (marker.chartGlucoseValue?.let(overlayValueToY) ?: eventBaseTopPx) -
-                                fingerstickLiftPx -
-                                (lane * journalChipLaneStepPx)
-                            ).coerceIn(journalChipMinTopPx, journalChipMaxTopPx)
-                    }
-
-                    JournalEntryType.INSULIN -> {
-                        val lane = insulinLanes[marker.entryId] ?: 0
-                        (
-                            chartHeightPx -
-                                insulinCurveHeightFor(marker.amount) -
-                                insulinLabelGapPx -
-                                (lane * journalChipLaneStepPx)
-                            ).coerceAtLeast(journalChipMinTopPx)
-                    }
-
-                    else -> {
-                        val lane = eventLanes[marker.entryId] ?: 0
-                        (
-                            (markerOverlayY(marker) ?: eventBaseTopPx) -
-                                fingerstickLiftPx -
-                                (lane * journalChipLaneStepPx)
-                            ).coerceIn(journalChipMinTopPx, journalChipMaxTopPx)
-                    }
+            chipMarkers.forEachIndexed { index, marker ->
+                if (!chipComposed[index]) return@forEachIndexed
+                val anchorX = chipAnchorXs[index]
+                val motion = chipMotions[index]
+                val spot = chipSpots[index]
+                val inOpenGroup = openChipGroup?.contains(index) == true
+                val group = chipGroupOf[marker.entryId]
+                val placement = chipPlacements[index]
+                // The front of a closed pile counts the chips it hides, itself included; those
+                // it hides are left to it for screen readers until the pile opens. Open, it
+                // still counts any that found no room to spread into.
+                val isPileFront = group != null && group[0] == index
+                val stackCount = when {
+                    !isPileFront -> 0
+                    !inOpenGroup -> group!!.size
+                    openChipGroupStuck > 0 -> openChipGroupStuck + 1
+                    else -> 0
                 }
-                JournalMarkerChip(
-                    marker = marker,
-                    modifier = Modifier
-                        .align(Alignment.TopStart)
-                        .zIndex(1.5f)
-                        .offset {
-                            androidx.compose.ui.unit.IntOffset(
-                                x = markerX.toInt(),
-                                y = markerTop.toInt()
+                val hiddenInPile = group != null && group[0] != index && !inOpenGroup
+                val widthPx = chipShownWidths[index]
+                val touchInsetX = ((journalChipTouchPx - widthPx) / 2f).coerceAtLeast(0f)
+                key(marker.entryId) {
+                    LaunchedEffect(spot) { motion.settle() }
+                    JournalMarkerChip(
+                        marker = marker,
+                        label = chipShownLabels[index],
+                        activePointerIds = activeJournalMarkerPointers,
+                        widthPx = widthPx,
+                        stackCount = stackCount,
+                        dimmed = hiddenInPile,
+                        hiddenFromAccessibility = hiddenInPile,
+                        modifier = Modifier
+                            .align(Alignment.TopStart)
+                            // Each layer of a pile sits under the one above it, and a front with
+                            // a count over its neighbours so the count stays clear. An open
+                            // group, and any chip on its way to a new spot of its own, rides
+                            // above the rest; a chip springing back into its pile stays under.
+                            .zIndex(
+                                if (inOpenGroup || (!hiddenInPile && !motion.isSettled)) {
+                                    1.7f
+                                } else {
+                                    1.6f - placement.depth.coerceAtMost(50) * 0.001f + if (stackCount > 0) 0.0005f else 0f
+                                }
                             )
-                        }
-                        .graphicsLayer {
-                            translationX = if (preferLeadingAnchor) {
-                                -size.width - journalChipSideOffsetPx
-                            } else {
-                                journalChipSideOffsetPx
+                            .offset {
+                                val position = motion.position
+                                androidx.compose.ui.unit.IntOffset(
+                                    x = (anchorX + position.x - touchInsetX).roundToInt(),
+                                    y = (position.y - journalChipPillInsetYPx).roundToInt()
+                                )
+                            },
+                        onHoverChange = { hovering ->
+                            if (hovering) {
+                                hoveredJournalChipId = marker.entryId
+                            } else if (hoveredJournalChipId == marker.entryId) {
+                                hoveredJournalChipId = null
                             }
                         },
-                    onClick = { onJournalMarkerClick?.invoke(marker.entryId) }
-                )
+                        onClick = {
+                            val stuck = when {
+                                group == null -> 0
+                                inOpenGroup -> openChipGroupStuck
+                                else -> spreadOf(group).stuckCount + (group.size - spreadablePart(group).size)
+                            }
+                            if (group != null && stuck > 0 && canZoomOntoChips && (!inOpenGroup || isPileFront)) {
+                                expandedJournalChipId = marker.entryId
+                                zoomOntoPile(group)
+                            } else if (group != null && !inOpenGroup) {
+                                expandedJournalChipId = marker.entryId
+                            } else {
+                                expandedJournalChipId = null
+                                onJournalMarkerClick?.invoke(marker.entryId)
+                            }
+                        }
+                    )
+                }
             }
 
             journalActionTimestamp
@@ -3529,6 +4032,27 @@ fun InteractiveGlucoseChart(
                 ?.let { actionTimestamp ->
                     val xFraction = (actionTimestamp - overlayViewportStart).toFloat() / overlayDuration
                     val actionX = (overlayDataWidthPx * xFraction).coerceIn(0f, overlayDataWidthPx)
+                    journalActionAnchor?.let { anchor ->
+                        // Where the canvas draws the dot.
+                        val actionY = journalActionDisplayValue
+                            ?.let(overlayValueToY)
+                            ?.takeIf { it.isFinite() }
+                            ?.let { coerceChartYToDrawableRange(it, chartHeightPx, journalActionDotInsetPx) }
+                            ?: coerceChartYToDrawableRange(chartHeightPx - journalActionDotInsetPx, chartHeightPx, journalActionDotInsetPx)
+                        Box(
+                            modifier = Modifier
+                                .align(Alignment.TopStart)
+                                .offset { androidx.compose.ui.unit.IntOffset(actionX.roundToInt(), actionY.roundToInt()) }
+                                .size(0.dp)
+                                .onGloballyPositioned { coordinates ->
+                                    val dot = coordinates.positionOnScreen()
+                                    anchor.dotOnScreen = dot
+                                    anchor.ceilingOnScreen = dot.y - actionY
+                                    anchor.floorOnScreen = dot.y + journalActionChipYOffsetPx - actionY
+                                    anchor.opensLeft = xFraction > 0.56f
+                                }
+                        )
+                    }
                     Surface(
                         modifier = Modifier
                             .align(Alignment.TopStart)
@@ -3545,11 +4069,13 @@ fun InteractiveGlucoseChart(
                         tonalElevation = 0.dp,
                         shadowElevation = 0.dp
                     ) {
+                        // ui-guardrails: allow-begin offgrid_spacing - the journal time pill, sized with the journal chips beside it
                         Row(
                             modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
+                            // ui-guardrails: allow-end
                             Icon(
                                 imageVector = Icons.Default.AccessTime,
                                 contentDescription = null,
@@ -3566,7 +4092,8 @@ fun InteractiveGlucoseChart(
                     }
                 }
 
-            activeInsulinSummary?.let { summary ->
+            if (activeInsulinSummary != null || activeCarbsGrams != null || stateDoseHint != null) {
+                val summary = activeInsulinSummary
                 val unitsLabel = { units: Float ->
                     if (units % 1f < 0.05f) {
                         units.roundToInt().toString()
@@ -3574,41 +4101,164 @@ fun InteractiveGlucoseChart(
                         String.format(java.util.Locale.getDefault(), "%.1f", units)
                     }
                 }
-                val totalUnitsLabel = unitsLabel(summary.totalUnits)
-                val remainingLabel = summary.nextEndingAt
-                    ?.let { formatRemainingDuration(it - System.currentTimeMillis()) }
-                    ?.takeIf { it.isNotBlank() }
+                val iobValue = summary?.let { stringResource(R.string.unit_insulin_value, unitsLabel(it.iobUnits)) }
+                val eiobValue = summary?.let { stringResource(R.string.unit_insulin_value, unitsLabel(it.eiobUnits)) }
+                val totalUnitsLabel = summary?.let { unitsLabel(it.totalUnits) }
+                val remainingLabel = formatRemainingDuration(
+                    LocalContext.current,
+                    summary?.activeUntil?.minus(System.currentTimeMillis())
+                )
+                val doseHintAmount = remember(stateDoseHint?.kind, stateDoseHint?.amount) {
+                    stateDoseHint?.let { hint ->
+                        NumberFormat.getNumberInstance().apply {
+                            minimumFractionDigits =
+                                if (hint.kind == StateDoseHintKind.INSULIN) 1 else 0
+                            maximumFractionDigits = minimumFractionDigits
+                            isGroupingUsed = false
+                        }.format(hint.amount)
+                    }
+                }
+                val doseHintTargetLabel = stateDoseHint?.let { hint ->
+                    if (isMmol) {
+                        stringResource(
+                            R.string.predictive_dose_target_value_mmol,
+                            GlucoseFormatter.mgToMmol(hint.targetMgDl)
+                        )
+                    } else {
+                        stringResource(R.string.predictive_dose_target_value_mgdl, hint.targetMgDl)
+                    }
+                }
+                // Collapsed shows the bare amount and, where there is one, when the state it
+                // is about arrives — a number with no time reads as "do this now", which is
+                // only true of the insulin case. Expanded has room to name both.
+                val doseHintLabel = if (stateDoseHint != null && doseHintAmount != null) {
+                    val minutesAhead = stateDoseHint.minutesAhead?.takeIf { it > 0 }
+                    when (stateDoseHint.kind) {
+                        StateDoseHintKind.CARBS -> if (!isActiveInsulinExpanded) {
+                            val amount = stringResource(R.string.unit_carbs_value, doseHintAmount)
+                            if (minutesAhead != null) {
+                                stringResource(R.string.dashboard_dose_hint_short_in, amount, minutesAhead)
+                            } else {
+                                stringResource(R.string.dashboard_dose_hint_short, amount)
+                            }
+                        } else if (minutesAhead != null && doseHintTargetLabel != null) {
+                            stringResource(
+                                R.string.dashboard_dose_hint_carbs_in,
+                                doseHintAmount,
+                                doseHintTargetLabel,
+                                minutesAhead
+                            )
+                        } else if (doseHintTargetLabel != null) {
+                            stringResource(
+                                R.string.dashboard_dose_hint_carbs_below,
+                                doseHintAmount,
+                                doseHintTargetLabel
+                            )
+                        } else {
+                            stringResource(R.string.dashboard_dose_hint_carbs, doseHintAmount)
+                        }
+                        StateDoseHintKind.INSULIN -> if (summary == null || isActiveInsulinExpanded) {
+                            stringResource(R.string.dashboard_dose_hint_insulin, doseHintAmount)
+                        } else {
+                            stringResource(
+                                R.string.dashboard_dose_hint_short,
+                                stringResource(R.string.unit_insulin_value, doseHintAmount)
+                            )
+                        }
+                    }
+                } else null
+                val activeInsulinCorner by animateDpAsState(
+                    targetValue = if (isActiveInsulinExpanded) 24.dp else 16.dp,
+                    animationSpec = activeInsulinMotionSpec(),
+                    label = "activeInsulinCorner"
+                )
+                val activeInsulinShape = RoundedCornerShape(activeInsulinCorner)
+                // Collapsed stays under half the chart so it never reaches the date chip;
+                // expanded is allowed a little more room but still stops short of it.
+                val activeInsulinMaxWidth = maxWidth * if (isActiveInsulinExpanded) {
+                    ACTIVE_INSULIN_EXPANDED_MAX_WIDTH_FRACTION
+                } else {
+                    ACTIVE_INSULIN_MAX_WIDTH_FRACTION
+                }
                 Surface(
                     modifier = Modifier
                         .align(Alignment.TopStart)
                         .padding(start = 12.dp, top = 12.dp)
+                        .widthIn(max = activeInsulinMaxWidth)
                         .zIndex(1.6f)
-                        .clickable { isActiveInsulinExpanded = !isActiveInsulinExpanded },
-                    shape = RoundedCornerShape(18.dp),
+                        .clip(activeInsulinShape)
+                        .clickable(enabled = summary != null || activeCarbsGrams != null) { isActiveInsulinExpanded = !isActiveInsulinExpanded },
+                    shape = activeInsulinShape,
                     color = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.96f),
                     tonalElevation = 0.dp,
                     shadowElevation = 0.dp
                 ) {
                     Column(
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                        modifier = Modifier
+                            .animateContentSize(animationSpec = activeInsulinMotionSpec())
+                            .padding(horizontal = 12.dp, vertical = 8.dp),
                         verticalArrangement = Arrangement.spacedBy(4.dp)
                     ) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text(
-                                text = "IOB ${unitsLabel(summary.iobUnits)}U",
-                                style = MaterialTheme.typography.labelLarge,
-                                fontWeight = FontWeight.SemiBold
-                            )
-                            if (showEiob) {
-                                Spacer(modifier = Modifier.width(6.dp))
+                        // Expanding spells the abbreviations out in place instead of
+                        // repeating the same two numbers in a second block below.
+                        if (iobValue != null) {
+                            if (isActiveInsulinExpanded) {
                                 Text(
-                                    text = "eIOB ${unitsLabel(summary.eiobUnits)}U",
-                                    style = MaterialTheme.typography.labelMedium,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    text = stringResource(R.string.dashboard_iob_full, iobValue),
+                                    style = MaterialTheme.typography.labelLargeEmphasized
                                 )
+                                if (showEiob && eiobValue != null) {
+                                    Text(
+                                        text = stringResource(R.string.dashboard_eiob_full, eiobValue),
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            } else {
+                                Row(
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    verticalAlignment = Alignment.Bottom
+                                ) {
+                                    Text(
+                                        text = stringResource(R.string.dashboard_iob_short, iobValue),
+                                        style = MaterialTheme.typography.labelLargeEmphasized,
+                                        maxLines = 1
+                                    )
+                                    if (showEiob && eiobValue != null) {
+                                        Text(
+                                            text = stringResource(R.string.dashboard_eiob_short, eiobValue),
+                                            style = MaterialTheme.typography.labelMedium,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            maxLines = 1
+                                        )
+                                    }
+                                }
                             }
-                            remainingLabel?.let { label ->
-                                Spacer(modifier = Modifier.width(10.dp))
+                        }
+                        activeCarbsGrams?.let { grams ->
+                            val carbsValue = stringResource(R.string.unit_carbs_value, unitsLabel(grams))
+                            Text(
+                                text = if (isActiveInsulinExpanded) {
+                                    stringResource(R.string.dashboard_cob_full, carbsValue)
+                                } else {
+                                    stringResource(R.string.journal_cob_value, carbsValue)
+                                },
+                                style = MaterialTheme.typography.labelLargeEmphasized
+                            )
+                        }
+                        // The hint, or — collapsed and with nothing to suggest — how long the
+                        // insulin still runs. Not both on one collapsed line: the hint already
+                        // carries its own time, and the card is under half the chart wide.
+                        // Expanded states the end time in full below either way.
+                        if (doseHintLabel != null) {
+                            Text(
+                                text = doseHintLabel,
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = if (isActiveInsulinExpanded) 2 else 1
+                            )
+                        } else if (remainingLabel != null && !isActiveInsulinExpanded) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
                                 Icon(
                                     imageVector = Icons.Default.AccessTime,
                                     contentDescription = null,
@@ -3617,50 +4267,41 @@ fun InteractiveGlucoseChart(
                                 )
                                 Spacer(modifier = Modifier.width(4.dp))
                                 Text(
-                                    text = label,
+                                    text = remainingLabel,
                                     style = MaterialTheme.typography.labelMedium,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1
                                 )
                             }
                         }
-                        AnimatedVisibility(visible = isActiveInsulinExpanded) {
-                            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                                Text(
-                                    text = stringResource(R.string.journal_active_insulin),
-                                    style = MaterialTheme.typography.labelLarge,
-                                    fontWeight = FontWeight.SemiBold,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                                Text(
-                                    text = buildString {
-                                        append(stringResource(R.string.journal_iob_expanded, unitsLabel(summary.iobUnits)))
-                                        if (showEiob) {
-                                            append(" · ")
-                                            append(stringResource(R.string.journal_eiob_expanded, unitsLabel(summary.eiobUnits)))
-                                        }
-                                    },
-                                    style = MaterialTheme.typography.titleSmall
-                                )
+                        if (isActiveInsulinExpanded && summary != null && totalUnitsLabel != null) {
+                            Text(
+                                text = stringResource(
+                                    R.string.journal_active_insulin_summary,
+                                    summary.activeEntryCount,
+                                    totalUnitsLabel,
+                                    summary.weightedActivityPercent
+                                ),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            summary.activeUntil?.let { activeUntil ->
                                 Text(
                                     text = stringResource(
-                                        R.string.journal_active_insulin_summary,
-                                        summary.activeEntryCount,
-                                        totalUnitsLabel,
-                                        summary.weightedActivityPercent
+                                        R.string.journal_active_insulin_until,
+                                        java.text.DateFormat.getTimeInstance(java.text.DateFormat.SHORT)
+                                            .format(java.util.Date(activeUntil))
                                     ),
-                                    style = MaterialTheme.typography.titleSmall
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
-                                summary.nextEndingAt?.let { nextEndingAt ->
-                                    Text(
-                                        text = stringResource(
-                                            R.string.journal_active_insulin_until,
-                                            java.text.DateFormat.getTimeInstance(java.text.DateFormat.SHORT)
-                                                .format(java.util.Date(nextEndingAt))
-                                        ),
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
-                                }
+                            }
+                            if (activeInsulinFromRemote) {
+                                Text(
+                                    text = stringResource(R.string.journal_iob_source_remote),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
                             }
                         }
                     }
@@ -3700,13 +4341,27 @@ fun InteractiveGlucoseChart(
 
                 // Compute calibrated value for tooltip
                 val isRawModeTT = viewMode == 1 || viewMode == 3
-                val hasCalibrationTT = calibratedValueResolver.hasCalibration(isRawModeTT)
-                val calibratedValueTT = if (hasCalibrationTT) {
-                    calibratedValueResolver.valueForPoint(point, isRawModeTT).takeIf { it > 0.1f }
-                } else null
+                val calibratedValueTT = chartModel.primary?.valueAt(point.timestamp)
+                    ?.takeIf { it.isFinite() && it > 0.1f }
+                    ?.takeIf { hasCalibration || it != (if (isRawModeTT) point.rawValue else point.value) }
                 val dvs = getDisplayValues(point, viewMode, unit, calibratedValueTT)
-                val tooltipPeerPoints = peerPointsByBucket[MultiSensorDisplay.bucketKeyForTimestamp(point.timestamp)]
-                    .orEmpty()
+                // Peer rows read what the peer's line drew — calibrated, smoothed,
+                // recorded — not the sensor's own point from before any of that.
+                val tooltipPeerRows = chartModel.peers.mapNotNull { series ->
+                    val cursor = series.cursorAt(point.timestamp) ?: return@mapNotNull null
+                    val source = peerChartSeries.firstOrNull { it.sensorId == series.sensorId }
+                        ?.points
+                        ?.let { tk.glucodata.chart.nearestInMinuteOf(it, point.timestamp) { p -> p.timestamp } }
+                        ?: return@mapNotNull null
+                    val peerIsRaw = series.viewMode == 1 || series.viewMode == 3
+                    val calibrated = cursor.line?.value
+                        ?.takeIf { it.isFinite() && it > 0.1f }
+                        ?.takeIf {
+                            peerHasCalibration[series.sensorId] == true ||
+                                it != (if (peerIsRaw) source.rawValue else source.value)
+                        }
+                    TooltipPeerRow(series.viewMode, Color(series.colorArgb), source, calibrated)
+                }
 
                 // --- 1. INFO CARD (Top) ---
                 // "Current Status Card styling" -> primaryContainer
@@ -3793,7 +4448,7 @@ fun InteractiveGlucoseChart(
                         // Colored Text Logic (Keep matching graph lines for values)
                         // Multi-sensor: tint the primary value subtly with its
                         // sensor identity color so it pairs with peer rows below.
-                        val primaryTooltipColor = if (tooltipPeerPoints.isNotEmpty()) {
+                        val primaryTooltipColor = if (tooltipPeerRows.isNotEmpty()) {
                             androidx.compose.ui.graphics.lerp(
                                 statusContentColor,
                                 primaryIdentityColor,
@@ -3802,9 +4457,10 @@ fun InteractiveGlucoseChart(
                         } else {
                             statusContentColor
                         }
+                        val tooltipValueWeight = MaterialTheme.typography.titleMediumEmphasized.fontWeight
                         val styledText = androidx.compose.ui.text.buildAnnotatedString {
                             // Primary Value
-                            withStyle(SpanStyle(color = primaryTooltipColor, fontWeight = FontWeight.Bold)) {
+                            withStyle(SpanStyle(color = primaryTooltipColor, fontWeight = tooltipValueWeight)) {
                                 append(dvs.primaryStr)
                             }
 
@@ -3813,7 +4469,7 @@ fun InteractiveGlucoseChart(
                                 withStyle(SpanStyle(color = MaterialTheme.colorScheme.onSurfaceVariant)) {
                                     append(" · ")
                                 }
-                                withStyle(SpanStyle(color = LocalContentColor.current.copy(alpha = 0.6f), fontWeight = FontWeight.Bold)) {
+                                withStyle(SpanStyle(color = LocalContentColor.current.copy(alpha = 0.6f), fontWeight = tooltipValueWeight)) {
                                     append(sec)
                                 }
                             }
@@ -3833,18 +4489,54 @@ fun InteractiveGlucoseChart(
                             text = styledText,
                             style = MaterialTheme.typography.titleMedium
                         )
-                        tooltipPeerPoints.forEach { peer ->
-                            val attrs = peerDrawAttrs[peer.sensorSerial]
-                            val peerColor = attrs?.first ?: SensorColors.getColor(peer.sensorSerial.orEmpty())
-                            val peerMode = attrs?.second ?: viewMode
+                        // Uncertainty, when the estimator that produced this
+                        // point actually reported it. The range is stated as a
+                        // range; the artifact line is phrased as a possibility,
+                        // because an elevated posterior probability is not the
+                        // same as an artifact having occurred.
+                        // Gated on the same preference as the ribbon, not just
+                        // on the point carrying an interval. Stored bands outlive
+                        // a switch away from Adaptive V2, so without this the
+                        // range kept appearing here for a model that never
+                        // produced one.
+                        point.uncertainty
+                            ?.takeIf { it.isUsable && uncertaintyRibbonEnabled }
+                            ?.let { uncertainty ->
+                            val isMmolTooltip = GlucoseFormatter.isMmol(unit)
+                            Text(
+                                text = stringResource(
+                                    R.string.glucose_likely_range_value,
+                                    GlucoseFormatter.format(uncertainty.lower, isMmolTooltip),
+                                    GlucoseFormatter.format(uncertainty.upper, isMmolTooltip),
+                                ),
+                                style = MaterialTheme.typography.labelMedium,
+                                color = statusContentColor.copy(alpha = 0.72f),
+                                modifier = Modifier.padding(top = 4.dp),
+                            )
+                            val statusRes = when {
+                                (uncertainty.artifactProbability ?: 0f) >= ARTIFACT_NOTICE_PROBABILITY ->
+                                    R.string.glucose_possible_artifact
+                                (uncertainty.confidence ?: 1f) <= LOW_CONFIDENCE_NOTICE ->
+                                    R.string.glucose_uncertainty_elevated
+                                else -> null
+                            }
+                            statusRes?.let {
+                                Text(
+                                    text = stringResource(it),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = statusContentColor.copy(alpha = 0.58f),
+                                )
+                            }
+                        }
+                        tooltipPeerRows.forEach { peer ->
                             val peerTextColor = androidx.compose.ui.graphics.lerp(
                                 statusContentColor,
-                                peerColor,
+                                peer.color,
                                 tk.glucodata.SensorVisuals.PEER_TEXT_BLEND
                             )
-                            val peerDvs = getDisplayValues(peer, peerMode, unit, calibratedValue = null)
+                            val peerDvs = getDisplayValues(peer.point, peer.viewMode, unit, peer.calibratedValue)
                             Text(
-                                modifier = Modifier.padding(top = 3.dp),
+                                modifier = Modifier.padding(top = 4.dp),
                                 text = buildGlucoseString(
                                     peerDvs,
                                     peerTextColor,
@@ -3944,17 +4636,55 @@ fun InteractiveGlucoseChart(
 
             // --- CALIBRATION TOOLTIPS ---
             // Show permanent tooltips for calibration points in visible range (respects mode)
-            val isRawModeTooltip = viewMode == 1 || viewMode == 3
-            val calibrationsTooltip = tk.glucodata.data.calibration.CalibrationManager.getVisibleCalibrations(isRawModeTooltip)
+            // Keep the timestamp glyph on the same baseline as the Canvas-drawn x-axis labels.
+            // The old implementation positioned the whole chip from the bottom of the chart and
+            // compensated with a guessed dp lift, so the chip's internal Text baseline drifted.
+            val chartTimeLabelBaselinePx = (
+                constraints.maxHeight.toFloat() -
+                    chartUnderlayBottomPx -
+                    previewWindowReservedPx -
+                    labelsLiftPx -
+                    28f
+                ).coerceAtLeast(0f)
+            val calibrationTimestampTextMeasurer = rememberTextMeasurer()
+            val calibrationTimestampTextStyle = MaterialTheme.typography.labelSmall
+            val calibrationTimestampChipHeightPx = with(LocalDensity.current) { 24.dp.toPx() }
             val viewportStartTooltip = overlayViewportStart
             val viewportEndTooltip = overlayViewportEnd
-            val visibleCalibrationsTooltip = calibrationsTooltip.filter { it.timestamp in viewportStartTooltip..viewportEndTooltip }
+            val visibleCalibrationsTooltip = visibleCalibrations.filter {
+                it.timestamp in viewportStartTooltip..viewportEndTooltip
+            }
 
+            val calibrationLabelLocale = java.util.Locale.getDefault()
+            val calibrationLabelTimeZone = java.util.TimeZone.getDefault()
             visibleCalibrationsTooltip.forEach { cal ->
                 val calXFraction = (cal.timestamp - viewportStartTooltip).toFloat() / overlayDuration
                 val calXOffset = (overlayDataWidthPx * calXFraction).coerceIn(0f, overlayDataWidthPx)
-                val calTimeFormat = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault())
-                val calTimeStr = calTimeFormat.format(java.util.Date(cal.timestamp))
+                // Collapse/scroll changes pixel positions every frame, not these labels.
+                val calTimeStr = remember(cal.timestamp, calibrationLabelLocale, calibrationLabelTimeZone) {
+                    java.text.SimpleDateFormat("HH:mm", calibrationLabelLocale).apply {
+                        timeZone = calibrationLabelTimeZone
+                    }.format(java.util.Date(cal.timestamp))
+                }
+                val calValueStr = remember(cal.userValue, unit, calibrationLabelLocale) {
+                    String.format(calibrationLabelLocale, if (unit.contains("mmol", true)) "%.1f" else "%.0f", cal.userValue)
+                }
+                val calibrationTimestampTextLayout = remember(
+                    calTimeStr,
+                    calibrationTimestampTextStyle
+                ) {
+                    calibrationTimestampTextMeasurer.measure(
+                        text = calTimeStr,
+                        style = calibrationTimestampTextStyle,
+                        maxLines = 1,
+                        softWrap = false
+                    )
+                }
+                val calibrationTimestampTextBaselineOffsetPx =
+                    (calibrationTimestampChipHeightPx - calibrationTimestampTextLayout.size.height) / 2f +
+                        calibrationTimestampTextLayout.firstBaseline
+                val calibrationTimestampChipTopPx =
+                    chartTimeLabelBaselinePx - calibrationTimestampTextBaselineOffsetPx
 
                 // Top: Value chip with waterdrop icon (clickable to edit)
                 Surface(
@@ -3990,9 +4720,8 @@ fun InteractiveGlucoseChart(
                         )
                         Spacer(modifier = Modifier.width(4.dp))
                         Text(
-                            text = String.format(java.util.Locale.getDefault(), if (unit.contains("mmol", true)) "%.1f" else "%.0f", cal.userValue),
-                            style = MaterialTheme.typography.labelMedium,
-                            fontWeight = FontWeight.Bold
+                            text = calValueStr,
+                            style = MaterialTheme.typography.labelMediumEmphasized
                         )
                     }
                 }
@@ -4000,21 +4729,21 @@ fun InteractiveGlucoseChart(
                 // Bottom: Time chip
                 Box(
                     modifier = Modifier
-                        .align(Alignment.BottomStart)
+                        .align(Alignment.TopStart)
                         .zIndex(1f) // Below scrubbing tooltip
                         .offset {
                             androidx.compose.ui.unit.IntOffset(
                                 x = calXOffset.toInt(),
-                                y = 0.dp.roundToPx() - (chartUnderlayBottomIntPx + previewWindowReservedIntPx)
+                                y = calibrationTimestampChipTopPx.roundToInt()
                             )
                         }
                         .graphicsLayer { translationX = -size.width / 2f }
                         .height(24.dp)
                         .background(
                             MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.85f),
-                            RoundedCornerShape(6.dp)
+                            RoundedCornerShape(4.dp)
                         )
-                        .padding(horizontal = 6.dp),
+                        .padding(horizontal = 8.dp),
                     contentAlignment = Alignment.Center
                 ) {
                     Text(
@@ -4029,18 +4758,30 @@ fun InteractiveGlucoseChart(
             // --- DATE HEADER OVERLAY ---
             // Show only if NOT today AND not "recent" (to avoid showing date when day just started)
             val now = System.currentTimeMillis()
-            val dayCheckFormat = java.text.SimpleDateFormat("yyyyDDD", java.util.Locale.getDefault())
-            val isToday = dayCheckFormat.format(java.util.Date(now)) == dayCheckFormat.format(java.util.Date(centerTime))
+            // Bucketed to a local day so panning within one day neither reformats the label
+            // nor restarts the transition below — centerTime itself changes every frame.
+            val headerDay = localDayIndex(centerTime)
+            val isToday = headerDay == localDayIndex(now)
             val isRecent = abs(now - centerTime) < 4 * 60 * 60 * 1000L // 4 Hour buffer for "just started" days
             val showHeaderDate = !isToday && !isRecent
-            val headerDate = remember(centerTime) {
+            val headerDate = remember(headerDay) {
                 java.text.SimpleDateFormat("EEEE, d MMMM", java.util.Locale.getDefault()).format(java.util.Date(centerTime))
             }
 
             androidx.compose.animation.AnimatedVisibility(
                 visible = showHeaderDate,
-                enter = fadeIn(),
-                exit = fadeOut(),
+                // Grows out of its own top-right corner, where it is anchored, so it reads
+                // as the chart putting the label up rather than a rectangle materialising.
+                enter = fadeIn(ExpressiveMotion.defaultEffects()) + scaleIn(
+                    animationSpec = ExpressiveMotion.defaultSpatial(),
+                    initialScale = 0.85f,
+                    transformOrigin = TransformOrigin(1f, 0f)
+                ),
+                exit = fadeOut(ExpressiveMotion.fastEffects()) + scaleOut(
+                    animationSpec = ExpressiveMotion.fastSpatial(),
+                    targetScale = 0.85f,
+                    transformOrigin = TransformOrigin(1f, 0f)
+                ),
                 modifier = Modifier
                     .align(Alignment.TopEnd)
                     .padding(top = 16.dp, end = 16.dp)
@@ -4048,18 +4789,40 @@ fun InteractiveGlucoseChart(
                 Box(
                     modifier = Modifier
                         .height(32.dp)
-                        .background(
-                            MaterialTheme.colorScheme.surfaceContainerHigh,
-                            RoundedCornerShape(8.dp)
-                        )
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(MaterialTheme.colorScheme.surfaceContainerHigh)
                         .padding(horizontal = 8.dp),
                     contentAlignment = Alignment.Center
                 ) {
-                    Text(
-                        text = headerDate,
-                        style = MaterialTheme.typography.labelLarge,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
+                    // Crossing midnight slides the new date in from the side the pan came
+                    // from, so the label moves with the finger instead of blinking. The
+                    // pill itself is outside this, so only the text travels; SizeTransform
+                    // still morphs its width as the day names change length.
+                    AnimatedContent(
+                        targetState = headerDay to headerDate,
+                        transitionSpec = {
+                            val backwards = targetState.first < initialState.first
+                            val entryEdge = if (backwards) -1 else 1
+                            val enter = slideInHorizontally(ExpressiveMotion.defaultSpatial()) {
+                                entryEdge * it / 2
+                            } + fadeIn(ExpressiveMotion.defaultEffects())
+                            val exit = slideOutHorizontally(ExpressiveMotion.defaultSpatial()) {
+                                -entryEdge * it / 2
+                            } + fadeOut(ExpressiveMotion.fastEffects())
+                            enter togetherWith exit using SizeTransform(clip = false) { _, _ ->
+                                ExpressiveMotion.defaultSpatial()
+                            }
+                        },
+                        label = "chartDateHeader"
+                    ) { (_, label) ->
+                        Text(
+                            text = label,
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            softWrap = false
+                        )
+                    }
                 }
             }
 
@@ -4078,42 +4841,45 @@ fun InteractiveGlucoseChart(
             ) {
                 // M3 Expressive: FilledTonalIconButton is lighter than FAB ("less like an action button")
                 // Icon: LastPage (>|) implies "Go to End/Now"
-                FilledTonalIconButton(
-                    onClick = {
-                        val realNow = System.currentTimeMillis()
-                        val targetTime = realNow - visibleDuration / 2
-                        val diff = targetTime - centerTime
-
-                        coroutineScope.launch {
-                            // "Smart Scroll": Avoid crazy jumps
-                            val maxScroll = 12 * 60 * 60 * 1000L // 12 Hours
-                            var startScroll = centerTime
-
-                            // If distance is huge, snap closer first
-                            if (abs(diff) > maxScroll) {
-                                startScroll = targetTime - (if (diff > 0) maxScroll else -maxScroll)
-                                centerTime = startScroll
+                IconButtonTooltip(stringResource(R.string.chart_back_to_now)) {
+                    FilledTonalIconButton(
+                        onClick = {
+                            val realNow = System.currentTimeMillis()
+                            val targetTime = realNow - visibleDuration / 2
+                            val diff = targetTime - centerTime
+    
+                            coroutineScope.launch {
+                                // "Smart Scroll": Avoid crazy jumps
+                                val maxScroll = 12 * 60 * 60 * 1000L // 12 Hours
+                                var startScroll = centerTime
+    
+                                // If distance is huge, snap closer first
+                                if (abs(diff) > maxScroll) {
+                                    startScroll = targetTime - (if (diff > 0) maxScroll else -maxScroll)
+                                    centerTime = startScroll
+                                }
+    
+                                // Animate the remaining distance
+                                androidx.compose.animation.core.Animatable(startScroll.toFloat()).animateTo(
+                                    targetValue = targetTime.toFloat(),
+                                    animationSpec = spring(stiffness = Spring.StiffnessMediumLow)
+                                ) {
+                                    centerTime = value.toLong()
+                                }
                             }
-
-                            // Animate the remaining distance
-                            androidx.compose.animation.core.Animatable(startScroll.toFloat()).animateTo(
-                                targetValue = targetTime.toFloat(),
-                                animationSpec = spring(stiffness = Spring.StiffnessMediumLow)
-                            ) {
-                                centerTime = value.toLong()
-                            }
-                        }
-                    },
-                    colors = IconButtonDefaults.filledTonalIconButtonColors(
-                        containerColor = MaterialTheme.colorScheme.secondaryContainer,
-                        contentColor = MaterialTheme.colorScheme.onSecondaryContainer
-                    ),
-                    modifier = Modifier.size(48.dp) // Slightly larger than standard 40dp for touch target
-                ) {
-                    Icon(
-                        imageVector = androidx.compose.material.icons.Icons.AutoMirrored.Filled.LastPage,
-                        contentDescription = null
-                    )
+                        },
+                        colors = IconButtonDefaults.filledTonalIconButtonColors(
+                            containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                            contentColor = MaterialTheme.colorScheme.onSecondaryContainer
+                        ),
+                        modifier = Modifier.size(48.dp), // Slightly larger than standard 40dp for touch target
+                        shapes = IconButtonDefaults.shapes()
+                    ) {
+                        Icon(
+                            imageVector = androidx.compose.material.icons.Icons.AutoMirrored.Filled.LastPage,
+                            contentDescription = stringResource(R.string.chart_back_to_now)
+                        )
+                    }
                 }
             }
             */
@@ -4136,16 +4902,17 @@ fun InteractiveGlucoseChart(
                 PreviewWindowNavigator(
                     modifier = Modifier.fillMaxWidth(),
                     renderData = renderData,
-                    calibratedValueResolver = calibratedValueResolver,
+                    chartModel = chartModel,
                     previewCenterTime = previewCenterTime,
                     viewMode = viewMode,
-                    targetLow = targetLow,
-                    targetHigh = targetHigh,
+                    rangeThresholds = rangeThresholds,
+                    rangePalette = chartBandPalette,
                     isMmol = isMmol,
                     currentCenterTime = centerTime,
                     currentVisibleDuration = visibleDuration
                 )
             }
+            android.os.Trace.endSection()
         }
 
         // --- ZOOM BUTTONS (Expressive Connected Group) ---
@@ -4178,6 +4945,23 @@ fun InteractiveGlucoseChart(
         val baseInterItemSpacing = 2.dp // Consistent 1dp everywhere for ranges
         val baseLabelStyle = MaterialTheme.typography.labelLarge // Richer, chunkier font (16sp) to match bigger layout
 
+        val rangeLabels = items.map { stringResource(it.labelResId, it.labelAmount) }
+        val rangeTextMeasurer = rememberTextMeasurer()
+        // Reserve the bold width for every label so changing selection cannot resize the picker.
+        val selectedLabelStyle = MaterialTheme.typography.labelLargeEmphasized
+        val rangeLabelsWidth = remember(rangeLabels, selectedLabelStyle, rangeTextMeasurer, density) {
+            with(density) {
+                rangeLabels.sumOf { label ->
+                    rangeTextMeasurer.measure(
+                        text = label,
+                        style = selectedLabelStyle,
+                        softWrap = false,
+                        maxLines = 1
+                    ).size.width
+                }.toDp()
+            }
+        }
+
         val pickerVerticalOffset = -(chartUnderlayBottomDp + (8.dp * safeExpandedProgress))
 
         // Two-phase dynamic shrink: measure the ideal pill width against the available
@@ -4198,7 +4982,7 @@ fun InteractiveGlucoseChart(
                     .graphicsLayer { alpha = chartBoostProgress }
                     .background(
                         color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f),
-                        shape = RoundedCornerShape(2.dp)
+                        shape = CircleShape
                     )
             )
 
@@ -4208,10 +4992,8 @@ fun InteractiveGlucoseChart(
                     .padding(horizontal = baseInset),
                 contentAlignment = Alignment.Center
             ) {
-            // Estimate intrinsic width of all elements at their base (unscaled) sizes.
-            // Estimate intrinsic width. Use a realistic text width for short labels: "1H", "24H", etc.
-            val avgTextWidth = 18.dp 
-            val rangesWidth = (baseRangeHorizontalPadding * 2 + avgTextWidth) * items.size +
+            // Measure translated labels at the current font scale before sizing the picker.
+            val rangesWidth = baseRangeHorizontalPadding * 2 * items.size + rangeLabelsWidth +
                 (baseRangeClockSize + baseRangeClockGap) // selected item's icon
             val rangeGapsWidth = baseInterItemSpacing * (items.size - 1)
             // Always reserve space for the Back-to-Now button so the entire UI doesn't visually resize/jump
@@ -4238,7 +5020,6 @@ fun InteractiveGlucoseChart(
                 }
             }
 
-            val scaledLabelStyle = baseLabelStyle.copy(fontSize = baseLabelStyle.fontSize * safeUniformScale)
 
             // Button gaps: always consistent (never conditional on adjacent selection)
             val buttonGap = scaled(baseOuterButtonGap)
@@ -4272,7 +5053,7 @@ fun InteractiveGlucoseChart(
                 ) {
                     Icon(
                         imageVector = androidx.compose.material.icons.Icons.Filled.DateRange,
-                        contentDescription = "Jump to Date",
+                        contentDescription = stringResource(R.string.chart_jump_to_date),
                         tint = MaterialTheme.colorScheme.onSecondaryContainer,
                         modifier = Modifier.requiredSize(scaled(baseOuterIconSize))
                     )
@@ -4378,12 +5159,27 @@ fun InteractiveGlucoseChart(
                             }
 
                             Text(
-                                text = range.label,
-                                style = scaledLabelStyle,
+                                text = stringResource(range.labelResId, range.labelAmount),
+                                style = if (isSel) selectedLabelStyle else baseLabelStyle,
+                                // The picker changes scale throughout collapse. Keep glyph
+                                // layout stable; scale the layer and its occupied bounds instead.
+                                modifier = Modifier.layout { measurable, constraints ->
+                                    val label = measurable.measure(Constraints())
+                                    val width = (label.width * safeUniformScale).roundToInt()
+                                        .coerceIn(constraints.minWidth, constraints.maxWidth)
+                                    val height = (label.height * safeUniformScale).roundToInt()
+                                        .coerceIn(constraints.minHeight, constraints.maxHeight)
+                                    layout(width, height) {
+                                        label.placeWithLayer(0, 0) {
+                                            scaleX = safeUniformScale
+                                            scaleY = safeUniformScale
+                                            transformOrigin = TransformOrigin(0f, 0f)
+                                        }
+                                    }
+                                },
                                 color = contentColor,
                                 softWrap = false,
-                                maxLines = 1,
-                                fontWeight = if (isSel) FontWeight.Bold else FontWeight.Medium
+                                maxLines = 1
                             )
                         }
                     }
@@ -4413,7 +5209,7 @@ fun InteractiveGlucoseChart(
                         ) {
                             Icon(
                                 imageVector = if (isScrolledRight) Icons.Filled.FirstPage else Icons.AutoMirrored.Filled.LastPage,
-                                contentDescription = "Back to Now",
+                                contentDescription = stringResource(R.string.chart_back_to_now),
                                 tint = MaterialTheme.colorScheme.onSecondaryContainer,
                                 modifier = Modifier.requiredSize(scaled(baseBackIconSize))
                             )
@@ -4440,13 +5236,15 @@ fun InteractiveGlucoseChart(
                             centerTime = selectedDate + (12 * 60 * 60 * 1000) // Center on noon of selected day
                         }
                         showDatePicker = false
-                    }
+                    },
+                    shapes = ButtonDefaults.shapes(),
+                    contentPadding = ButtonDefaults.TextButtonContentPadding
                 ) {
                     Text(stringResource(R.string.go))
                 }
             },
             dismissButton = {
-                TextButton(onClick = { showDatePicker = false }) {
+                TextButton(onClick = { showDatePicker = false }, shapes = ButtonDefaults.shapes(), contentPadding = ButtonDefaults.TextButtonContentPadding) {
                     Text(stringResource(R.string.cancel))
                 }
             }
@@ -4456,56 +5254,217 @@ fun InteractiveGlucoseChart(
     }
 }
 
+/** Which spot a journal chip rests in: its slot or pile layer, and how far it peeks or spreads from it. */
+private data class JournalChipSpot(val slot: JournalChipSlot, val front: Long, val depth: Int, val shiftX: Int, val shiftY: Int)
+
+/**
+ * One journal chip's motion. The chip follows its resting spot exactly as the chart pans and
+ * rescales under it; only when given a new [JournalChipSpot] does it spring there, from wherever
+ * it was.
+ */
+private class JournalChipMotion(private var spot: JournalChipSpot, private var target: Offset) {
+    // How far the chip still is from its spot, springing to nothing.
+    private val lag = Animatable(Offset.Zero, Offset.VectorConverter)
+    // The jump a new spot made, until [settle] hands it to [lag].
+    private var jump = Offset.Zero
+
+    val position: Offset get() = target + lag.value + jump
+
+    val isSettled: Boolean get() = jump == Offset.Zero && !lag.isRunning
+
+    fun moveTo(spot: JournalChipSpot, target: Offset) {
+        if (spot != this.spot) {
+            jump += this.target - target
+            this.spot = spot
+        }
+        this.target = target
+    }
+
+    suspend fun settle() {
+        if (jump != Offset.Zero) {
+            val from = lag.value + jump
+            jump = Offset.Zero
+            lag.snapTo(from)
+        }
+        if (lag.value != Offset.Zero) lag.animateTo(Offset.Zero, ExpressiveMotion.defaultSpatial())
+    }
+}
+
 @Composable
 private fun JournalMarkerChip(
     marker: JournalChartMarker,
+    label: String,
+    activePointerIds: MutableSet<PointerId>,
+    widthPx: Float,
     modifier: Modifier = Modifier,
+    stackCount: Int = 0,
+    dimmed: Boolean = false,
+    hiddenFromAccessibility: Boolean = false,
+    onHoverChange: (Boolean) -> Unit = {},
     onClick: () -> Unit
 ) {
     val tint = Color(marker.accentColor)
-    Surface(
-        modifier = modifier,
-        onClick = onClick,
-        shape = RoundedCornerShape(14.dp),
-        color = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.92f),
-        border = BorderStroke(1.dp, tint.copy(alpha = 0.18f)),
-        tonalElevation = 0.dp,
-        shadowElevation = 0.dp
+    // The input handler is keyed on this callback; a stable one keeps it from restarting
+    // whenever the chip recomposes while a group moves.
+    val currentOnClick by rememberUpdatedState(onClick)
+    val activate = remember { { currentOnClick() } }
+    val hoverSource = remember { MutableInteractionSource() }
+    val hovered by hoverSource.collectIsHoveredAsState()
+    val currentOnHoverChange by rememberUpdatedState(onHoverChange)
+    LaunchedEffect(hovered) { currentOnHoverChange(hovered) }
+    DisposableEffect(Unit) { onDispose { currentOnHoverChange(false) } }
+    // The chart lays chips out at their measured width, so the chip takes exactly that width.
+    val widthDp = with(LocalDensity.current) { widthPx.toDp() }
+    val countDescription = if (stackCount > 1) {
+        pluralStringResource(R.plurals.journal_chart_marker_count_description, stackCount, stackCount)
+    } else {
+        null
+    }
+    // A chip peeking out from behind its pile's front is toned down, so the front reads first.
+    val dim by animateFloatAsState(if (dimmed) 1f else 0f, ExpressiveMotion.defaultEffects(), label = "JournalChipDim")
+    Box(
+        modifier = modifier
+            .journalMarkerInput(activePointerIds, activate)
+            .hoverable(hoverSource)
+            .then(if (hiddenFromAccessibility) Modifier.semantics { hideFromAccessibility() } else Modifier)
     ) {
-        Row(
-            modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
-            verticalAlignment = Alignment.CenterVertically
+        // ui-guardrails: allow-begin offgrid_spacing, offscale_radius - journal chip metrics as tuned in #572; the chart's chip layout measures them
+        Surface(
+            modifier = Modifier.width(widthDp),
+            shape = RoundedCornerShape(14.dp),
+            // Opaque, so where chips overlap the one behind shows as a clean edge rather than
+            // bleeding its label through.
+            color = androidx.compose.ui.graphics.lerp(
+                MaterialTheme.colorScheme.surfaceContainerHigh,
+                MaterialTheme.colorScheme.surfaceContainerLow,
+                dim
+            ),
+            border = BorderStroke(1.dp, tint.copy(alpha = 0.18f * (1f - dim * 0.7f))),
+            tonalElevation = 0.dp,
+            shadowElevation = 0.dp
         ) {
-            Icon(
-                imageVector = when (marker.type) {
-                    JournalEntryType.INSULIN -> Icons.Default.Vaccines
-                    JournalEntryType.CARBS -> Icons.Default.Restaurant
-                    JournalEntryType.FINGERSTICK -> Icons.Default.Bloodtype
-                    JournalEntryType.ACTIVITY -> Icons.Default.DirectionsRun
-                    JournalEntryType.NOTE -> Icons.AutoMirrored.Filled.Label
-                },
-                contentDescription = null,
-                tint = tint,
-                modifier = Modifier.size(14.dp)
-            )
-            Spacer(modifier = Modifier.width(6.dp))
-            Text(
-                text = marker.detailText.ifBlank { marker.title.take(10) },
-                style = MaterialTheme.typography.labelMedium,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.widthIn(max = 88.dp)
-            )
+            Row(
+                modifier = Modifier
+                    .padding(horizontal = 8.dp, vertical = 5.dp)
+                    .graphicsLayer { alpha = 1f - dim * 0.6f },
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(
+                    imageVector = when (marker.type) {
+                        JournalEntryType.INSULIN -> Icons.Default.Vaccines
+                        JournalEntryType.CARBS -> Icons.Default.Restaurant
+                        JournalEntryType.FINGERSTICK -> Icons.Default.Bloodtype
+                        JournalEntryType.ACTIVITY -> Icons.Default.DirectionsRun
+                        JournalEntryType.NOTE -> Icons.AutoMirrored.Filled.Label
+                    },
+                    contentDescription = null,
+                    tint = tint,
+                    modifier = Modifier.size(14.dp)
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                // ui-guardrails: allow-end
+                Text(
+                    text = label,
+                    style = MaterialTheme.typography.labelMedium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.widthIn(max = 88.dp)
+                )
+            }
+        }
+        // Sits on the pill's corner rather than inside it, so a count coming and going never
+        // changes the chip's width or moves its neighbours.
+        if (countDescription != null) {
+            Badge(
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .offset(x = 6.dp, y = (-6).dp)
+                    .clearAndSetSemantics { contentDescription = countDescription },
+                containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                contentColor = MaterialTheme.colorScheme.onSecondaryContainer
+            ) {
+                Text(text = stringResource(R.string.journal_chart_marker_count, stackCount))
+            }
         }
     }
 }
 
-private fun formatRemainingDuration(remainingMillis: Long): String {
-    if (remainingMillis <= 0L) return ""
-    val totalMinutes = (remainingMillis / 60_000L).coerceAtLeast(0L)
-    val hours = totalMinutes / 60L
-    val minutes = totalMinutes % 60L
-    return String.format(java.util.Locale.getDefault(), "%02d:%02d", hours, minutes)
+private fun Modifier.journalMarkerInput(
+    activePointerIds: MutableSet<PointerId>,
+    activateMarker: () -> Unit
+): Modifier = this
+    .minimumInteractiveComponentSize()
+    .semantics(mergeDescendants = true) {
+        role = Role.Button
+        onClick(action = {
+            activateMarker()
+            true
+        })
+    }
+    .pointerInput(activePointerIds, activateMarker) {
+        awaitEachGesture {
+            val down = awaitFirstDown(
+                requireUnconsumed = false,
+                pass = PointerEventPass.Initial
+            )
+            val gate = JournalMarkerGestureGate(viewConfiguration.touchSlop)
+            activePointerIds.add(down.id)
+            try {
+                while (true) {
+                    val event = awaitPointerEvent(PointerEventPass.Main)
+                    val change = event.changes.firstOrNull { it.id == down.id }
+                    if (change == null) {
+                        gate.cancel()
+                        break
+                    }
+                    gate.observe(
+                        displacementX = change.position.x - down.position.x,
+                        displacementY = change.position.y - down.position.y,
+                        pointerCount = event.changes.size
+                    )
+                    if (!change.pressed) {
+                        if (gate.shouldClick(change.changedToUp())) {
+                            change.consume()
+                            activateMarker()
+                        }
+                        break
+                    }
+                }
+            } finally {
+                activePointerIds.remove(down.id)
+            }
+        }
+    }
+
+/**
+ * Countdown next to the clock glyph on the active-insulin chip. Rendered as "2 h 40 min"
+ * rather than "02:40" so it cannot be mistaken for a wall-clock time.
+ */
+private fun formatRemainingDuration(context: android.content.Context, remainingMillis: Long?): String? {
+    if (remainingMillis == null || remainingMillis <= 0L) return null
+    val totalMinutes = (remainingMillis / 60_000L).toInt()
+    val hours = totalMinutes / 60
+    val minutes = totalMinutes % 60
+    return when {
+        hours == 0 -> context.getString(R.string.stats_duration_minutes, minutes)
+        minutes == 0 -> context.getString(R.string.stats_duration_hours, hours)
+        else -> context.getString(R.string.stats_duration_hours_minutes, hours, minutes)
+    }
+}
+
+/** Shared spring for the active-insulin chip's size and corner morph, so they move as one. */
+private fun <T> activeInsulinMotionSpec() = ExpressiveMotion.defaultSpatial<T>()
+
+/**
+ * Which local calendar day a timestamp falls in, as a day number.
+ *
+ * Cheap enough to call on every pan frame, unlike the `SimpleDateFormat` comparison it
+ * replaced. The DST-shortened day is off by an hour at its boundary, which is invisible
+ * for a header label.
+ */
+private fun localDayIndex(millis: Long): Long {
+    val zone = java.util.TimeZone.getDefault()
+    return Math.floorDiv(millis + zone.getOffset(millis), 86_400_000L)
 }
 
 private fun resolveGraphRangeDefaults(

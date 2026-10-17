@@ -1,5 +1,8 @@
 package tk.glucodata.ui.alerts
 
+import tk.glucodata.ui.components.IconButtonTooltip
+import androidx.compose.material3.IconButtonDefaults
+import androidx.compose.material3.ButtonDefaults
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
@@ -44,12 +47,11 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import tk.glucodata.Applic
-import tk.glucodata.Natives
 import tk.glucodata.R
 
 /**
  * Special marker values for sound selection:
- * - null/empty: App Default Sound (uses Natives.readring)
+ * - null/empty: App Default Sound (Ember)
  * - SYSTEM_DEFAULT_SOUND: System's default notification sound
  * - Any other URI: Custom sound
  */
@@ -67,7 +69,8 @@ fun getSoundDisplayText(uri: String?, alertTypeId: Int = 0): String {
     return when {
         uri.isNullOrEmpty() -> Applic.app.getString(R.string.app_default_sound)
         uri == SYSTEM_DEFAULT_SOUND -> Applic.app.getString(R.string.system_default_sound)
-        else -> Applic.app.getString(R.string.custom_sound_selected)
+        else -> BundledAlertSounds.styleFor(uri, Applic.app.packageName)
+            ?: Applic.app.getString(R.string.custom_sound_selected)
     }
 }
 
@@ -100,22 +103,56 @@ object CustomSoundRepository {
 fun SoundPicker(
     currentUri: String?,
     alertTypeId: Int = 0,
+    soundVolumePercent: Int = tk.glucodata.alerts.AlertSoundVolume.DEFAULT_PERCENT,
+    intensityProfile: String = "STRONG",
+    audioUsage: Int = AudioAttributes.USAGE_NOTIFICATION,
     onSoundSelected: (String?) -> Unit,
     onDismiss: () -> Unit
 ) {
     val context = LocalContext.current
     var systemSounds by remember { mutableStateOf<List<SoundItem>>(emptyList()) }
     var customSounds by remember { mutableStateOf<Set<String>>(emptySet()) }
-    
-    // Selected URI - null means App Default
-    var selectedUri by remember { mutableStateOf(currentUri) }
+
     var isPlaying by remember { mutableStateOf(false) }
     var playingUri by remember { mutableStateOf<String?>(null) }
-    val mediaPlayer = remember { MediaPlayer() }
-    
-    // App default sound URI for preview
-    val appDefaultUri = remember { try { Natives.readring(alertTypeId) } catch (e: Exception) { null } }
-    
+    var mediaPlayer by remember { mutableStateOf<MediaPlayer?>(null) }
+    var soundBoost by remember { mutableStateOf<tk.glucodata.alerts.AlertSoundBoost?>(null) }
+
+    // Preview what choosing App Default will save, not the previous native selection.
+    val appDefaultUri = remember(alertTypeId, context.packageName) {
+        tk.glucodata.alerts.AlertSoundDefaults.uri(context.packageName, alertTypeId)
+    }
+
+    fun stopSound() {
+        // release also cancels asynchronous preparation; stop/isPlaying are invalid
+        // in some MediaPlayer states, including a preview that has not prepared yet.
+        val previous = mediaPlayer
+        mediaPlayer = null
+        try { previous?.release() } finally {
+            soundBoost?.close()
+            soundBoost = null
+        }
+        isPlaying = false
+        playingUri = null
+    }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            val previous = mediaPlayer
+            mediaPlayer = null
+            try { previous?.release() } finally {
+                soundBoost?.close()
+                soundBoost = null
+            }
+        }
+    }
+
+    // Tapping a row confirms it immediately; there is no OK button.
+    fun chooseSound(uri: String?) {
+        stopSound()
+        onSoundSelected(uri)
+    }
+
     // File picker launcher
     val filePicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
@@ -130,12 +167,12 @@ fun SoundPicker(
                 val uriString = uri.toString()
                 CustomSoundRepository.addCustomSound(uriString)
                 customSounds = CustomSoundRepository.getCustomSounds()
-                selectedUri = uriString
+                chooseSound(uriString)
             }
         }
     }
 
-    LaunchedEffect(Unit) {
+    LaunchedEffect(alertTypeId) {
         // Load custom sounds
         customSounds = CustomSoundRepository.getCustomSounds()
         
@@ -143,6 +180,9 @@ fun SoundPicker(
         val soundList = mutableListOf<SoundItem>()
         soundList.add(SoundItem(null, context.getString(R.string.app_default_sound)))
         soundList.add(SoundItem(SYSTEM_DEFAULT_SOUND, context.getString(R.string.system_default_sound)))
+        BundledAlertSounds.styles.forEach { style ->
+            soundList.add(SoundItem(BundledAlertSounds.uri(context.packageName, style, alertTypeId), style))
+        }
 
         val ringtoneManager = RingtoneManager(context)
         ringtoneManager.setType(RingtoneManager.TYPE_NOTIFICATION)
@@ -157,59 +197,58 @@ fun SoundPicker(
         systemSounds = soundList
     }
 
-    DisposableEffect(Unit) {
-        onDispose {
-            if (mediaPlayer.isPlaying) mediaPlayer.stop()
-            mediaPlayer.release()
-        }
-    }
-
     fun playSound(uri: String?) {
+        stopSound()
+        val player = MediaPlayer()
+        mediaPlayer = player
         try {
-            mediaPlayer.reset()
             val actualUri = when {
-                uri == null -> appDefaultUri?.let { Uri.parse(it) }
+                uri.isNullOrEmpty() -> appDefaultUri?.takeIf { it.isNotEmpty() }?.let { Uri.parse(it) }
                 uri == SYSTEM_DEFAULT_SOUND -> RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
                 else -> Uri.parse(uri)
-            }
-            
-            if (actualUri != null) {
-                mediaPlayer.setDataSource(context, actualUri)
-            } else {
-                mediaPlayer.setDataSource(context, RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION))
-            }
-            
-            mediaPlayer.setAudioAttributes(
+            } ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
+
+            player.setAudioAttributes(
                 AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_NOTIFICATION)
+                    .setUsage(audioUsage)
                     .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
                     .build()
             )
-            mediaPlayer.setOnPreparedListener { mp ->
-                mp.start()
-                isPlaying = true
-                playingUri = uri
+            player.setDataSource(context, actualUri)
+            player.setOnPreparedListener { prepared ->
+                if (mediaPlayer === prepared) {
+                    val gain = tk.glucodata.alerts.AlertSoundVolume.gain(soundVolumePercent, intensityProfile)
+                    prepared.setVolume(gain, gain)
+                    soundBoost = tk.glucodata.alerts.AlertSoundBoost.attach(prepared.audioSessionId, soundVolumePercent)
+                    try { prepared.start() } catch (e: Exception) {
+                        android.util.Log.w("SoundPicker", "Could not start preview", e)
+                        stopSound()
+                    }
+                }
             }
-            mediaPlayer.prepareAsync()
-            mediaPlayer.setOnCompletionListener {
-                isPlaying = false
-                playingUri = null
+            player.setOnCompletionListener { completed ->
+                if (mediaPlayer === completed) stopSound()
             }
+            player.setOnErrorListener { failed, what, extra ->
+                android.util.Log.w("SoundPicker", "Preview failed: $what/$extra")
+                if (mediaPlayer === failed) stopSound()
+                true
+            }
+            // Show Stop while preparing too, so a pending preview can be cancelled.
+            isPlaying = true
+            playingUri = uri
+            player.prepareAsync()
         } catch (e: Exception) {
-            e.printStackTrace()
-            isPlaying = false
-            playingUri = null
+            android.util.Log.w("SoundPicker", "Could not preview sound", e)
+            stopSound()
         }
     }
 
-    fun stopSound() {
-        if (mediaPlayer.isPlaying) mediaPlayer.stop()
-        isPlaying = false
-        playingUri = null
-    }
-
     AlertDialog(
-        onDismissRequest = onDismiss,
+        onDismissRequest = {
+            stopSound()
+            onDismiss()
+        },
         title = { Text(stringResource(R.string.select_alert_sound)) },
         text = {
             LazyColumn(modifier = Modifier.heightIn(max = 400.dp)) {
@@ -251,9 +290,9 @@ fun SoundPicker(
                     items(customSounds.toList()) { uri ->
                         SoundRow(
                             title = context.getString(R.string.custom_sound_prefix, uri.substringAfterLast("/").take(25)),
-                            isSelected = selectedUri == uri,
+                            isSelected = currentUri == uri,
                             isPlaying = isPlaying && playingUri == uri,
-                            onClick = { selectedUri = uri },
+                            onClick = { chooseSound(uri) },
                             onPlay = { if (isPlaying && playingUri == uri) stopSound() else playSound(uri) }
                         )
                     }
@@ -263,9 +302,9 @@ fun SoundPicker(
                 items(systemSounds) { sound ->
                     SoundRow(
                         title = sound.title,
-                        isSelected = if (sound.uri == null) selectedUri == null else selectedUri == sound.uri,
+                        isSelected = if (sound.uri == null) currentUri.isNullOrEmpty() else currentUri == sound.uri,
                         isPlaying = isPlaying && playingUri == sound.uri,
-                        onClick = { selectedUri = sound.uri },
+                        onClick = { chooseSound(sound.uri) },
                         onPlay = { if (isPlaying && playingUri == sound.uri) stopSound() else playSound(sound.uri) }
                     )
                 }
@@ -274,16 +313,10 @@ fun SoundPicker(
         confirmButton = {
             TextButton(onClick = {
                 stopSound()
-                onSoundSelected(selectedUri)
-            }) {
-                Text(stringResource(R.string.ok))
-            }
-        },
-        dismissButton = {
-            TextButton(onClick = {
-                stopSound()
                 onDismiss()
-            }) {
+            },
+            shapes = ButtonDefaults.shapes(),
+            contentPadding = ButtonDefaults.TextButtonContentPadding) {
                 Text(stringResource(R.string.cancel))
             }
         }
@@ -311,11 +344,13 @@ private fun SoundRow(
             modifier = Modifier.weight(1f).padding(start = 8.dp),
             style = MaterialTheme.typography.bodyLarge
         )
-        IconButton(onClick = onPlay) {
-            Icon(
-                imageVector = if (isPlaying) Icons.Filled.Stop else Icons.Filled.PlayArrow,
-                contentDescription = if (isPlaying) stringResource(R.string.stop) else stringResource(R.string.preview)
-            )
+        IconButtonTooltip(if (isPlaying) stringResource(R.string.stop) else stringResource(R.string.preview)) {
+            IconButton(onClick = onPlay, shapes = IconButtonDefaults.shapes()) {
+                Icon(
+                    imageVector = if (isPlaying) Icons.Filled.Stop else Icons.Filled.PlayArrow,
+                    contentDescription = if (isPlaying) stringResource(R.string.stop) else stringResource(R.string.preview)
+                )
+            }
         }
     }
     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
